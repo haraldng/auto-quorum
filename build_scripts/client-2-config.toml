@@ -1,16 +1,10 @@
 location = "local-2"
 server_id = 2
-read_ratio = 0.25
+read_ratio = 0
 local_deployment = true
-scheduled_start_utc_ms = SCHEDULE
+scheduled_start_utc_ms = 0
 
 [[request_rate_intervals]]
 duration_sec = 5
 requests_per_sec = 10
-read_ratio = 0.25
-
-[[request_rate_intervals]]
-duration_sec = 10
-requests_per_sec = 1
-read_ratio = 0.25
-
+read_ratio = 0

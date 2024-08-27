@@ -1,11 +1,10 @@
 use chrono::Utc;
 use futures::SinkExt;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::time::interval;
+use tokio::time::{interval};
 use tokio_stream::StreamExt;
 
 use common::util::{get_node_addr, wrap_stream, Connection as ServerConnection};
@@ -15,6 +14,12 @@ use common::{kv::*, messages::*};
 struct RequestData {
     time_sent_utc: i64,
     response: Option<Response>,
+}
+
+impl RequestData {
+    fn response_time(&self) -> Option<i64> {
+        self.response.as_ref().map(|r| r.time_recieved_utc - self.time_sent_utc)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -45,13 +50,17 @@ impl RequestInterval {
         Duration::from_secs(self.duration_sec)
     }
 
-    fn get_request_delay(self) -> Duration {
+    fn get_request_delay(self) -> (Duration, usize) {
         if self.requests_per_sec == 0 {
-            return Duration::from_secs(999999);
+            return (Duration::from_secs(999999), 0);
         }
-        let delay_ms = 1000 / self.requests_per_sec;
-        assert!(delay_ms != 0);
-        Duration::from_millis(delay_ms)
+        if self.requests_per_sec > 1000 {
+            let ops_per_ms = self.requests_per_sec / 1000;
+            (Duration::from_millis(1), ops_per_ms as usize)
+        } else {
+            let delay_ms = 1000 / self.requests_per_sec;
+            (Duration::from_millis(delay_ms), 1)
+        }
     }
 }
 
@@ -61,6 +70,7 @@ pub struct Client {
     request_data: Vec<RequestData>,
     request_rate_intervals: Vec<RequestInterval>,
     kill_signal_sec: Option<u64>,
+    ops_per_interval: usize,
 }
 
 impl Client {
@@ -78,6 +88,7 @@ impl Client {
             request_data: Vec::with_capacity(8000),
             request_rate_intervals: config.request_rate_intervals,
             kill_signal_sec: config.kill_signal_sec,
+            ops_per_interval: 1
         };
         client.send_registration().await;
         client
@@ -99,21 +110,16 @@ impl Client {
         if self.request_rate_intervals.is_empty() {
             return;
         }
-        let mut rng = rand::thread_rng();
         let intervals = self.request_rate_intervals.clone();
+        assert_eq!(intervals.len(), 1, "Should only use one interval in metronome");
         let mut intervals = intervals.iter();
         let first_interval = intervals.next().unwrap();
-        let mut read_ratio = first_interval.read_ratio;
-        let mut request_interval = interval(first_interval.get_request_delay());
+        let (req_interval, ops_per_interval) = first_interval.get_request_delay();
+        self.ops_per_interval = ops_per_interval;
+        let mut request_interval = interval(req_interval);
         let mut next_interval = interval(first_interval.get_interval_duration());
-        let mut kill_interval = match self.kill_signal_sec {
-            Some(0) => interval(Duration::from_millis(1)),
-            Some(sec_until_kill) => interval(Duration::from_secs(sec_until_kill)),
-            None => interval(Duration::from_secs(999999)),
-        };
         request_interval.tick().await;
         next_interval.tick().await;
-        kill_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -123,41 +129,16 @@ impl Client {
                 // Send request according to rate of current request interval setting. (defined in
                     // TOML config)
                 _ = request_interval.tick() => {
-                    let key = self.command_id.to_string();
-                    if rng.gen::<f64>() < read_ratio {
-                        self.get(key).await;
-                    } else {
+                    for _ in 0..self.ops_per_interval {
+                        let key = self.command_id.to_string();
                         self.put(key.clone(), key).await;
                     }
                 },
                 // Go to the next request interval setting. (defined in TOML config)
                 _ = next_interval.tick() => {
-                    if let Some(new_interval) = intervals.next() {
-                        read_ratio = new_interval.read_ratio;
-                        next_interval = interval(new_interval.get_interval_duration());
-                        next_interval.tick().await;
-                        request_interval = interval(new_interval.get_request_delay());
-                    } else {
-                        break;
-                    }
+                    println!("Switching to next interval");
+                    break;
                 },
-                // Hardcoded for a specific benchmark. Tells current server to "crash" and then
-                    // connects to server 6.
-                _ = kill_interval.tick(), if self.kill_signal_sec.is_some() => {
-                    self.send_kill_signal().await;
-                    self.kill_signal_sec = None;
-                    // Makes sure kill_internal.tick() never resolves again
-                    kill_interval = interval(Duration::from_secs(999999));
-                    kill_interval.tick().await;
-                    let server_address =
-                        get_node_addr(6, false).expect("Couldn't resolve server IP");
-                    let server_stream = TcpStream::connect(server_address)
-                        .await
-                        .expect("Couldn't connect to server {server_id}");
-                    server_stream.set_nodelay(true).unwrap();
-                    self.server = wrap_stream(server_stream);
-                    self.send_registration().await;
-                }
             }
         }
         self.print_results();
@@ -209,9 +190,19 @@ impl Client {
     }
 
     fn print_results(&self) {
+        let mut all_latencies = Vec::with_capacity(self.request_data.len());
+        let mut missed_responses = 0;
         for request_data in &self.request_data {
+            match request_data.response_time() {
+                Some(latency) => all_latencies.push(latency),
+                None => missed_responses += 1,
+            }
             let request_json = serde_json::to_string(request_data).unwrap();
             println!("{request_json}");
         }
+        let avg_latency = all_latencies.iter().sum::<i64>() as f64 / all_latencies.len() as f64;
+        let duration_s = self.request_rate_intervals.first().unwrap().duration_sec as f64;
+        let throughput = (all_latencies.len() - missed_responses) as f64 / duration_s;
+        println!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, missed: {missed_responses}");
     }
 }

@@ -47,7 +47,7 @@ impl Network {
         let (connection_sink, connection_source) = mpsc::channel(100);
         let (message_sink, message_source) = mpsc::channel(100);
         let port = 8000 + id as u16;
-        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
+        let listening_address = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = TcpListener::bind(listening_address).await?;
         let mut network = Self {
             id,
@@ -111,7 +111,7 @@ impl Network {
         let first_message = reader.next().await;
         let connection_id = match first_message {
             Some(Ok(NetworkMessage::NodeRegister(node_id))) => {
-                debug!("Identified connection from node {node_id}");
+                info!("Identified connection from node {node_id}");
                 let identified_connection = NewConnection::NodeConnection(node_id, writer);
                 connection_sink.send(identified_connection).await.unwrap();
                 ConnectionId::ServerConnection(node_id)

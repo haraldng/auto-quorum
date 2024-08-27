@@ -1,7 +1,7 @@
 location = "local-1"
 initial_leader = 1
 local_deployment = true
-optimize = OPTIMIZE
+optimize = true
 optimize_threshold = 0.97
 initial_read_strat = ["ReadAsWrite", "ReadAsWrite", "ReadAsWrite"]
 

@@ -10,7 +10,9 @@ anyhow = "1.0.79"
 env_logger = "0.10.1"
 futures = "0.3.30"
 log = "0.4.20"
+#omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome", features = ["serde", "toml_config"] }
 omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "auto-quorum", features = ["serde", "toml_config"] }
+# omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome" }
 omnipaxos_storage = { path = "../omnipaxos_storage" }
 common = { path = "../common" }
 serde = { version = "1.0.194", features = ["derive"] }

@@ -1,18 +1,13 @@
 location = "local-1"
 server_id = 1
-read_ratio = 0.25
+read_ratio = 0
 local_deployment = true
 # kill_signal_sec = 5
-scheduled_start_utc_ms = SCHEDULE
+scheduled_start_utc_ms = 0
 
 # Defining TOML vector of (duration_sec, requests_per_sec, read_ratio) which determines the behavior of the client requests
 [[request_rate_intervals]]
-duration_sec = 10
-requests_per_sec = 1
-read_ratio = 0.25
-
-[[request_rate_intervals]]
-duration_sec = 5
-requests_per_sec = 10
-read_ratio = 0.25
+#duration_sec = 10
+#requests_per_sec = 1
+#read_ratio = 0
 
