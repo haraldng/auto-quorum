@@ -8,7 +8,6 @@ mod database;
 mod metrics;
 mod network;
 mod optimizer;
-mod read;
 mod server;
 
 #[tokio::main]

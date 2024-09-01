@@ -1,10 +1,22 @@
 use omnipaxos::{
     ballot_leader_election::Ballot, messages::Message as OmniPaxosMessage,
-    storage::ReadQuorumConfig, util::NodeId,
+    util::NodeId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::kv::{ClientId, Command, CommandId, KVCommand};
+
+/// The current read quorum config used for linearizable quorum reads.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ReadQuorumConfig {
+    /// The current n_accepted
+    pub n_accepted: Ballot,
+    /// The accepted index of the config log.
+    pub config_log_accepted_idx: usize,
+    /// The read quorum size of the config
+    pub read_quorum_size: usize,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetworkMessage {
@@ -70,7 +82,6 @@ pub struct QuorumReadRequest {
 pub struct QuorumReadResponse {
     pub client_id: ClientId,
     pub command_id: CommandId,
-    pub read_quorum_config: ReadQuorumConfig,
     pub accepted_idx: usize,
     pub ballot_read: BallotRead,
 }
@@ -80,7 +91,6 @@ impl QuorumReadResponse {
         my_id: NodeId,
         client_id: ClientId,
         command_id: CommandId,
-        read_quorum_config: ReadQuorumConfig,
         accepted_idx: usize,
         promise: Ballot,
         leader: NodeId,
@@ -91,7 +101,6 @@ impl QuorumReadResponse {
         QuorumReadResponse {
             client_id,
             command_id,
-            read_quorum_config,
             accepted_idx,
             ballot_read,
         }

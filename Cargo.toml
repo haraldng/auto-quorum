@@ -4,6 +4,5 @@ resolver = "2"
 members = [
     "omnipaxos_server",
     "omnipaxos_client",
-    "omnipaxos_storage",
     "common"
     ]

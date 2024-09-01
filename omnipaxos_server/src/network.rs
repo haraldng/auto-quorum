@@ -1,7 +1,6 @@
 use anyhow::Error;
 use futures::{SinkExt, Stream, StreamExt};
 use log::*;
-use omnipaxos::messages::ballot_leader_election::BLEMsg;
 use omnipaxos::messages::Message as OmniPaxosMessage;
 use omnipaxos::util::NodeId;
 use std::collections::HashMap;
@@ -255,10 +254,8 @@ impl Network {
             warn!("Not connected to node {to}");
             // If HeartbeatRequest msg is what failed, try to reconnect to node.
             if let ClusterMessage::OmniPaxosMessage(OmniPaxosMessage::BLE(m)) = msg {
-                if let BLEMsg::HeartbeatRequest(_) = m.msg {
-                    if m.to == to {
-                        self.connect_to_node(to);
-                    }
+                if m.to == to {
+                    self.connect_to_node(to);
                 }
             }
         }

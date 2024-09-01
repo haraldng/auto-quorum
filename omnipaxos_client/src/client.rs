@@ -190,6 +190,7 @@ impl Client {
     }
 
     fn print_results(&self) {
+        let num_requests = self.request_data.len();
         let mut all_latencies = Vec::with_capacity(self.request_data.len());
         let mut missed_responses = 0;
         for request_data in &self.request_data {
@@ -202,7 +203,13 @@ impl Client {
         }
         let avg_latency = all_latencies.iter().sum::<i64>() as f64 / all_latencies.len() as f64;
         let duration_s = self.request_rate_intervals.first().unwrap().duration_sec as f64;
-        let throughput = (all_latencies.len() - missed_responses) as f64 / duration_s;
-        println!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, missed: {missed_responses}");
+        let num_responses = all_latencies.len();
+        let throughput = if num_responses <= missed_responses {
+            eprintln!("More dropped requests ({missed_responses}) than completed requests ({num_responses})");
+            0.0
+        } else {
+            (num_responses - missed_responses) as f64 / duration_s
+        };
+        println!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}");
     }
 }
