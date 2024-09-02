@@ -20,7 +20,8 @@ pub async fn main() {
     let omnipaxos_config = OmniPaxosConfig::with_toml(&config_file).unwrap();
     let config_string = fs::read_to_string(config_file).unwrap();
     let server_config: OmniPaxosServerConfig = toml::from_str(&config_string).unwrap();
-    let initial_leader = server_config.initial_leader;
+    let max_node_pid = omnipaxos_config.cluster_config.nodes.iter().max().unwrap();
+    let initial_leader = server_config.initial_leader.unwrap_or(*max_node_pid);
     println!("{}", serde_json::to_string(&server_config).unwrap());
     let mut server = OmniPaxosServer::new(server_config, omnipaxos_config).await;
     server.run(initial_leader).await;

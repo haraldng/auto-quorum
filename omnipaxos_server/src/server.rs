@@ -7,7 +7,10 @@ use std::time::Duration;
 use omnipaxos::{
     util::{LogEntry, NodeId}, OmniPaxos, OmniPaxosConfig,
 };
-use omnipaxos_storage::memory_storage::MemoryStorage;
+use omnipaxos::ballot_leader_election::Ballot;
+use omnipaxos_storage::duration_storage::DurationStorage;
+use omnipaxos::sequence_paxos::Phase;
+use tokio::time::Instant;
 
 use crate::{
     database::Database,
@@ -16,6 +19,9 @@ use crate::{
     optimizer::{ClusterOptimizer, ClusterStrategy},
 };
 use common::{kv::*, messages::*};
+
+const LEADER_WAIT: Duration = Duration::from_secs(3);
+const FLUSH_DURATION: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OmniPaxosServerConfig {
@@ -28,7 +34,7 @@ pub struct OmniPaxosServerConfig {
     pub initial_read_strat: Option<Vec<ReadStrategy>>,
 }
 
-type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
+type OmniPaxosInstance = OmniPaxos<Command, DurationStorage<Command>>;
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -42,6 +48,7 @@ pub struct OmniPaxosServer {
     strategy: ClusterStrategy,
     optimize: bool,
     optimize_threshold: f64,
+    leader_attempt: u32,
 }
 
 impl OmniPaxosServer {
@@ -53,7 +60,7 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage: MemoryStorage<Command> = MemoryStorage::default();
+        let storage: DurationStorage<Command> = DurationStorage::new(FLUSH_DURATION);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -87,26 +94,26 @@ impl OmniPaxosServer {
             strategy: init_strat,
             optimize,
             optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
+            leader_attempt: 0,
         };
         server.send_outgoing_msgs().await;
         server
     }
 
-    pub async fn run(&mut self, initial_leader: Option<NodeId>) {
-        let mut election_interval = tokio::time::interval(Duration::from_millis(1000));
-        let initialized_leader = match initial_leader {
-            Some(_) => false,
-            None => true,
-        };
+    pub async fn run(&mut self, initial_leader: NodeId) {
+        let mut election_interval = tokio::time::interval(LEADER_WAIT);
+        let mut outgoing_interval = tokio::time::interval(Duration::from_millis(1));
         election_interval.tick().await;
+
         loop {
             tokio::select! {
                 biased;
                 _ = election_interval.tick() => {
-                    // TODO: revert BLE to stop tracking latency
-                    self.omnipaxos.tick();
-                    self.send_outgoing_msgs().await;
+                    self.become_initial_leader(initial_leader).await;
                 },
+                _ = outgoing_interval.tick() => {
+                    self.send_outgoing_msgs().await;
+                }
                 Some(msg) = self.network.next() => {
                     self.handle_incoming_msg(msg.unwrap()).await;
                 },
@@ -114,14 +121,20 @@ impl OmniPaxosServer {
         }
     }
 
-    async fn force_initial_leader_switch(&mut self, initial_leader: NodeId) {
-        if let Some(current_leader) = self.omnipaxos.get_current_leader() {
-            if current_leader == self.id {
-                unimplemented!("Relinquish leadership")
-                /*
-                self.omnipaxos.relinquish_leadership(initial_leader);
-                self.send_outgoing_msgs().await;
-                */
+    async fn become_initial_leader(&mut self, leader_pid: NodeId) {
+        if leader_pid == self.id {
+            let (_leader, phase) = self.omnipaxos.get_current_leader_state();
+            match phase {
+                Phase::Accept => {},
+                _ => {
+                    let mut ballot = Ballot::default();
+                    self.leader_attempt += 1;
+                    ballot.n = self.leader_attempt;
+                    ballot.pid = self.id;
+                    ballot.config_id = 1;
+                    log::info!("Node: {:?}, Initializing prepare phase with ballot: {:?}", self.id, ballot);
+                    self.omnipaxos.initialize_prepare_phase(ballot);
+                }
             }
         }
     }

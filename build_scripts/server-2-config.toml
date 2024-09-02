@@ -1,5 +1,5 @@
 location = "local-2"
-initial_leader = 1
+#initial_leader = 1
 local_deployment = true
 optimize = true
 optimize_threshold = 0.97
