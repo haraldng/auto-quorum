@@ -21,7 +21,6 @@ use crate::{
 use common::{kv::*, messages::*};
 
 const LEADER_WAIT: Duration = Duration::from_secs(3);
-const FLUSH_DURATION: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OmniPaxosServerConfig {
@@ -32,6 +31,7 @@ pub struct OmniPaxosServerConfig {
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
     pub initial_read_strat: Option<Vec<ReadStrategy>>,
+    pub storage_duration_ms: Option<u64>
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, DurationStorage<Command>>;
@@ -60,7 +60,10 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage: DurationStorage<Command> = DurationStorage::new(FLUSH_DURATION);
+        let storage_duration_ms = server_config.storage_duration_ms.expect("Storage duration must be set");
+        let flush_duration = Duration::from_millis(storage_duration_ms);
+        let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
+        info!("Node: {:?}: using metronome: {}", server_id, omnipaxos_config.cluster_config.use_metronome);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -132,7 +135,7 @@ impl OmniPaxosServer {
                     ballot.n = self.leader_attempt;
                     ballot.pid = self.id;
                     ballot.config_id = 1;
-                    log::info!("Node: {:?}, Initializing prepare phase with ballot: {:?}", self.id, ballot);
+                    info!("Node: {:?}, Initializing prepare phase with ballot: {:?}", self.id, ballot);
                     self.omnipaxos.initialize_prepare_phase(ballot);
                 }
             }
@@ -158,7 +161,7 @@ impl OmniPaxosServer {
                 },
                 None => {
                     let log_len = self.omnipaxos.read_entries(0..).unwrap_or_default().len();
-                    log::warn!("Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}", self.id);
+                    warn!("Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}", self.id);
                 }
             }
         }
@@ -199,7 +202,9 @@ impl OmniPaxosServer {
             Incoming::ClusterMessage(_from, ClusterMessage::OmniPaxosMessage(m)) => {
                 self.omnipaxos.handle_incoming(m);
                 self.send_outgoing_msgs().await;
-                self.handle_decided_entries().await;
+                if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
+                    self.handle_decided_entries().await;
+                }
             }
             Incoming::ClusterMessage(from, ClusterMessage::QuorumReadRequest(req)) => {
                 self.handle_quorum_read_request(from, req).await;

@@ -42,6 +42,6 @@ trap "cleanup" EXIT
 #sed -i "s/SCHEDULE/$utc_sync/g" "$client1_config_path" &&
 #sed -i "s/SCHEDULE/$utc_sync/g" "$client2_config_path" &&
 
-CONFIG_FILE="$client1_config_path"  cargo run --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client1_log_path" &
+CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client1_log_path" &
 #CONFIG_FILE="$client2_config_path"  cargo run --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client2_log_path"
 

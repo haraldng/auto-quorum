@@ -7,7 +7,6 @@ scheduled_start_utc_ms = 0
 
 # Defining TOML vector of (duration_sec, requests_per_sec, read_ratio) which determines the behavior of the client requests
 [[request_rate_intervals]]
-#duration_sec = 10
-#requests_per_sec = 1
-#read_ratio = 0
-
+duration_sec = 30
+requests_per_sec = 50
+read_ratio = 0

@@ -136,7 +136,6 @@ impl Client {
                 },
                 // Go to the next request interval setting. (defined in TOML config)
                 _ = next_interval.tick() => {
-                    println!("Switching to next interval");
                     break;
                 },
             }
@@ -193,13 +192,26 @@ impl Client {
         let num_requests = self.request_data.len();
         let mut all_latencies = Vec::with_capacity(self.request_data.len());
         let mut missed_responses = 0;
+        let mut dropped_sequence: usize = 0;
         for request_data in &self.request_data {
-            match request_data.response_time() {
-                Some(latency) => all_latencies.push(latency),
-                None => missed_responses += 1,
+            let response_time = request_data.response_time();
+            match response_time {
+                Some(latency) => {
+                    all_latencies.push(latency);
+                    if dropped_sequence > 0 {
+                        println!("dropped requests: {dropped_sequence}");
+                        dropped_sequence = 0;
+                    }
+                    println!("request: {:?}, latency: {:?}", request_data.response.as_ref().unwrap().message, latency);
+                },
+                None => {
+                    missed_responses += 1;
+                    dropped_sequence += 1;
+                },
             }
-            let request_json = serde_json::to_string(request_data).unwrap();
-            println!("{request_json}");
+        }
+        if dropped_sequence > 0 {
+            println!("dropped requests: {dropped_sequence}");
         }
         let avg_latency = all_latencies.iter().sum::<i64>() as f64 / all_latencies.len() as f64;
         let duration_s = self.request_rate_intervals.first().unwrap().duration_sec as f64;

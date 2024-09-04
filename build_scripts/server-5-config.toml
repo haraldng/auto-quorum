@@ -1,4 +1,4 @@
-location = "local-2"
+location = "local-5"
 initial_leader = 1
 local_deployment = true
 optimize = true
@@ -11,7 +11,7 @@ nodes = [1, 2, 3, 4, 5]
 use_metronome = true
 
 [server_config]
-pid = 2
+pid = 5
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200
