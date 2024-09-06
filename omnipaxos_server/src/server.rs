@@ -8,9 +8,10 @@ use omnipaxos::{
     util::{LogEntry, NodeId}, OmniPaxos, OmniPaxosConfig,
 };
 use omnipaxos::ballot_leader_election::Ballot;
-use omnipaxos_storage::duration_storage::DurationStorage;
+use omnipaxos::messages::Message;
+use omnipaxos::messages::sequence_paxos::PaxosMsg;
 use omnipaxos::sequence_paxos::Phase;
-use tokio::time::Instant;
+use omnipaxos_storage::memory_storage::MemoryStorage;
 
 use crate::{
     database::Database,
@@ -34,7 +35,7 @@ pub struct OmniPaxosServerConfig {
     pub storage_duration_ms: Option<u64>
 }
 
-type OmniPaxosInstance = OmniPaxos<Command, DurationStorage<Command>>;
+type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -49,6 +50,7 @@ pub struct OmniPaxosServer {
     optimize: bool,
     optimize_threshold: f64,
     leader_attempt: u32,
+    storage_duration: Duration,
 }
 
 impl OmniPaxosServer {
@@ -61,9 +63,10 @@ impl OmniPaxosServer {
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
         let storage_duration_ms = server_config.storage_duration_ms.expect("Storage duration must be set");
-        let flush_duration = Duration::from_millis(storage_duration_ms);
-        let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
-        info!("Node: {:?}: using metronome: {}", server_id, omnipaxos_config.cluster_config.use_metronome);
+        // let flush_duration = Duration::from_millis(storage_duration_ms);
+        // let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
+        let storage = MemoryStorage::default();
+        info!("Node: {:?}: using metronome: {}, storage_duration: {}", server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_ms);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -98,6 +101,7 @@ impl OmniPaxosServer {
             optimize,
             optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
             leader_attempt: 0,
+            storage_duration: Duration::from_millis(storage_duration_ms),
         };
         server.send_outgoing_msgs().await;
         server
@@ -186,6 +190,17 @@ impl OmniPaxosServer {
     async fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         for msg in messages {
+            match &msg {
+                Message::SequencePaxos(paxos_msg) => {
+                    match paxos_msg.msg {
+                        PaxosMsg::Accepted(_) => {
+                            tokio::time::sleep(self.storage_duration).await;
+                        },
+                        _ => {}
+                    }
+                }
+                Message::BLE(_) => {}
+            }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network

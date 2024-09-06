@@ -4,6 +4,7 @@ read_ratio = 0
 local_deployment = true
 # kill_signal_sec = 5
 scheduled_start_utc_ms = 0
+use_metronome = true
 
 # Defining TOML vector of (duration_sec, requests_per_sec, read_ratio) which determines the behavior of the client requests
 [[request_rate_intervals]]

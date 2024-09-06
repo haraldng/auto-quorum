@@ -31,11 +31,12 @@ struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientConfig {
     location: String,
-    server_id: u64,
-    request_rate_intervals: Vec<RequestInterval>,
+    pub server_id: u64,
+    pub request_rate_intervals: Vec<RequestInterval>,
     local_deployment: Option<bool>,
     kill_signal_sec: Option<u64>,
     pub scheduled_start_utc_ms: Option<i64>,
+    pub use_metronome: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -59,7 +60,7 @@ impl RequestInterval {
             (Duration::from_millis(1), ops_per_ms as usize)
         } else {
             let delay_ms = 1000 / self.requests_per_sec;
-            (Duration::from_millis(delay_ms), 1)
+            (Duration::from_millis(2000), 10)
         }
     }
 }
@@ -129,6 +130,9 @@ impl Client {
                 // Send request according to rate of current request interval setting. (defined in
                     // TOML config)
                 _ = request_interval.tick() => {
+                    if self.command_id >= 50 {
+                        continue;
+                    }
                     for _ in 0..self.ops_per_interval {
                         let key = self.command_id.to_string();
                         self.put(key.clone(), key).await;
@@ -223,5 +227,6 @@ impl Client {
             (num_responses - missed_responses) as f64 / duration_s
         };
         println!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}");
+        eprintln!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}");
     }
 }

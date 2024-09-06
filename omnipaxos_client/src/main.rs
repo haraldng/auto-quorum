@@ -28,7 +28,7 @@ pub async fn main() {
     };
     let config_string = fs::read_to_string(config_file).unwrap();
     let client_config: ClientConfig = toml::from_str(&config_string).unwrap();
-    println!("{}", serde_json::to_string(&client_config).unwrap());
+    println!("Client: {}, Metronome: {}, {:?}", client_config.server_id, client_config.use_metronome.unwrap(), client_config.request_rate_intervals);
     // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
     let mut client = Client::with(client_config).await;
     client.run().await;

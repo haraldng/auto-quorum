@@ -15,4 +15,4 @@ pid = 1
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200
-batch_size = 50
+batch_size = 10
