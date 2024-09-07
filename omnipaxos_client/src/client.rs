@@ -9,6 +9,10 @@ use tokio_stream::StreamExt;
 
 use common::util::{get_node_addr, wrap_stream, Connection as ServerConnection};
 use common::{kv::*, messages::*};
+use histogram::Histogram;
+
+const PERCENTILES: [f64; 6] = [50.0, 70.0, 80.0, 90.0, 95.0, 99.0];
+
 
 #[derive(Debug, Serialize)]
 struct RequestData {
@@ -32,11 +36,13 @@ struct Response {
 pub struct ClientConfig {
     location: String,
     pub server_id: u64,
-    pub request_rate_intervals: Vec<RequestInterval>,
     local_deployment: Option<bool>,
     kill_signal_sec: Option<u64>,
     pub scheduled_start_utc_ms: Option<i64>,
     pub use_metronome: Option<bool>,
+    pub req_batch_size: Option<usize>,
+    pub(crate) interval_sec: Option<u64>,
+    pub(crate) iterations: Option<usize>
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -69,9 +75,12 @@ pub struct Client {
     server: ServerConnection,
     command_id: CommandId,
     request_data: Vec<RequestData>,
-    request_rate_intervals: Vec<RequestInterval>,
     kill_signal_sec: Option<u64>,
-    ops_per_interval: usize,
+    req_batch_size: usize,
+    batch_interval: Duration,
+    iterations: usize,
+    current_iteration: usize,
+    num_responses: usize,
 }
 
 impl Client {
@@ -87,9 +96,12 @@ impl Client {
             server: wrap_stream(server_stream),
             command_id: 0,
             request_data: Vec::with_capacity(8000),
-            request_rate_intervals: config.request_rate_intervals,
             kill_signal_sec: config.kill_signal_sec,
-            ops_per_interval: 1
+            req_batch_size: config.req_batch_size.expect("Batch size not set"),
+            batch_interval: Duration::from_secs(config.interval_sec.expect("Interval not set")),
+            iterations: config.iterations.expect("Iterations not set"),
+            current_iteration: 0,
+            num_responses: 0,
         };
         client.send_registration().await;
         client
@@ -108,19 +120,8 @@ impl Client {
     }
 
     pub async fn run(&mut self) {
-        if self.request_rate_intervals.is_empty() {
-            return;
-        }
-        let intervals = self.request_rate_intervals.clone();
-        assert_eq!(intervals.len(), 1, "Should only use one interval in metronome");
-        let mut intervals = intervals.iter();
-        let first_interval = intervals.next().unwrap();
-        let (req_interval, ops_per_interval) = first_interval.get_request_delay();
-        self.ops_per_interval = ops_per_interval;
-        let mut request_interval = interval(req_interval);
-        let mut next_interval = interval(first_interval.get_interval_duration());
-        request_interval.tick().await;
-        next_interval.tick().await;
+        let mut batch_interval = interval(self.batch_interval);
+        batch_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -129,18 +130,18 @@ impl Client {
                 Some(msg) = self.server.next() => self.handle_response(msg.unwrap()),
                 // Send request according to rate of current request interval setting. (defined in
                     // TOML config)
-                _ = request_interval.tick() => {
-                    if self.command_id >= 50 {
-                        continue;
+                _ = batch_interval.tick() => {
+                    if self.current_iteration == self.iterations {
+                        if self.num_responses == self.request_data.len() {
+                            break;
+                        }
+                    } else {
+                        for _ in 0..self.req_batch_size {
+                            let key = self.command_id.to_string();
+                            self.put(key.clone(), key).await;
+                        }
+                        self.current_iteration += 1;
                     }
-                    for _ in 0..self.ops_per_interval {
-                        let key = self.command_id.to_string();
-                        self.put(key.clone(), key).await;
-                    }
-                },
-                // Go to the next request interval setting. (defined in TOML config)
-                _ = next_interval.tick() => {
-                    break;
                 },
             }
         }
@@ -173,6 +174,7 @@ impl Client {
                     time_recieved_utc: response_time,
                     message: response,
                 });
+                self.num_responses += 1;
             }
             _ => panic!("Recieved unexpected message: {msg:?}"),
         }
@@ -194,19 +196,23 @@ impl Client {
 
     fn print_results(&self) {
         let num_requests = self.request_data.len();
-        let mut all_latencies = Vec::with_capacity(self.request_data.len());
         let mut missed_responses = 0;
         let mut dropped_sequence: usize = 0;
+        let mut histo = Histogram::new(15, 16).unwrap();
+        let mut latency_sum = 0;
+        let mut num_responses = 0;
         for request_data in &self.request_data {
             let response_time = request_data.response_time();
             match response_time {
                 Some(latency) => {
-                    all_latencies.push(latency);
+                    histo.increment(latency as u64).unwrap();
+                    latency_sum += latency;
+                    num_responses += 1;
                     if dropped_sequence > 0 {
                         println!("dropped requests: {dropped_sequence}");
                         dropped_sequence = 0;
                     }
-                    println!("request: {:?}, latency: {:?}", request_data.response.as_ref().unwrap().message, latency);
+                    println!("request: {:?}, latency: {:?}, sent: {:?}", request_data.response.as_ref().unwrap().message.command_id(), latency, request_data.time_sent_utc);
                 },
                 None => {
                     missed_responses += 1;
@@ -217,16 +223,25 @@ impl Client {
         if dropped_sequence > 0 {
             println!("dropped requests: {dropped_sequence}");
         }
-        let avg_latency = all_latencies.iter().sum::<i64>() as f64 / all_latencies.len() as f64;
-        let duration_s = self.request_rate_intervals.first().unwrap().duration_sec as f64;
-        let num_responses = all_latencies.len();
+        let avg_latency = latency_sum as f64 / num_responses as f64;
+        let duration_s = self.iterations as f64 * self.batch_interval.as_secs_f64();
         let throughput = if num_responses <= missed_responses {
-            eprintln!("More dropped requests ({missed_responses}) than completed requests ({num_responses})");
+            eprintln!("More dropped requests ({num_responses}) than completed requests ({num_responses})");
             0.0
         } else {
             (num_responses - missed_responses) as f64 / duration_s
         };
-        println!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}");
-        eprintln!("Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}");
+        let res_str = format!(
+            "Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+        );
+        println!("{res_str}");
+        eprintln!("{res_str}");
+
+        let mut p_str = String::from("Latency percentiles:");
+        for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
+            p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
+        }
+        println!("{p_str}");
+        eprintln!("{p_str}");
     }
 }
