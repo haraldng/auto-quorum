@@ -41,10 +41,11 @@ pub struct ClientConfig {
     pub scheduled_start_utc_ms: Option<i64>,
     pub use_metronome: Option<bool>,
     pub req_batch_size: Option<usize>,
-    pub(crate) interval_sec: Option<u64>,
+    pub(crate) interval_ms: Option<u64>,
     pub(crate) iterations: Option<usize>
 }
 
+/*
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct RequestInterval {
     duration_sec: u64,
@@ -70,6 +71,7 @@ impl RequestInterval {
         }
     }
 }
+*/
 
 pub struct Client {
     server: ServerConnection,
@@ -98,7 +100,7 @@ impl Client {
             request_data: Vec::with_capacity(8000),
             kill_signal_sec: config.kill_signal_sec,
             req_batch_size: config.req_batch_size.expect("Batch size not set"),
-            batch_interval: Duration::from_secs(config.interval_sec.expect("Interval not set")),
+            batch_interval: Duration::from_millis(config.interval_ms.expect("Interval not set")),
             iterations: config.iterations.expect("Iterations not set"),
             current_iteration: 0,
             num_responses: 0,

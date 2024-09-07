@@ -29,12 +29,12 @@ pub async fn main() {
     let config_string = fs::read_to_string(config_file).unwrap();
     let client_config: ClientConfig = toml::from_str(&config_string).unwrap();
     println!(
-        "Client: {}, Metronome: {}, req_batch_size: {}, interval_sec: {}, iterations: {}",
-         client_config.server_id,
-         client_config.use_metronome.unwrap(),
-         client_config.req_batch_size.unwrap(),
-         client_config.interval_sec.unwrap(),
-         client_config.iterations.unwrap()
+        "Client: {}, Metronome: {}, req_batch_size: {}, interval_ms: {}, iterations: {}",
+        client_config.server_id,
+        client_config.use_metronome.unwrap(),
+        client_config.req_batch_size.unwrap(),
+        client_config.interval_ms.unwrap(),
+        client_config.iterations.unwrap()
     );
     // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
     let mut client = Client::with(client_config).await;
