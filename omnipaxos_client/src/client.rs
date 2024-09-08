@@ -39,7 +39,7 @@ pub struct ClientConfig {
     local_deployment: Option<bool>,
     kill_signal_sec: Option<u64>,
     pub scheduled_start_utc_ms: Option<i64>,
-    pub use_metronome: Option<bool>,
+    pub use_metronome: Option<usize>,
     pub req_batch_size: Option<usize>,
     pub(crate) interval_ms: Option<u64>,
     pub(crate) iterations: Option<usize>
