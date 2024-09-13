@@ -17,7 +17,7 @@ cleanup() {
 trap "interrupt" SIGINT
 trap "cleanup" EXIT
 
-# sudo tc qdisc add dev lo root netem delay 100msec
+#sudo tc qdisc add dev lo root netem delay 1msec
 for ((i = 1; i <= cluster_size; i++)); do
     config_path="./server-${i}-config.toml"
     # Set log path and optimize setting in TOML config file depending on arg 2

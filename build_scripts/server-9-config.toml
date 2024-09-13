@@ -1,4 +1,4 @@
-location = "local-5"
+location = "local-9"
 initial_leader = 1
 local_deployment = true
 optimize = true
@@ -7,11 +7,11 @@ storage_duration_micros = 0
 
 [cluster_config]
 configuration_id = 1
-nodes = [1, 2, 3]
+nodes = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 use_metronome = 0
 
 [server_config]
-pid = 5
+pid = 9
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200

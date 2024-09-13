@@ -32,7 +32,7 @@ pub struct OmniPaxosServerConfig {
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
     pub initial_read_strat: Option<Vec<ReadStrategy>>,
-    pub storage_duration_ms: Option<u64>
+    pub storage_duration_micros: Option<u64>
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -62,11 +62,11 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage_duration_ms = server_config.storage_duration_ms.expect("Storage duration must be set");
+        let storage_duration_micros = server_config.storage_duration_micros.expect("Storage duration must be set");
         // let flush_duration = Duration::from_millis(storage_duration_ms);
         // let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
         let storage = MemoryStorage::default();
-        info!("Node: {:?}: using metronome: {}, storage_duration: {}", server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_ms);
+        info!("Node: {:?}: using metronome: {}, storage_duration: {}", server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -101,7 +101,7 @@ impl OmniPaxosServer {
             optimize,
             optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
             leader_attempt: 0,
-            storage_duration: Duration::from_millis(storage_duration_ms),
+            storage_duration: Duration::from_micros(storage_duration_micros),
         };
         server.send_outgoing_msgs().await;
         server

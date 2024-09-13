@@ -42,7 +42,9 @@ pub struct ClientConfig {
     pub use_metronome: Option<usize>,
     pub req_batch_size: Option<usize>,
     pub(crate) interval_ms: Option<u64>,
-    pub(crate) iterations: Option<usize>
+    pub(crate) iterations: Option<usize>,
+    pub storage_duration_micros: Option<usize>,
+    pub nodes: Option<Vec<usize>>
 }
 
 /*

@@ -34,14 +34,14 @@ cleanup() {
     sed -i "s/$utc_sync/SCHEDULE/g" "$client1_config_path"
     sed -i "s/$utc_sync/SCHEDULE/g" "$client2_config_path"
 }
-trap "interrupt" SIGINT
-trap "cleanup" EXIT
+#trap "interrupt" SIGINT
+#trap "cleanup" EXIT
 
 # Replace SCHEDULE placeholder in TOML config with unified start time
 # Ensures that the clients' event loops start at the same time despite the executables starting at different times.
 #sed -i "s/SCHEDULE/$utc_sync/g" "$client1_config_path" &&
 #sed -i "s/SCHEDULE/$utc_sync/g" "$client2_config_path" &&
 
-CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client1_log_path" &
+CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client1_log_path"
 #CONFIG_FILE="$client2_config_path"  cargo run --manifest-path="../omnipaxos_client/Cargo.toml" 1> "$client2_log_path"
 

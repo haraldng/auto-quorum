@@ -3,16 +3,16 @@ initial_leader = 1
 local_deployment = true
 optimize = true
 optimize_threshold = 0.97
-storage_duration_ms = 80
+storage_duration_micros = 0
 
 [cluster_config]
 configuration_id = 1
-nodes = [1, 2, 3, 4, 5]
-use_metronome = 2
+nodes = [1, 2, 3]
+use_metronome = 0
 
 [server_config]
 pid = 3
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200
-batch_size = 10
+
