@@ -124,9 +124,20 @@ impl OmniPaxosServer {
                 _ = election_interval.tick() => {
                     let cluster_connected = self.reconnect_to_cluster();
                     if cluster_connected {
+                        debug!("FULLY CONNECTED TO CLUSTER");
                         self.become_initial_leader(initial_leader).await;
+                        break;
                     }
                 },
+                Some(msg) = self.network.next() => {
+                    self.handle_incoming_msg(msg.unwrap()).await;
+                },
+            }
+        }
+
+        loop {
+            tokio::select! {
+                biased;
                 _ = outgoing_interval.tick() => {
                     self.send_outgoing_msgs().await;
                 }
