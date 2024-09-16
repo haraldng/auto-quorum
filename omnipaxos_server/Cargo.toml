@@ -12,9 +12,9 @@ futures = "0.3.30"
 log = "0.4.20"
 omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome", features = ["serde", "toml_config"] }
 #omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "auto-quorum", features = ["serde", "toml_config"] }
-#omnipaxos = { path = "/Users/haraldng/code/omnipaxos/omnipaxos", features = ["serde", "toml_config", "logging"] }
+# omnipaxos = { path = "/Users/haraldng/code/omnipaxos/omnipaxos", features = ["serde", "toml_config", "logging"] }
 omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome" }
-#omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "auto-quorum" }
+# omnipaxos_storage = { path = "../../../auto-quorum/omnipaxos_storage" }
 #omnipaxos_storage = { path = "/Users/haraldng/code/omnipaxos/omnipaxos_storage" }
 common = { path = "../common" }
 serde = { version = "1.0.194", features = ["derive"] }

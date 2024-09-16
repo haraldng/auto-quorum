@@ -8,10 +8,12 @@ storage_duration_micros = 0
 [cluster_config]
 configuration_id = 1
 nodes = [1, 2, 3]
+# 1 = shuffle but still flush tail, 2 = no tail flush
 use_metronome = 0
 
 [server_config]
 pid = 1
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
+# batch_size = 0 => use metronome length
 flush_batch_tick_timeout = 200

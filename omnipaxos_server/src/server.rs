@@ -4,13 +4,14 @@ use log::*;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use omnipaxos::{
-    util::{LogEntry, NodeId}, OmniPaxos, OmniPaxosConfig,
-};
 use omnipaxos::ballot_leader_election::Ballot;
-use omnipaxos::messages::Message;
 use omnipaxos::messages::sequence_paxos::PaxosMsg;
+use omnipaxos::messages::Message;
 use omnipaxos::sequence_paxos::Phase;
+use omnipaxos::{
+    util::{LogEntry, NodeId},
+    OmniPaxos, OmniPaxosConfig,
+};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 
 use crate::{
@@ -32,7 +33,7 @@ pub struct OmniPaxosServerConfig {
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
     pub initial_read_strat: Option<Vec<ReadStrategy>>,
-    pub storage_duration_micros: Option<u64>
+    pub storage_duration_micros: Option<u64>,
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -62,11 +63,16 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage_duration_micros = server_config.storage_duration_micros.expect("Storage duration must be set");
+        let storage_duration_micros = server_config
+            .storage_duration_micros
+            .expect("Storage duration must be set");
         // let flush_duration = Duration::from_millis(storage_duration_ms);
         // let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
         let storage = MemoryStorage::default();
-        info!("Node: {:?}: using metronome: {}, storage_duration: {}", server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros);
+        info!(
+            "Node: {:?}: using metronome: {}, storage_duration: {}",
+            server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros
+        );
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -116,7 +122,10 @@ impl OmniPaxosServer {
             tokio::select! {
                 biased;
                 _ = election_interval.tick() => {
-                    self.become_initial_leader(initial_leader).await;
+                    let cluster_connected = self.reconnect_to_cluster();
+                    if cluster_connected {
+                        self.become_initial_leader(initial_leader).await;
+                    }
                 },
                 _ = outgoing_interval.tick() => {
                     self.send_outgoing_msgs().await;
@@ -128,18 +137,36 @@ impl OmniPaxosServer {
         }
     }
 
+    // Retry connection to other nodes in the cluster. Returns true if connected to entire cluster otherwise false.
+    fn reconnect_to_cluster(&mut self) -> bool {
+        let pending_cluster_connections: Vec<&u64> = self
+            .nodes
+            .iter()
+            .filter(|&node_id| {
+                *node_id != self.id && !self.network.cluster_connections.contains_key(node_id)
+            })
+            .collect();
+        for pending_node in &pending_cluster_connections {
+            self.network.connect_to_node(**pending_node);
+        }
+        return pending_cluster_connections.is_empty();
+    }
+
     async fn become_initial_leader(&mut self, leader_pid: NodeId) {
         if leader_pid == self.id {
             let (_leader, phase) = self.omnipaxos.get_current_leader_state();
             match phase {
-                Phase::Accept => {},
+                Phase::Accept => {}
                 _ => {
                     let mut ballot = Ballot::default();
                     self.leader_attempt += 1;
                     ballot.n = self.leader_attempt;
                     ballot.pid = self.id;
                     ballot.config_id = 1;
-                    info!("Node: {:?}, Initializing prepare phase with ballot: {:?}", self.id, ballot);
+                    info!(
+                        "Node: {:?}, Initializing prepare phase with ballot: {:?}",
+                        self.id, ballot
+                    );
                     self.omnipaxos.initialize_prepare_phase(ballot);
                 }
             }
@@ -149,9 +176,7 @@ impl OmniPaxosServer {
     async fn handle_decided_entries(&mut self) {
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
-            let decided_entries = self
-                .omnipaxos
-                .read_decided_suffix(self.current_decided_idx);
+            let decided_entries = self.omnipaxos.read_decided_suffix(self.current_decided_idx);
             match decided_entries {
                 Some(ents) => {
                     self.current_decided_idx = new_decided_idx;
@@ -162,10 +187,13 @@ impl OmniPaxosServer {
                     });
                     self.update_database_and_respond(decided_commands.collect())
                         .await;
-                },
+                }
                 None => {
                     let log_len = self.omnipaxos.read_entries(0..).unwrap_or_default().len();
-                    warn!("Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}", self.id);
+                    warn!(
+                        "Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}",
+                        self.id
+                    );
                 }
             }
         }
@@ -191,14 +219,12 @@ impl OmniPaxosServer {
         let messages = self.omnipaxos.outgoing_messages();
         for msg in messages {
             match &msg {
-                Message::SequencePaxos(paxos_msg) => {
-                    match paxos_msg.msg {
-                        PaxosMsg::Accepted(_) => {
-                            tokio::time::sleep(self.storage_duration).await;
-                        },
-                        _ => {}
+                Message::SequencePaxos(paxos_msg) => match paxos_msg.msg {
+                    PaxosMsg::Accepted(_) => {
+                        tokio::time::sleep(self.storage_duration).await;
                     }
-                }
+                    _ => {}
+                },
                 Message::BLE(_) => {}
             }
             let to = msg.get_receiver();

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::time::{interval};
+use tokio::time::interval;
 use tokio_stream::StreamExt;
 
 use common::util::{get_node_addr, wrap_stream, Connection as ServerConnection};
@@ -12,7 +12,6 @@ use common::{kv::*, messages::*};
 use histogram::Histogram;
 
 const PERCENTILES: [f64; 6] = [50.0, 70.0, 80.0, 90.0, 95.0, 99.0];
-
 
 #[derive(Debug, Serialize)]
 struct RequestData {
@@ -22,7 +21,9 @@ struct RequestData {
 
 impl RequestData {
     fn response_time(&self) -> Option<i64> {
-        self.response.as_ref().map(|r| r.time_recieved_utc - self.time_sent_utc)
+        self.response
+            .as_ref()
+            .map(|r| r.time_recieved_utc - self.time_sent_utc)
     }
 }
 
@@ -44,7 +45,7 @@ pub struct ClientConfig {
     pub(crate) interval_ms: Option<u64>,
     pub(crate) iterations: Option<usize>,
     pub storage_duration_micros: Option<usize>,
-    pub nodes: Option<Vec<usize>>
+    pub nodes: Option<Vec<usize>>,
 }
 
 /*
@@ -216,12 +217,17 @@ impl Client {
                         println!("dropped requests: {dropped_sequence}");
                         dropped_sequence = 0;
                     }
-                    println!("request: {:?}, latency: {:?}, sent: {:?}", request_data.response.as_ref().unwrap().message.command_id(), latency, request_data.time_sent_utc);
-                },
+                    println!(
+                        "request: {:?}, latency: {:?}, sent: {:?}",
+                        request_data.response.as_ref().unwrap().message.command_id(),
+                        latency,
+                        request_data.time_sent_utc
+                    );
+                }
                 None => {
                     missed_responses += 1;
                     dropped_sequence += 1;
-                },
+                }
             }
         }
         if dropped_sequence > 0 {
@@ -230,7 +236,9 @@ impl Client {
         let avg_latency = latency_sum as f64 / num_responses as f64;
         let duration_s = self.iterations as f64 * self.batch_interval.as_secs_f64();
         let throughput = if num_responses <= missed_responses {
-            eprintln!("More dropped requests ({num_responses}) than completed requests ({num_responses})");
+            eprintln!(
+                "More dropped requests ({num_responses}) than completed requests ({num_responses})"
+            );
             0.0
         } else {
             (num_responses - missed_responses) as f64 / duration_s

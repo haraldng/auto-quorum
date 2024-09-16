@@ -27,7 +27,7 @@ enum NewConnection {
 pub struct Network {
     id: NodeId,
     listener: TcpListener,
-    cluster_connections: HashMap<NodeId, NetworkSink>,
+    pub cluster_connections: HashMap<NodeId, NetworkSink>,
     client_connections: HashMap<ClientId, NetworkSink>,
     max_client_id: Arc<Mutex<ClientId>>,
     connection_sink: Sender<NewConnection>,
@@ -46,7 +46,7 @@ impl Network {
         let (connection_sink, connection_source) = mpsc::channel(100);
         let (message_sink, message_source) = mpsc::channel(100);
         let port = 8000 + id as u16;
-        let listening_address = SocketAddr::from(([127, 0, 0, 1], port));
+        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(listening_address).await?;
         let mut network = Self {
             id,
@@ -67,7 +67,7 @@ impl Network {
         Ok(network)
     }
 
-    fn connect_to_node(&mut self, to: NodeId) {
+    pub fn connect_to_node(&mut self, to: NodeId) {
         debug!("Trying to connect to node {to}");
         let message_sink = self.message_sink.clone();
         let connection_sink = self.connection_sink.clone();
@@ -79,6 +79,7 @@ impl Network {
                 return;
             }
         };
+        debug!("Connecting to node {to} at address {to_address:?}");
         tokio::spawn(async move {
             match TcpStream::connect(to_address).await {
                 Ok(connection) => {
