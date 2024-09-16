@@ -20,6 +20,11 @@ use crate::{
     optimizer::{ClusterOptimizer, ClusterStrategy},
 };
 use common::{kv::*, messages::*};
+use tempfile::tempfile;
+use std::io::Write;
+use std::fs::File;
+
+
 
 const LEADER_WAIT: Duration = Duration::from_secs(3);
 
@@ -32,7 +37,8 @@ pub struct OmniPaxosServerConfig {
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
     pub initial_read_strat: Option<Vec<ReadStrategy>>,
-    pub storage_duration_micros: Option<u64>
+    pub storage_duration_micros: Option<u64>,
+    pub data_size: Option<usize>,
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -51,6 +57,8 @@ pub struct OmniPaxosServer {
     optimize_threshold: f64,
     leader_attempt: u32,
     storage_duration: Duration,
+    data_size: usize,
+    temp_file: Option<File>,
 }
 
 impl OmniPaxosServer {
@@ -62,11 +70,23 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage_duration_micros = server_config.storage_duration_micros.expect("Storage duration must be set");
+        let storage_duration_micros = server_config
+            .storage_duration_micros
+            .expect("Storage duration must be set");
+        let data_size = server_config.data_size.unwrap_or(0);
+        let temp_file = if data_size == 0 {
+            None
+        } else {
+            let file = tempfile().expect("Failed to open temp file");
+            Some(file)
+        };
         // let flush_duration = Duration::from_millis(storage_duration_ms);
         // let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
         let storage = MemoryStorage::default();
-        info!("Node: {:?}: using metronome: {}, storage_duration: {}", server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros);
+        info!(
+            "Node: {:?}: using metronome: {}, storage_duration: {}, data_size: {data_size}, file: {:?}",
+            server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros, &temp_file
+        );
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(server_id, nodes.clone(), local_deployment)
             .await
@@ -102,6 +122,8 @@ impl OmniPaxosServer {
             optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
             leader_attempt: 0,
             storage_duration: Duration::from_micros(storage_duration_micros),
+            data_size,
+            temp_file
         };
         server.send_outgoing_msgs().await;
         server
@@ -191,14 +213,18 @@ impl OmniPaxosServer {
         let messages = self.omnipaxos.outgoing_messages();
         for msg in messages {
             match &msg {
-                Message::SequencePaxos(paxos_msg) => {
-                    match paxos_msg.msg {
-                        PaxosMsg::Accepted(_) => {
+                Message::SequencePaxos(paxos_msg) => match paxos_msg.msg {
+                    PaxosMsg::Accepted(_) => {
+                        if self.data_size == 0 {
                             tokio::time::sleep(self.storage_duration).await;
-                        },
-                        _ => {}
+                        } else {
+                            let buffer = vec![b'A'; self.data_size]; // A vector of `x` bytes, all set to 'A'
+                            self.temp_file.as_mut().unwrap().write_all(&buffer).expect("Failed to write file");
+                            self.temp_file.as_mut().unwrap().flush().expect("Failed to flush file");
+                        }
                     }
-                }
+                    _ => {}
+                },
                 Message::BLE(_) => {}
             }
             let to = msg.get_receiver();

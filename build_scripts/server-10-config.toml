@@ -4,6 +4,8 @@ local_deployment = true
 optimize = true
 optimize_threshold = 0.97
 storage_duration_micros = 0
+data_size = 8
+
 
 [cluster_config]
 configuration_id = 1
