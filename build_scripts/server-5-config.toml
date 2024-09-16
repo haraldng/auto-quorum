@@ -8,11 +8,11 @@ storage_duration_micros = 0
 [cluster_config]
 configuration_id = 1
 nodes = [1, 2, 3]
-use_metronome = 0
+use_metronome = 2
 
 [server_config]
 pid = 5
 election_tick_timeout = 1
 resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200
-
+batch_size = 200

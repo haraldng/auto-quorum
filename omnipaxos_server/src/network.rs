@@ -68,7 +68,7 @@ impl Network {
     }
 
     fn connect_to_node(&mut self, to: NodeId) {
-        debug!("Trying to connect to node {to}");
+        debug!("Node {}: Trying to connect to node {to}", self.id);
         let message_sink = self.message_sink.clone();
         let connection_sink = self.connection_sink.clone();
         let from = self.id;
@@ -251,7 +251,7 @@ impl Network {
                 self.cluster_connections.remove(&to);
             }
         } else {
-            warn!("Not connected to node {to}");
+            warn!("Node {}: Not connected to node {to}", self.id);
             // If HeartbeatRequest msg is what failed, try to reconnect to node.
             if let ClusterMessage::OmniPaxosMessage(OmniPaxosMessage::BLE(m)) = msg {
                 if m.to == to {

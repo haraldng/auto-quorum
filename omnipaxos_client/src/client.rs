@@ -12,7 +12,7 @@ use common::{kv::*, messages::*};
 use histogram::Histogram;
 
 const PERCENTILES: [f64; 6] = [50.0, 70.0, 80.0, 90.0, 95.0, 99.0];
-
+const EXP_TIMEOUT_ITERATIONS: usize = 100000;   // number of iterations until we stop waiting for responses
 
 #[derive(Debug, Serialize)]
 struct RequestData {
@@ -96,14 +96,16 @@ impl Client {
             .await
             .expect("Couldn't connect to server {server_id}");
         server_stream.set_nodelay(true).unwrap();
+        let req_batch_size = config.req_batch_size.expect("Batch size not set");
+        let iterations = config.iterations.expect("Iterations not set");
         let mut client = Self {
             server: wrap_stream(server_stream),
             command_id: 0,
-            request_data: Vec::with_capacity(8000),
+            request_data: Vec::with_capacity(req_batch_size *iterations),
             kill_signal_sec: config.kill_signal_sec,
-            req_batch_size: config.req_batch_size.expect("Batch size not set"),
+            req_batch_size,
             batch_interval: Duration::from_millis(config.interval_ms.expect("Interval not set")),
-            iterations: config.iterations.expect("Iterations not set"),
+            iterations,
             current_iteration: 0,
             num_responses: 0,
         };
@@ -135,8 +137,8 @@ impl Client {
                 // Send request according to rate of current request interval setting. (defined in
                     // TOML config)
                 _ = batch_interval.tick() => {
-                    if self.current_iteration == self.iterations {
-                        if self.num_responses == self.request_data.len() {
+                    if self.current_iteration >= self.iterations {
+                        if self.num_responses == self.request_data.len() || self.current_iteration == self.iterations + EXP_TIMEOUT_ITERATIONS {
                             break;
                         }
                     } else {
@@ -144,8 +146,8 @@ impl Client {
                             let key = self.command_id.to_string();
                             self.put(key.clone(), key).await;
                         }
-                        self.current_iteration += 1;
                     }
+                    self.current_iteration += 1;
                 },
             }
         }
@@ -205,6 +207,10 @@ impl Client {
         let mut histo = Histogram::new(15, 16).unwrap();
         let mut latency_sum = 0;
         let mut num_responses = 0;
+
+        let first_sent = self.request_data.first().unwrap().time_sent_utc;
+        let mut last_received = 0;
+
         for request_data in &self.request_data {
             let response_time = request_data.response_time();
             match response_time {
@@ -212,6 +218,7 @@ impl Client {
                     histo.increment(latency as u64).unwrap();
                     latency_sum += latency;
                     num_responses += 1;
+                    last_received = request_data.response.as_ref().unwrap().time_recieved_utc;
                     if dropped_sequence > 0 {
                         println!("dropped requests: {dropped_sequence}");
                         dropped_sequence = 0;
@@ -229,14 +236,19 @@ impl Client {
         }
         let avg_latency = latency_sum as f64 / num_responses as f64;
         let duration_s = self.iterations as f64 * self.batch_interval.as_secs_f64();
-        let throughput = if num_responses <= missed_responses {
+
+
+        let elapsed_ms = last_received - first_sent;
+        let throughput = num_responses as f64 / (elapsed_ms as f64 / 1000.0);
+
+        let req_rate = if num_responses <= missed_responses {
             eprintln!("More dropped requests ({num_responses}) than completed requests ({num_responses})");
             0.0
         } else {
             (num_responses - missed_responses) as f64 / duration_s
         };
         let res_str = format!(
-            "Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+            "Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, Request rate: {req_rate} ops/s, num requests: {num_requests}, missed: {missed_responses}"
         );
         println!("{res_str}");
         eprintln!("{res_str}");
