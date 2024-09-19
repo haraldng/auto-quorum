@@ -1,3 +1,4 @@
+cluster_name = "local-cluster"
 location = "local-3"
 initial_leader = 1
 local_deployment = true
