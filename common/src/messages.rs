@@ -1,6 +1,5 @@
 use omnipaxos::{
-    ballot_leader_election::Ballot, messages::Message as OmniPaxosMessage,
-    util::NodeId,
+    ballot_leader_election::Ballot, messages::Message as OmniPaxosMessage, util::NodeId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +34,7 @@ pub enum ClientMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
+    Ready,
     Write(CommandId),
     Read(CommandId, Option<String>),
 }
@@ -44,6 +44,7 @@ impl ServerMessage {
         match self {
             ServerMessage::Write(id) => *id,
             ServerMessage::Read(id, _) => *id,
+            ServerMessage::Ready => unimplemented!(),
         }
     }
 }

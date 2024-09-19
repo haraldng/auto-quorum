@@ -25,10 +25,11 @@ enum NewConnection {
 }
 
 pub struct Network {
+    cluster_name: String,
     id: NodeId,
     listener: TcpListener,
     pub cluster_connections: HashMap<NodeId, NetworkSink>,
-    client_connections: HashMap<ClientId, NetworkSink>,
+    pub client_connections: HashMap<ClientId, NetworkSink>,
     max_client_id: Arc<Mutex<ClientId>>,
     connection_sink: Sender<NewConnection>,
     connection_source: Receiver<NewConnection>,
@@ -39,6 +40,7 @@ pub struct Network {
 
 impl Network {
     pub async fn new(
+        cluster_name: String,
         id: NodeId,
         peers: Vec<NodeId>,
         local_deployment: bool,
@@ -49,6 +51,7 @@ impl Network {
         let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(listening_address).await?;
         let mut network = Self {
+            cluster_name,
             id,
             listener,
             cluster_connections: HashMap::new(),
@@ -60,26 +63,24 @@ impl Network {
             message_source,
             is_local: local_deployment,
         };
-        // Create connections to other servers
-        for peer in peers.into_iter().filter(|p| *p < id) {
-            network.connect_to_node(peer);
-        }
+        // // Create connections to other servers
+        // for peer in peers.into_iter().filter(|p| *p < id) {
+        //     network.connect_to_node(peer);
+        // }
         Ok(network)
     }
 
     pub fn connect_to_node(&mut self, to: NodeId) {
-        debug!("Trying to connect to node {to}");
         let message_sink = self.message_sink.clone();
         let connection_sink = self.connection_sink.clone();
         let from = self.id;
-        let to_address = match get_node_addr(to, self.is_local) {
+        let to_address = match get_node_addr(&self.cluster_name, to, self.is_local) {
             Ok(addr) => addr,
             Err(e) => {
                 log::error!("Error resolving DNS name of node {to}: {e}");
                 return;
             }
         };
-        debug!("Connecting to node {to} at address {to_address:?}");
         tokio::spawn(async move {
             match TcpStream::connect(to_address).await {
                 Ok(connection) => {
@@ -200,7 +201,6 @@ impl Network {
 
         // Send handshake
         let handshake = NetworkMessage::NodeRegister(my_id);
-        debug!("Sending handshake to {to}");
         if let Err(err) = writer.send(handshake).await {
             error!("Error sending handshake to {to}: {err}");
             return;
@@ -252,13 +252,13 @@ impl Network {
                 self.cluster_connections.remove(&to);
             }
         } else {
-            warn!("Not connected to node {to}");
+            warn!("Not connected to node {to}: couldn't send {msg:?}");
             // If HeartbeatRequest msg is what failed, try to reconnect to node.
-            if let ClusterMessage::OmniPaxosMessage(OmniPaxosMessage::BLE(m)) = msg {
-                if m.to == to {
-                    self.connect_to_node(to);
-                }
-            }
+            // if let ClusterMessage::OmniPaxosMessage(OmniPaxosMessage::BLE(m)) = msg {
+            //     if m.to == to {
+            //         self.connect_to_node(to);
+            //     }
+            // }
         }
     }
 
@@ -298,6 +298,7 @@ impl Stream for Network {
                         self.connection_sink.clone(),
                         self.max_client_id.clone(),
                     ));
+                    cx.waker().wake_by_ref();
                 }
                 Err(err) => {
                     error!("Error checking for new requests: {:?}", err);
@@ -308,7 +309,10 @@ impl Stream for Network {
         // Poll new identified connection
         if let Poll::Ready(val) = self.connection_source.poll_recv(cx) {
             match val {
-                Some(new_conn) => self.handle_identified_connection(new_conn),
+                Some(new_conn) => {
+                    self.handle_identified_connection(new_conn);
+                    cx.waker().wake_by_ref();
+                }
                 None => return Poll::Ready(Some(Err(NetworkError::InternalChannelFailure))),
             }
         }
@@ -320,8 +324,8 @@ impl Stream for Network {
             }
         }
         // Nothing to yield yet
-        // Note: don't need to call waker here because previous poll_recv and poll_accept will
-        // handle scheduling the wake up.
+        // NOTE: don't need to call waker here because previous poll_recv and poll_accept will
+        // handle scheduling the wake up???
         return Poll::Pending;
     }
 }

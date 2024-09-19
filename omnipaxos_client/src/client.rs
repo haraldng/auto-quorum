@@ -1,6 +1,7 @@
 use chrono::Utc;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -35,6 +36,7 @@ struct Response {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientConfig {
+    cluster_name: String,
     location: String,
     pub server_id: u64,
     local_deployment: Option<bool>,
@@ -88,17 +90,28 @@ pub struct Client {
     num_responses: usize,
 }
 
+async fn get_server_connection(server_address: SocketAddr) -> ServerConnection {
+    let mut retry_connection = interval(Duration::from_secs(1));
+    loop {
+        retry_connection.tick().await;
+        match TcpStream::connect(server_address).await {
+            Ok(stream) => {
+                stream.set_nodelay(true).unwrap();
+                break wrap_stream(stream);
+            }
+            Err(e) => eprintln!("Unable to connect to server: {e}"),
+        }
+    }
+}
+
 impl Client {
     pub async fn with(config: ClientConfig) -> Self {
         let is_local = config.local_deployment.unwrap_or(false);
-        let server_address =
-            get_node_addr(config.server_id, is_local).expect("Couldn't resolve server IP");
-        let server_stream = TcpStream::connect(server_address)
-            .await
-            .expect("Couldn't connect to server {server_id}");
-        server_stream.set_nodelay(true).unwrap();
+        let server_address = get_node_addr(&config.cluster_name, config.server_id, is_local)
+            .expect("Couldn't resolve server IP");
+        let server = get_server_connection(server_address).await;
         let mut client = Self {
-            server: wrap_stream(server_stream),
+            server,
             command_id: 0,
             request_data: Vec::with_capacity(8000),
             kill_signal_sec: config.kill_signal_sec,
@@ -125,6 +138,12 @@ impl Client {
     }
 
     pub async fn run(&mut self) {
+        let first_msg = self.server.next().await.unwrap();
+        match first_msg.unwrap() {
+            NetworkMessage::ServerMessage(ServerMessage::Ready) => (),
+            _ => panic!("Recieved unexpected message during handshake"),
+        }
+
         let mut batch_interval = interval(self.batch_interval);
         batch_interval.tick().await;
 
@@ -210,19 +229,25 @@ impl Client {
             let response_time = request_data.response_time();
             match response_time {
                 Some(latency) => {
+                    if latency > 10 {
+                        eprintln!("SLOW REQUEST {request_data:?}");
+                    }
                     histo.increment(latency as u64).unwrap();
                     latency_sum += latency;
                     num_responses += 1;
-                    if dropped_sequence > 0 {
-                        println!("dropped requests: {dropped_sequence}");
-                        dropped_sequence = 0;
+                    // if dropped_sequence > 0 {
+                    //     println!("dropped requests: {dropped_sequence}");
+                    //     dropped_sequence = 0;
+                    // }
+                    if latency > 10 {
+                        println!("SLOW REQUEST {request_data:?}");
                     }
-                    println!(
-                        "request: {:?}, latency: {:?}, sent: {:?}",
-                        request_data.response.as_ref().unwrap().message.command_id(),
-                        latency,
-                        request_data.time_sent_utc
-                    );
+                    // println!(
+                    //     "request: {:?}, latency: {:?}, sent: {:?}",
+                    //     request_data.response.as_ref().unwrap().message.command_id(),
+                    //     latency,
+                    //     request_data.time_sent_utc
+                    // );
                 }
                 None => {
                     missed_responses += 1;
@@ -230,10 +255,21 @@ impl Client {
                 }
             }
         }
+        let avg_latency = latency_sum as f64 / num_responses as f64;
+        let variance = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .map(|value| {
+                let diff = value as f64 - avg_latency;
+                diff * diff
+            })
+            .sum::<f64>()
+            / num_responses as f64;
+        let std_dev = variance.sqrt();
         if dropped_sequence > 0 {
             println!("dropped requests: {dropped_sequence}");
         }
-        let avg_latency = latency_sum as f64 / num_responses as f64;
         let duration_s = self.iterations as f64 * self.batch_interval.as_secs_f64();
         let throughput = if num_responses <= missed_responses {
             eprintln!(
@@ -244,7 +280,7 @@ impl Client {
             (num_responses - missed_responses) as f64 / duration_s
         };
         let res_str = format!(
-            "Avg latency: {avg_latency} ms, Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+            "Avg latency: {avg_latency} ms, Std dev: {std_dev} Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
         );
         println!("{res_str}");
         eprintln!("{res_str}");

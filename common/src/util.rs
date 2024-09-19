@@ -18,12 +18,16 @@ pub fn wrap_stream(stream: TcpStream) -> Connection {
     Framed::new(length_delimited, Bincode::default())
 }
 
-pub fn get_node_addr(node: NodeId, is_local: bool) -> Result<SocketAddr, std::io::Error> {
+pub fn get_node_addr(
+    cluster_name: &String,
+    node: NodeId,
+    is_local: bool,
+) -> Result<SocketAddr, std::io::Error> {
     let dns_name = if is_local {
         // format!("s{node}:800{node}")
         format!("localhost:800{node}")
     } else {
-        format!("server-{node}.internal.zone.:800{node}")
+        format!("{cluster_name}-server-{node}.internal.zone.:800{node}")
     };
     let address = dns_name.to_socket_addrs()?.next().unwrap();
     Ok(address)

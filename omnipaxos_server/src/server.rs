@@ -26,6 +26,7 @@ const LEADER_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OmniPaxosServerConfig {
+    pub cluster_name: String,
     pub location: String,
     pub initial_leader: Option<NodeId>,
     pub optimize: Option<bool>,
@@ -74,9 +75,14 @@ impl OmniPaxosServer {
             server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros
         );
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
-        let network = Network::new(server_id, nodes.clone(), local_deployment)
-            .await
-            .unwrap();
+        let network = Network::new(
+            server_config.cluster_name,
+            server_id,
+            nodes.clone(),
+            local_deployment,
+        )
+        .await
+        .unwrap();
         let metrics_server = MetricsHeartbeatServer::new(server_id, nodes.clone());
         let quorum_size = nodes.len() / 2 + 1;
         let init_read_quorum = quorum_size;
@@ -109,46 +115,46 @@ impl OmniPaxosServer {
             leader_attempt: 0,
             storage_duration: Duration::from_micros(storage_duration_micros),
         };
+        // Clears outgoing_messages of initial BLE messages
         server.send_outgoing_msgs().await;
         server
     }
 
     pub async fn run(&mut self, initial_leader: NodeId) {
         let mut election_interval = tokio::time::interval(LEADER_WAIT);
-        let mut outgoing_interval = tokio::time::interval(Duration::from_millis(1));
-        election_interval.tick().await;
-
         loop {
             tokio::select! {
-                biased;
+                // Ensures cluster is connected and leader is promoted before client starts sending
+                // requests.
                 _ = election_interval.tick() => {
-                    let cluster_connected = self.reconnect_to_cluster();
-                    if cluster_connected {
-                        debug!("FULLY CONNECTED TO CLUSTER");
-                        self.become_initial_leader(initial_leader).await;
+                    let cluster_is_connected = self.reconnect_to_cluster();
+                    if self.id != initial_leader && cluster_is_connected {
+                        debug!("{}: Fully connected to cluster", self.id);
                         break;
                     }
+                    if self.id == initial_leader && cluster_is_connected {
+                        self.become_initial_leader(initial_leader).await;
+                        let client_is_initialized = self.initialize_client().await;
+                        if client_is_initialized {
+                            debug!("{}: Leader fully initialized connections", self.id);
+                            break;
+                        }
+                    }
                 },
+                // Still necessary for sending handshakes and polling for new connections
                 Some(msg) = self.network.next() => {
                     self.handle_incoming_msg(msg.unwrap()).await;
                 },
             }
         }
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = outgoing_interval.tick() => {
-                    self.send_outgoing_msgs().await;
-                }
-                Some(msg) = self.network.next() => {
-                    self.handle_incoming_msg(msg.unwrap()).await;
-                },
-            }
+        while let Some(msg) = self.network.next().await {
+            self.handle_incoming_msg(msg.unwrap()).await;
         }
     }
 
-    // Retry connection to other nodes in the cluster. Returns true if connected to entire cluster otherwise false.
+    // Retry connection to other nodes in the cluster. Returns true if connections
+    // necessary for cluster operation exist.
     fn reconnect_to_cluster(&mut self) -> bool {
         let pending_cluster_connections: Vec<&u64> = self
             .nodes
@@ -158,9 +164,21 @@ impl OmniPaxosServer {
             })
             .collect();
         for pending_node in &pending_cluster_connections {
-            self.network.connect_to_node(**pending_node);
+            if **pending_node < self.id {
+                self.network.connect_to_node(**pending_node);
+            }
         }
         return pending_cluster_connections.is_empty();
+    }
+
+    async fn initialize_client(&mut self) -> bool {
+        if self.network.client_connections.contains_key(&self.id) {
+            self.network
+                .send(Outgoing::ServerMessage(self.id, ServerMessage::Ready))
+                .await;
+            return true;
+        }
+        return false;
     }
 
     async fn become_initial_leader(&mut self, leader_pid: NodeId) {
@@ -179,6 +197,7 @@ impl OmniPaxosServer {
                         self.id, ballot
                     );
                     self.omnipaxos.initialize_prepare_phase(ballot);
+                    self.send_outgoing_msgs().await;
                 }
             }
         }
