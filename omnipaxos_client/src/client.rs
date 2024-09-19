@@ -229,9 +229,6 @@ impl Client {
             let response_time = request_data.response_time();
             match response_time {
                 Some(latency) => {
-                    if latency > 10 {
-                        eprintln!("SLOW REQUEST {request_data:?}");
-                    }
                     histo.increment(latency as u64).unwrap();
                     latency_sum += latency;
                     num_responses += 1;
@@ -239,15 +236,15 @@ impl Client {
                     //     println!("dropped requests: {dropped_sequence}");
                     //     dropped_sequence = 0;
                     // }
-                    if latency > 10 {
-                        println!("SLOW REQUEST {request_data:?}");
-                    }
-                    // println!(
-                    //     "request: {:?}, latency: {:?}, sent: {:?}",
-                    //     request_data.response.as_ref().unwrap().message.command_id(),
-                    //     latency,
-                    //     request_data.time_sent_utc
-                    // );
+                    // if latency > 10 {
+                    //     println!("SLOW REQUEST {request_data:?}");
+                    // }
+                    println!(
+                        "request: {:?}, latency: {:?}, sent: {:?}",
+                        request_data.response.as_ref().unwrap().message.command_id(),
+                        latency,
+                        request_data.time_sent_utc
+                    );
                 }
                 None => {
                     missed_responses += 1;

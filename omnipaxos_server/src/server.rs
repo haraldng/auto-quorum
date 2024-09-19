@@ -1,11 +1,14 @@
+use core::panic;
+use std::time::Duration;
+
 use chrono::Utc;
 use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use omnipaxos::ballot_leader_election::Ballot;
-use omnipaxos::messages::sequence_paxos::PaxosMsg;
+use omnipaxos::messages::sequence_paxos::{PaxosMessage, PaxosMsg};
 use omnipaxos::messages::Message;
 use omnipaxos::sequence_paxos::Phase;
 use omnipaxos::{
@@ -52,7 +55,9 @@ pub struct OmniPaxosServer {
     optimize: bool,
     optimize_threshold: f64,
     leader_attempt: u32,
-    storage_duration: Duration,
+    storage_delay: Option<Duration>,
+    delayed_accepted_sink: Sender<Outgoing>,
+    delayed_accepted_source: Receiver<Outgoing>,
 }
 
 impl OmniPaxosServer {
@@ -64,15 +69,17 @@ impl OmniPaxosServer {
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let optimize = server_config.optimize.unwrap_or(true);
-        let storage_duration_micros = server_config
-            .storage_duration_micros
-            .expect("Storage duration must be set");
-        // let flush_duration = Duration::from_millis(storage_duration_ms);
-        // let storage: DurationStorage<Command> = DurationStorage::new(flush_duration);
+        let storage_delay = match server_config.storage_duration_micros {
+            None => panic!("Storage duration must be set"),
+            Some(0) => None, // sleeping with duration 0 yields the task
+            Some(dur) => Some(Duration::from_micros(dur)),
+        };
         let storage = MemoryStorage::default();
         info!(
-            "Node: {:?}: using metronome: {}, storage_duration: {}",
-            server_id, omnipaxos_config.cluster_config.use_metronome, storage_duration_micros
+            "Node: {:?}: using metronome: {}, storage_duration: {:?}",
+            server_id,
+            omnipaxos_config.cluster_config.use_metronome,
+            server_config.storage_duration_micros
         );
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let network = Network::new(
@@ -100,6 +107,7 @@ impl OmniPaxosServer {
             read_strategies: init_read_strat,
         };
         let optimizer = ClusterOptimizer::new(nodes.clone());
+        let (delayed_accepted_sink, delayed_accepted_source) = tokio::sync::mpsc::channel(10000);
         let mut server = OmniPaxosServer {
             id: server_id,
             nodes,
@@ -113,7 +121,9 @@ impl OmniPaxosServer {
             optimize,
             optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
             leader_attempt: 0,
-            storage_duration: Duration::from_micros(storage_duration_micros),
+            storage_delay,
+            delayed_accepted_sink,
+            delayed_accepted_source,
         };
         // Clears outgoing_messages of initial BLE messages
         server.send_outgoing_msgs().await;
@@ -148,9 +158,21 @@ impl OmniPaxosServer {
             }
         }
 
-        while let Some(msg) = self.network.next().await {
-            self.handle_incoming_msg(msg.unwrap()).await;
+        loop {
+            tokio::select! {
+                biased;
+                Some(msg) = self.network.next() => {
+                    self.handle_incoming_msg(msg.unwrap()).await;
+                },
+                Some(ready_accepted) = self.delayed_accepted_source.recv() => {
+                    self.network.send(ready_accepted).await;
+                },
+            }
         }
+
+        // while let Some(msg) = self.network.next().await {
+        //     self.handle_incoming_msg(msg.unwrap()).await;
+        // }
     }
 
     // Retry connection to other nodes in the cluster. Returns true if connections
@@ -248,20 +270,29 @@ impl OmniPaxosServer {
     async fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         for msg in messages {
-            match &msg {
-                Message::SequencePaxos(paxos_msg) => match paxos_msg.msg {
-                    PaxosMsg::Accepted(_) => {
-                        tokio::time::sleep(self.storage_duration).await;
-                    }
-                    _ => {}
-                },
-                Message::BLE(_) => {}
-            }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network
-                .send(Outgoing::ClusterMessage(to, cluster_msg))
-                .await;
+            match (self.storage_delay, &cluster_msg) {
+                (
+                    Some(delay),
+                    ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(PaxosMessage {
+                        from: _,
+                        to: _,
+                        msg: PaxosMsg::Accepted(_),
+                    })),
+                ) => {
+                    let delayed_accepted_sink = self.delayed_accepted_sink.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
+                        delayed_accepted_sink.send(outgoing_msg).await.unwrap();
+                    });
+                }
+                _ => {
+                    let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
+                    self.network.send(outgoing_msg).await;
+                }
+            }
         }
     }
 
