@@ -144,10 +144,13 @@ impl OmniPaxosServer {
                     }
                     if self.id == initial_leader && cluster_is_connected {
                         self.become_initial_leader(initial_leader).await;
-                        let client_is_initialized = self.initialize_client().await;
-                        if client_is_initialized {
-                            debug!("{}: Leader fully initialized connections", self.id);
-                            break;
+                        let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
+                        if self.id == leader_id && phase == Phase::Accept {
+                            let client_is_initialized = self.initialize_client().await;
+                            if client_is_initialized {
+                                debug!("{}: Leader fully initialized connections", self.id);
+                                break;
+                            }
                         }
                     }
                 },
