@@ -218,12 +218,15 @@ impl OmniPaxosServer {
                         msg: PaxosMsg::Accepted(_),
                     })),
                 ) => {
-                    let delayed_accepted_sink = self.delayed_accepted_sink.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
-                        delayed_accepted_sink.send(outgoing_msg).await.unwrap();
-                    });
+                    // let delayed_accepted_sink = self.delayed_accepted_sink.clone();
+                    // tokio::spawn(async move {
+                    //     tokio::time::sleep(delay).await;
+                    //     let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
+                    //     delayed_accepted_sink.send(outgoing_msg).await.unwrap();
+                    // });
+                    tokio::time::sleep(delay).await;
+                    let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
+                    self.network.send(outgoing_msg).await;
                 }
                 _ => {
                     let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);

@@ -5,9 +5,7 @@ use std::{env, fs};
 use toml;
 
 mod database;
-mod metrics;
 mod network;
-mod optimizer;
 mod server;
 
 #[tokio::main]

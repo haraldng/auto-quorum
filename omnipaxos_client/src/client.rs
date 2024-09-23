@@ -175,7 +175,7 @@ impl Client {
     async fn send_command(&mut self, command: KVCommand) {
         let request = ClientMessage::Append(self.command_id, command);
         let data = RequestData {
-            time_sent_utc: Utc::now().timestamp_millis(),
+            time_sent_utc: Utc::now().timestamp_micros(),
             response: None,
         };
         self.request_data.push(data);
@@ -193,7 +193,7 @@ impl Client {
         match msg {
             NetworkMessage::ServerMessage(response) => {
                 let cmd_id = response.command_id();
-                let response_time = Utc::now().timestamp_millis();
+                let response_time = Utc::now().timestamp_micros();
                 self.request_data[cmd_id].response = Some(Response {
                     time_recieved_utc: response_time,
                     message: response,
@@ -222,7 +222,7 @@ impl Client {
         let num_requests = self.request_data.len();
         let mut missed_responses = 0;
         let mut dropped_sequence: usize = 0;
-        let mut histo = Histogram::new(15, 16).unwrap();
+        let mut histo = Histogram::new(7, 32).unwrap();
         let mut latency_sum = 0;
         let mut num_responses = 0;
         for request_data in &self.request_data {
@@ -252,13 +252,13 @@ impl Client {
                 }
             }
         }
-        let avg_latency = latency_sum as f64 / num_responses as f64;
+        let avg_latency = (latency_sum as f64 / 1000.) / num_responses as f64;
         let variance = self
             .request_data
             .iter()
             .filter_map(|data| data.response_time())
             .map(|value| {
-                let diff = value as f64 - avg_latency;
+                let diff = (value as f64 / 1000.) - avg_latency;
                 diff * diff
             })
             .sum::<f64>()
@@ -277,7 +277,7 @@ impl Client {
             (num_responses - missed_responses) as f64 / duration_s
         };
         let res_str = format!(
-            "Avg latency: {avg_latency} ms, Std dev: {std_dev} Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+            "Avg latency: {avg_latency} ms, Std dev: {std_dev} ms Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
         );
         println!("{res_str}");
         eprintln!("{res_str}");
@@ -288,5 +288,35 @@ impl Client {
         }
         println!("{p_str}");
         eprintln!("{p_str}");
+
+        // Batch latency
+        //
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let batch_latencies: Vec<i64> = latencies
+            .chunks(self.req_batch_size)
+            .map(|batch| batch.into_iter().sum())
+            .collect();
+        let num_batches = batch_latencies.len();
+        let avg_batch_latency = batch_latencies.iter().sum::<i64>() as f64 / num_batches as f64;
+        let variance = batch_latencies
+            .into_iter()
+            .map(|value| {
+                let diff = (value as f64) - avg_batch_latency;
+                diff * diff
+            })
+            .sum::<f64>()
+            / num_batches as f64;
+        let std_dev = variance.sqrt();
+        let res_str = format!(
+            "Avg batch latency: {} ms, Batch std dev: {} ms",
+            avg_batch_latency / 1000.,
+            std_dev / 1000.,
+        );
+        println!("{res_str}");
+        eprintln!("{res_str}");
     }
 }

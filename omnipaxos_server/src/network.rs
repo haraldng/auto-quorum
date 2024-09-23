@@ -345,12 +345,6 @@ impl Network {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum NetworkError {
-    SocketListenerFailure,
-    InternalChannelFailure,
-}
-
 impl Stream for Network {
     type Item = Incoming;
 
