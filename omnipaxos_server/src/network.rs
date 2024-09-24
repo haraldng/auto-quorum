@@ -212,6 +212,10 @@ impl Network {
                     *max_client_id
                 };
                 debug!("Identified connection from client {next_client_id}");
+                registration_connection
+                    .send(RegistrationMessage::AssignedId(next_client_id))
+                    .await
+                    .unwrap();
                 let underlying_stream = registration_connection.into_inner().into_inner();
                 let (from_client, to_client) = frame_servers_connection(underlying_stream);
                 connection_sender
@@ -219,6 +223,10 @@ impl Network {
                     .await
                     .unwrap();
                 NewIngressConnection::FromClient(next_client_id, from_client)
+            }
+            Some(Ok(RegistrationMessage::AssignedId(_))) => {
+                error!("Handshake failed");
+                return;
             }
             Some(Err(err)) => {
                 error!("Error deserializing handshake: {:?}", err);
@@ -233,11 +241,7 @@ impl Network {
         // Receive messages
         match identified_connection {
             NewIngressConnection::FromClient(client_id, mut reader) => {
-                while let Some(mut msg) = reader.next().await {
-                    // TODO: Send client its assigned ID in handshake instead
-                    if let Ok(ClientMessage::Append(ref mut id, _, _)) = msg {
-                        *id = client_id;
-                    }
+                while let Some(msg) = reader.next().await {
                     match msg {
                         Ok(m) => {
                             debug!("Received request from client {client_id}: {m:?}");

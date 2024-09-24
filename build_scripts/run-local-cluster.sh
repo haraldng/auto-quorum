@@ -29,7 +29,7 @@ for ((i = 1; i <= cluster_size; i++)); do
         log_path="../../auto-quorum-benchmark/logs/test-local-no-reconfig_server-${i}.log"
     fi
     log_path="/dev/null"
-    RUST_LOG=error CONFIG_FILE="$config_path" cargo run --release --manifest-path="../omnipaxos_server/Cargo.toml" 1> "$log_path" &
+    RUST_LOG=debug CONFIG_FILE="$config_path" cargo run --release --manifest-path="../omnipaxos_server/Cargo.toml" 1> "$log_path" &
 done
 wait
 

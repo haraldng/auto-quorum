@@ -7,6 +7,7 @@ use crate::kv::{ClientId, Command, CommandId, KVCommand};
 pub enum RegistrationMessage {
     NodeRegister(NodeId),
     ClientRegister,
+    AssignedId(ClientId),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +25,7 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Append(ClientId, CommandId, KVCommand),
+    // BatchAppend(ClientId, Vec<(CommandId, KVCommand)>),
 }
 
 impl ServerMessage {

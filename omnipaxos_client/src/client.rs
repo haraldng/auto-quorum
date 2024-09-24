@@ -81,10 +81,10 @@ impl RequestInterval {
 */
 
 pub struct Client {
+    id: ClientId,
     server: ServerConnection,
     command_id: CommandId,
     request_data: Vec<RequestData>,
-    kill_signal_sec: Option<u64>,
     req_batch_size: usize,
     batch_interval: Duration,
     iterations: usize,
@@ -92,7 +92,7 @@ pub struct Client {
     num_responses: usize,
 }
 
-async fn get_server_connection(server_address: SocketAddr) -> ServerConnection {
+async fn get_server_connection(server_address: SocketAddr) -> (ServerConnection, ClientId) {
     let mut retry_connection = interval(Duration::from_secs(1));
     loop {
         retry_connection.tick().await;
@@ -104,8 +104,13 @@ async fn get_server_connection(server_address: SocketAddr) -> ServerConnection {
                     .send(RegistrationMessage::ClientRegister)
                     .await
                     .expect("Couldn't send message to server");
+                let first_msg = registration_connection.next().await.unwrap();
+                let assigned_id = match first_msg.unwrap() {
+                    RegistrationMessage::AssignedId(id) => id,
+                    _ => panic!("Recieved unexpected message during handshake"),
+                };
                 let underlying_stream = registration_connection.into_inner().into_inner();
-                break frame_clients_connection(underlying_stream);
+                break (frame_clients_connection(underlying_stream), assigned_id);
             }
             Err(e) => eprintln!("Unable to connect to server: {e}"),
         }
@@ -117,12 +122,12 @@ impl Client {
         let is_local = config.local_deployment.unwrap_or(false);
         let server_address = get_node_addr(&config.cluster_name, config.server_id, is_local)
             .expect("Couldn't resolve server IP");
-        let server = get_server_connection(server_address).await;
+        let (server, assigned_id) = get_server_connection(server_address).await;
         Self {
+            id: assigned_id,
             server,
             command_id: 0,
             request_data: Vec::with_capacity(8000),
-            kill_signal_sec: config.kill_signal_sec,
             req_batch_size: config.req_batch_size.expect("Batch size not set"),
             batch_interval: Duration::from_millis(config.interval_ms.expect("Interval not set")),
             iterations: config.iterations.expect("Iterations not set"),
@@ -179,8 +184,7 @@ impl Client {
     }
 
     async fn send_command(&mut self, command: KVCommand) {
-        // TODO: Get client ID from handshake
-        let request = ClientMessage::Append(0, self.command_id, command);
+        let request = ClientMessage::Append(self.id, self.command_id, command);
         let data = RequestData {
             time_sent_utc: Utc::now().timestamp_micros(),
             response: None,
