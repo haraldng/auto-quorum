@@ -1,11 +1,10 @@
 use core::panic;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 use omnipaxos::ballot_leader_election::Ballot;
 use omnipaxos::messages::sequence_paxos::{PaxosMessage, PaxosMsg};
@@ -17,15 +16,10 @@ use omnipaxos::{
 };
 use omnipaxos_storage::memory_storage::MemoryStorage;
 
-use crate::{
-    database::Database,
-    metrics::MetricsHeartbeatServer,
-    network::Network,
-    optimizer::{ClusterOptimizer, ClusterStrategy},
-};
+use crate::{database::Database, network::Network};
 use common::{kv::*, messages::*};
 
-const LEADER_WAIT: Duration = Duration::from_secs(3);
+const LEADER_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OmniPaxosServerConfig {
@@ -36,7 +30,6 @@ pub struct OmniPaxosServerConfig {
     pub optimize_threshold: Option<f64>,
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
-    pub initial_read_strat: Option<Vec<ReadStrategy>>,
     pub storage_duration_micros: Option<u64>,
 }
 
@@ -47,28 +40,24 @@ pub struct OmniPaxosServer {
     nodes: Vec<NodeId>,
     database: Database,
     network: Network,
+    cluster_messages: Receiver<ClusterMessage>,
+    client_messages: Receiver<ClientMessage>,
     omnipaxos: OmniPaxosInstance,
+    initial_leader: NodeId,
     current_decided_idx: usize,
-    metrics_server: MetricsHeartbeatServer,
-    optimizer: ClusterOptimizer,
-    strategy: ClusterStrategy,
-    optimize: bool,
-    optimize_threshold: f64,
     leader_attempt: u32,
     storage_delay: Option<Duration>,
-    delayed_accepted_sink: Sender<Outgoing>,
-    delayed_accepted_source: Receiver<Outgoing>,
 }
 
 impl OmniPaxosServer {
     pub async fn new(
         server_config: OmniPaxosServerConfig,
         omnipaxos_config: OmniPaxosConfig,
+        initial_leader: NodeId,
     ) -> Self {
         let server_id = omnipaxos_config.server_config.pid;
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
-        let optimize = server_config.optimize.unwrap_or(true);
         let storage_delay = match server_config.storage_duration_micros {
             None => panic!("Storage duration must be set"),
             Some(0) => None, // sleeping with duration 0 yields the task
@@ -82,148 +71,97 @@ impl OmniPaxosServer {
             server_config.storage_duration_micros
         );
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
+        let initial_clients = match server_id == initial_leader {
+            true => 1,
+            false => 0,
+        };
+        let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(10000);
+        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(10000);
         let network = Network::new(
             server_config.cluster_name,
             server_id,
             nodes.clone(),
+            initial_clients,
             local_deployment,
+            client_message_sender,
+            cluster_message_sender,
         )
         .await
         .unwrap();
-        let metrics_server = MetricsHeartbeatServer::new(server_id, nodes.clone());
-        let quorum_size = nodes.len() / 2 + 1;
-        let init_read_quorum = quorum_size;
-        let init_read_strat = match server_config.initial_read_strat {
-            Some(strats) => {
-                assert_eq!(strats.len(), nodes.len());
-                strats
-            }
-            None => vec![ReadStrategy::default(); nodes.len()],
-        };
-        let init_strat = ClusterStrategy {
-            leader: server_id,
-            read_quorum_size: init_read_quorum,
-            write_quorum_size: nodes.len() - init_read_quorum + 1,
-            read_strategies: init_read_strat,
-        };
-        let optimizer = ClusterOptimizer::new(nodes.clone());
-        let (delayed_accepted_sink, delayed_accepted_source) = tokio::sync::mpsc::channel(10000);
         let mut server = OmniPaxosServer {
             id: server_id,
             nodes,
             database: Database::new(),
             network,
+            cluster_messages,
+            client_messages,
             omnipaxos,
+            initial_leader,
             current_decided_idx: 0,
-            metrics_server,
-            optimizer,
-            strategy: init_strat,
-            optimize,
-            optimize_threshold: server_config.optimize_threshold.unwrap_or(0.8),
             leader_attempt: 0,
             storage_delay,
-            delayed_accepted_sink,
-            delayed_accepted_source,
         };
         // Clears outgoing_messages of initial BLE messages
-        server.send_outgoing_msgs().await;
+        let _ = server.omnipaxos.outgoing_messages();
         server
     }
 
-    pub async fn run(&mut self, initial_leader: NodeId) {
-        let mut election_interval = tokio::time::interval(LEADER_WAIT);
-        loop {
-            tokio::select! {
-                // Ensures cluster is connected and leader is promoted before client starts sending
-                // requests.
-                _ = election_interval.tick() => {
-                    let cluster_is_connected = self.reconnect_to_cluster();
-                    if self.id != initial_leader && cluster_is_connected {
-                        debug!("{}: Fully connected to cluster", self.id);
-                        break;
-                    }
-                    if self.id == initial_leader && cluster_is_connected {
-                        self.become_initial_leader(initial_leader).await;
+    pub async fn run(&mut self) {
+        if self.id == self.initial_leader {
+            let mut election_interval = tokio::time::interval(LEADER_WAIT);
+            loop {
+                tokio::select! {
+                    // Ensures cluster is connected and leader is promoted before client starts sending
+                    // requests.
+                    _ = election_interval.tick() => {
+                        debug!("{}: Leader check initialized", self.id);
+                        self.become_initial_leader().await;
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
-                            let client_is_initialized = self.initialize_client().await;
-                            if client_is_initialized {
-                                debug!("{}: Leader fully initialized connections", self.id);
-                                break;
-                            }
+                            debug!("{}: Leader fully initialized", self.id);
+                            self.network.send_to_client(self.id, ServerMessage::Ready).await;
+                            break;
                         }
-                    }
-                },
-                // Still necessary for sending handshakes and polling for new connections
-                Some(msg) = self.network.next() => {
-                    self.handle_incoming_msg(msg.unwrap()).await;
-                },
+                    },
+                    // Still necessary for sending handshakes
+                    Some(msg) = self.cluster_messages.recv() => {
+                        self.handle_cluster_message(msg).await;
+                    },
+                    Some(msg) = self.client_messages.recv() => {
+                        self.handle_client_request(msg).await;
+                    },
+                }
             }
         }
 
         loop {
             tokio::select! {
-                biased;
-                Some(msg) = self.network.next() => {
-                    self.handle_incoming_msg(msg.unwrap()).await;
+                Some(msg) = self.client_messages.recv() => {
+                    self.handle_client_request(msg).await;
                 },
-                Some(ready_accepted) = self.delayed_accepted_source.recv() => {
-                    self.network.send(ready_accepted).await;
+                Some(msg) = self.cluster_messages.recv() => {
+                    self.handle_cluster_message(msg).await;
                 },
             }
         }
-
-        // while let Some(msg) = self.network.next().await {
-        //     self.handle_incoming_msg(msg.unwrap()).await;
-        // }
     }
 
-    // Retry connection to other nodes in the cluster. Returns true if connections
-    // necessary for cluster operation exist.
-    fn reconnect_to_cluster(&mut self) -> bool {
-        let pending_cluster_connections: Vec<&u64> = self
-            .nodes
-            .iter()
-            .filter(|&node_id| {
-                *node_id != self.id && !self.network.cluster_connections.contains_key(node_id)
-            })
-            .collect();
-        for pending_node in &pending_cluster_connections {
-            if **pending_node < self.id {
-                self.network.connect_to_node(**pending_node);
-            }
-        }
-        return pending_cluster_connections.is_empty();
-    }
-
-    async fn initialize_client(&mut self) -> bool {
-        if self.network.client_connections.contains_key(&self.id) {
-            self.network
-                .send(Outgoing::ServerMessage(self.id, ServerMessage::Ready))
-                .await;
-            return true;
-        }
-        return false;
-    }
-
-    async fn become_initial_leader(&mut self, leader_pid: NodeId) {
-        if leader_pid == self.id {
-            let (_leader, phase) = self.omnipaxos.get_current_leader_state();
-            match phase {
-                Phase::Accept => {}
-                _ => {
-                    let mut ballot = Ballot::default();
-                    self.leader_attempt += 1;
-                    ballot.n = self.leader_attempt;
-                    ballot.pid = self.id;
-                    ballot.config_id = 1;
-                    info!(
-                        "Node: {:?}, Initializing prepare phase with ballot: {:?}",
-                        self.id, ballot
-                    );
-                    self.omnipaxos.initialize_prepare_phase(ballot);
-                    self.send_outgoing_msgs().await;
-                }
+    async fn become_initial_leader(&mut self) {
+        let (_leader, phase) = self.omnipaxos.get_current_leader_state();
+        match phase {
+            Phase::Accept => {}
+            _ => {
+                let mut ballot = Ballot::default();
+                self.leader_attempt += 1;
+                ballot.n = self.leader_attempt;
+                ballot.pid = self.id;
+                ballot.config_id = 1;
+                info!(
+                    "Node: {:?}, Initializing prepare phase with ballot: {:?}",
+                    self.id, ballot
+                );
+                self.omnipaxos.initialize_prepare_phase(ballot);
+                self.send_outgoing_msgs().await;
             }
         }
     }
@@ -264,7 +202,7 @@ impl OmniPaxosServer {
                     None => ServerMessage::Write(command.id),
                 };
                 self.network
-                    .send(Outgoing::ServerMessage(command.client_id, response))
+                    .send_to_client(command.client_id, response)
                     .await;
             }
         }
@@ -284,97 +222,39 @@ impl OmniPaxosServer {
                         msg: PaxosMsg::Accepted(_),
                     })),
                 ) => {
-                    let delayed_accepted_sink = self.delayed_accepted_sink.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
-                        delayed_accepted_sink.send(outgoing_msg).await.unwrap();
-                    });
+                    // let delayed_accepted_sink = self.delayed_accepted_sink.clone();
+                    // tokio::spawn(async move {
+                    //     tokio::time::sleep(delay).await;
+                    //     let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
+                    //     delayed_accepted_sink.send(outgoing_msg).await.unwrap();
+                    // });
+                    tokio::time::sleep(delay).await;
+                    self.network.send_to_cluster(to, cluster_msg).await;
                 }
-                _ => {
-                    let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
-                    self.network.send(outgoing_msg).await;
-                }
+                _ => self.network.send_to_cluster(to, cluster_msg).await,
             }
         }
     }
 
-    async fn handle_incoming_msg(&mut self, msg: Incoming) {
-        match msg {
-            Incoming::ClientMessage(from, request) => {
-                self.handle_client_request(from, request).await;
-            }
-            Incoming::ClusterMessage(_from, ClusterMessage::OmniPaxosMessage(m)) => {
+    async fn handle_cluster_message(&mut self, message: ClusterMessage) {
+        match message {
+            ClusterMessage::OmniPaxosMessage(m) => {
                 self.omnipaxos.handle_incoming(m);
                 self.send_outgoing_msgs().await;
                 if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
                     self.handle_decided_entries().await;
                 }
             }
-            Incoming::ClusterMessage(from, ClusterMessage::QuorumReadRequest(req)) => {
-                self.handle_quorum_read_request(from, req).await;
-            }
-            Incoming::ClusterMessage(from, ClusterMessage::QuorumReadResponse(resp)) => {
-                self.handle_quorum_read_response(from, resp).await;
-            }
-            Incoming::ClusterMessage(from, ClusterMessage::MetricSync(sync)) => {
-                if let Some((to, reply)) = self.metrics_server.handle_metric_sync(from, sync) {
-                    self.network
-                        .send(Outgoing::ClusterMessage(
-                            to,
-                            ClusterMessage::MetricSync(reply),
-                        ))
-                        .await;
-                }
-            }
-            Incoming::ClusterMessage(from, ClusterMessage::ReadStrategyUpdate(strat)) => {
-                self.handle_read_strategy_update(from, strat);
-            }
         }
     }
 
-    async fn handle_client_request(&mut self, from: ClientId, request: ClientMessage) {
+    async fn handle_client_request(&mut self, request: ClientMessage) {
         match request {
-            ClientMessage::Append(command_id, kv_command) => match &kv_command {
-                KVCommand::Put(..) => {
-                    self.metrics_server.local_write();
-                    self.commit_command_to_log(from, command_id, kv_command)
-                        .await;
-                }
-                KVCommand::Delete(_) => {
-                    self.metrics_server.local_write();
-                    self.commit_command_to_log(from, command_id, kv_command)
-                        .await;
-                }
-                KVCommand::Get(_) => {
-                    self.metrics_server.local_read();
-                    self.handle_read_request(from, command_id, kv_command).await;
-                }
-            },
+            ClientMessage::Append(client_id, command_id, kv_command) => {
+                self.commit_command_to_log(client_id, command_id, kv_command)
+                    .await;
+            }
         };
-    }
-
-    async fn handle_read_request(
-        &mut self,
-        from: ClientId,
-        command_id: CommandId,
-        kv_command: KVCommand,
-    ) {
-        let read_strat = self.strategy.read_strategies[self.id as usize - 1];
-        match read_strat {
-            ReadStrategy::ReadAsWrite => {
-                self.commit_command_to_log(from, command_id, kv_command)
-                    .await
-            }
-            ReadStrategy::QuorumRead => {
-                self.start_quorum_read(from, command_id, kv_command, false)
-                    .await
-            }
-            ReadStrategy::BallotRead => {
-                self.start_quorum_read(from, command_id, kv_command, true)
-                    .await
-            }
-        }
     }
 
     async fn commit_command_to_log(
@@ -393,57 +273,5 @@ impl OmniPaxosServer {
             .append(command)
             .expect("Append to Omnipaxos log failed");
         self.send_outgoing_msgs().await;
-    }
-
-    async fn handle_quorum_read_request(&mut self, from: NodeId, request: QuorumReadRequest) {
-        unimplemented!()
-    }
-
-    // TODO: if reads show us that something is chosen but not decided we can decide it and
-    // apply chosen writes and rinse reads immediately.
-    async fn handle_quorum_read_response(&mut self, from: NodeId, response: QuorumReadResponse) {
-        unimplemented!()
-    }
-
-    async fn start_quorum_read(
-        &mut self,
-        client_id: ClientId,
-        command_id: CommandId,
-        read_command: KVCommand,
-        enable_ballot_read: bool,
-    ) {
-        unimplemented!()
-    }
-
-    async fn send_strat(&mut self) {
-        unimplemented!()
-    }
-
-    // TODO: its possible for strategy updates to come in out of sync or get dropped
-    fn handle_read_strategy_update(&mut self, _from: NodeId, read_strat: Vec<ReadStrategy>) {
-        self.strategy.read_strategies = read_strat
-    }
-
-    fn log(
-        &self,
-        strategy: Option<(&ClusterStrategy, f64, f64)>,
-        new_strat: bool,
-        cache_update: bool,
-    ) {
-        let timestamp = Utc::now().timestamp_millis();
-        let leader = self.omnipaxos.get_current_leader();
-        let leader_json = serde_json::to_string(&leader).unwrap();
-        let metrics_json = serde_json::to_string(&self.metrics_server.metrics).unwrap();
-        let opt_strategy_latency =
-            strategy.map(|s| s.1 / self.metrics_server.metrics.get_total_load());
-        let curr_strategy_latency =
-            strategy.map(|s| s.2 / self.metrics_server.metrics.get_total_load());
-        let strategy_json = match strategy {
-            Some((strat, _, _)) => serde_json::to_string(strat).unwrap(),
-            None => serde_json::to_string(&None::<ClusterStrategy>).unwrap(),
-        };
-        let opt_strategy_latency_json = serde_json::to_string(&opt_strategy_latency).unwrap();
-        let curr_strategy_latency_json = serde_json::to_string(&curr_strategy_latency).unwrap();
-        println!("{{ \"timestamp\": {timestamp}, \"new_strat\": {new_strat}, \"opt_strat_latency\": {opt_strategy_latency_json:<20}, \"curr_strat_latency\": {curr_strategy_latency_json:<20}, \"cluster_strategy\": {strategy_json:<200}, \"leader\": {leader_json}, \"metrics_update\": {cache_update}, \"cluster_metrics\": {metrics_json} }}");
     }
 }

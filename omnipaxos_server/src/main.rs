@@ -5,9 +5,7 @@ use std::{env, fs};
 use toml;
 
 mod database;
-mod metrics;
 mod network;
-mod optimizer;
 mod server;
 
 #[tokio::main]
@@ -23,6 +21,6 @@ pub async fn main() {
     let max_node_pid = omnipaxos_config.cluster_config.nodes.iter().max().unwrap();
     let initial_leader = server_config.initial_leader.unwrap_or(*max_node_pid);
     println!("{}", serde_json::to_string(&server_config).unwrap());
-    let mut server = OmniPaxosServer::new(server_config, omnipaxos_config).await;
-    server.run(initial_leader).await;
+    let mut server = OmniPaxosServer::new(server_config, omnipaxos_config, initial_leader).await;
+    server.run().await;
 }

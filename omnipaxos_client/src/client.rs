@@ -8,7 +8,9 @@ use tokio::net::TcpStream;
 use tokio::time::interval;
 use tokio_stream::StreamExt;
 
-use common::util::{get_node_addr, wrap_stream, Connection as ServerConnection};
+use common::util::{
+    frame_clients_connection, frame_registration_connection, get_node_addr, ServerConnection,
+};
 use common::{kv::*, messages::*};
 use histogram::Histogram;
 
@@ -97,7 +99,13 @@ async fn get_server_connection(server_address: SocketAddr) -> ServerConnection {
         match TcpStream::connect(server_address).await {
             Ok(stream) => {
                 stream.set_nodelay(true).unwrap();
-                break wrap_stream(stream);
+                let mut registration_connection = frame_registration_connection(stream);
+                registration_connection
+                    .send(RegistrationMessage::ClientRegister)
+                    .await
+                    .expect("Couldn't send message to server");
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                break frame_clients_connection(underlying_stream);
             }
             Err(e) => eprintln!("Unable to connect to server: {e}"),
         }
@@ -110,7 +118,7 @@ impl Client {
         let server_address = get_node_addr(&config.cluster_name, config.server_id, is_local)
             .expect("Couldn't resolve server IP");
         let server = get_server_connection(server_address).await;
-        let mut client = Self {
+        Self {
             server,
             command_id: 0,
             request_data: Vec::with_capacity(8000),
@@ -120,9 +128,7 @@ impl Client {
             iterations: config.iterations.expect("Iterations not set"),
             current_iteration: 0,
             num_responses: 0,
-        };
-        client.send_registration().await;
-        client
+        }
     }
 
     pub async fn put(&mut self, key: String, value: String) {
@@ -140,7 +146,7 @@ impl Client {
     pub async fn run(&mut self) {
         let first_msg = self.server.next().await.unwrap();
         match first_msg.unwrap() {
-            NetworkMessage::ServerMessage(ServerMessage::Ready) => (),
+            ServerMessage::Ready => (),
             _ => panic!("Recieved unexpected message during handshake"),
         }
 
@@ -153,7 +159,7 @@ impl Client {
                 // Handle the next server message when it arrives
                 Some(msg) = self.server.next() => self.handle_response(msg.unwrap()),
                 // Send request according to rate of current request interval setting. (defined in
-                    // TOML config)
+                // TOML config)
                 _ = batch_interval.tick() => {
                     if self.current_iteration == self.iterations {
                         if self.num_responses == self.request_data.len() {
@@ -173,56 +179,39 @@ impl Client {
     }
 
     async fn send_command(&mut self, command: KVCommand) {
-        let request = ClientMessage::Append(self.command_id, command);
+        // TODO: Get client ID from handshake
+        let request = ClientMessage::Append(0, self.command_id, command);
         let data = RequestData {
-            time_sent_utc: Utc::now().timestamp_millis(),
+            time_sent_utc: Utc::now().timestamp_micros(),
             response: None,
         };
         self.request_data.push(data);
         self.command_id += 1;
-        if let Err(e) = self
-            .server
-            .send(NetworkMessage::ClientMessage(request))
-            .await
-        {
+        if let Err(e) = self.server.send(request).await {
             log::error!("Couldn't send command to server: {e}");
         }
     }
 
-    fn handle_response(&mut self, msg: NetworkMessage) {
+    fn handle_response(&mut self, msg: ServerMessage) {
         match msg {
-            NetworkMessage::ServerMessage(response) => {
+            ServerMessage::Ready => panic!("Recieved unexpected message: {msg:?}"),
+            response => {
                 let cmd_id = response.command_id();
-                let response_time = Utc::now().timestamp_millis();
+                let response_time = Utc::now().timestamp_micros();
                 self.request_data[cmd_id].response = Some(Response {
                     time_recieved_utc: response_time,
                     message: response,
                 });
                 self.num_responses += 1;
             }
-            _ => panic!("Recieved unexpected message: {msg:?}"),
         }
-    }
-
-    async fn send_registration(&mut self) {
-        self.server
-            .send(NetworkMessage::ClientRegister)
-            .await
-            .expect("Couldn't send message to server");
-    }
-
-    async fn send_kill_signal(&mut self) {
-        self.server
-            .send(NetworkMessage::KillServer)
-            .await
-            .expect("Couldn't send message to server")
     }
 
     fn print_results(&self) {
         let num_requests = self.request_data.len();
         let mut missed_responses = 0;
         let mut dropped_sequence: usize = 0;
-        let mut histo = Histogram::new(15, 16).unwrap();
+        let mut histo = Histogram::new(7, 32).unwrap();
         let mut latency_sum = 0;
         let mut num_responses = 0;
         for request_data in &self.request_data {
@@ -252,18 +241,6 @@ impl Client {
                 }
             }
         }
-        let avg_latency = latency_sum as f64 / num_responses as f64;
-        let variance = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .map(|value| {
-                let diff = value as f64 - avg_latency;
-                diff * diff
-            })
-            .sum::<f64>()
-            / num_responses as f64;
-        let std_dev = variance.sqrt();
         if dropped_sequence > 0 {
             println!("dropped requests: {dropped_sequence}");
         }
@@ -276,17 +253,103 @@ impl Client {
         } else {
             (num_responses - missed_responses) as f64 / duration_s
         };
+
+        // Request latency
+        let (avg_latency, std_dev) = self.calc_avg_response_latency();
         let res_str = format!(
-            "Avg latency: {avg_latency} ms, Std dev: {std_dev} Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+            "Avg latency: {avg_latency:.3} ms, Std dev: {std_dev:.3} ms Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
         );
         println!("{res_str}");
         eprintln!("{res_str}");
 
-        let mut p_str = String::from("Latency percentiles:");
-        for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
-            p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
+        // let mut p_str = String::from("Latency percentiles:");
+        // for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
+        //     p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
+        // }
+        // println!("{p_str}");
+        // eprintln!("{p_str}");
+
+        // Batch latency
+        let (avg_batch_latency, std_dev) = self.calc_avg_batch_latency();
+        let res_str =
+            format!("Avg batch latency: {avg_batch_latency:.3} ms, Batch std dev: {std_dev:.3} ms");
+        println!("{res_str}");
+        eprintln!("{res_str}");
+
+        // Batch position latency
+        let batch_position_latency = self.calc_avg_batch_latency_by_position();
+        let res_str = format!("Avg batch position latency: {batch_position_latency:?} ms");
+        println!("{res_str}");
+        eprintln!("{res_str}");
+    }
+
+    fn calc_avg_response_latency(&self) -> (f64, f64) {
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let num_responses = latencies.len();
+        let avg_latency = latencies.iter().sum::<i64>() as f64 / num_responses as f64;
+        let variance = latencies
+            .into_iter()
+            .map(|value| {
+                let diff = (value as f64) - avg_latency;
+                diff * diff
+            })
+            .sum::<f64>()
+            / num_responses as f64;
+        let std_dev = variance.sqrt();
+        // Convert from microseconds to ms
+        (avg_latency / 1000., std_dev / 1000.)
+    }
+
+    fn calc_avg_batch_latency(&self) -> (f64, f64) {
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let batch_latencies: Vec<i64> = latencies
+            .chunks(self.req_batch_size)
+            .map(|batch| batch.into_iter().sum())
+            .collect();
+        let num_batches = batch_latencies.len();
+        let avg_batch_latency = batch_latencies.iter().sum::<i64>() as f64 / num_batches as f64;
+        let variance = batch_latencies
+            .into_iter()
+            .map(|value| {
+                let diff = (value as f64) - avg_batch_latency;
+                diff * diff
+            })
+            .sum::<f64>()
+            / num_batches as f64;
+        let std_dev = variance.sqrt();
+        // Convert from microseconds to ms
+        (avg_batch_latency / 1000., std_dev / 1000.)
+    }
+
+    fn calc_avg_batch_latency_by_position(&self) -> Vec<f64> {
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let batch_count = latencies.len() / self.req_batch_size;
+        let mut sums = vec![0i64; self.req_batch_size]; // to accumulate sums for each index in chunks
+        for batch in latencies.chunks(self.req_batch_size) {
+            for i in 0..self.req_batch_size {
+                sums[i] += batch[i];
+            }
         }
-        println!("{p_str}");
-        eprintln!("{p_str}");
+        let avg_latencies: Vec<f64> = sums
+            .iter()
+            .map(|&sum| (sum as f64 / 1000.) / batch_count as f64)
+            .collect();
+        // let variances = sums.into_iter().enumerate().map(|(i, sum)| {
+        //     let diff = (sum as f64) - avg_latencies[i];
+        //     diff * diff
+        // }).sum::<f64>();
+        avg_latencies
     }
 }

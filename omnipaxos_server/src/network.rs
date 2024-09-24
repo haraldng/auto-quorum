@@ -1,143 +1,224 @@
 use anyhow::Error;
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use log::*;
-use omnipaxos::messages::Message as OmniPaxosMessage;
-use omnipaxos::util::NodeId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
-use common::{kv::ClientId, messages::*, util::*};
+use common::{
+    kv::{ClientId, NodeId},
+    messages::*,
+    util::*,
+};
 
-enum ConnectionId {
-    ClientConnection(ClientId),
-    ServerConnection(NodeId),
+enum NewEgressConnection {
+    ToNode(NodeId, ToNodeConnection),
+    ToClient(ClientId, ToClientConnection),
 }
-
-enum NewConnection {
-    NodeConnection(NodeId, NetworkSink),
-    ClientConnection(ClientId, NetworkSink),
+enum NewIngressConnection {
+    FromNode(NodeId, FromNodeConnection),
+    FromClient(ClientId, FromClientConnection),
 }
 
 pub struct Network {
     cluster_name: String,
     id: NodeId,
-    listener: TcpListener,
-    pub cluster_connections: HashMap<NodeId, NetworkSink>,
-    pub client_connections: HashMap<ClientId, NetworkSink>,
-    max_client_id: Arc<Mutex<ClientId>>,
-    connection_sink: Sender<NewConnection>,
-    connection_source: Receiver<NewConnection>,
-    message_sink: Sender<Incoming>,
-    message_source: Receiver<Incoming>,
+    peers: Vec<NodeId>,
     is_local: bool,
+    cluster_connections: Vec<Option<ToNodeConnection>>,
+    client_connections: HashMap<ClientId, ToClientConnection>,
+    max_client_id: Arc<Mutex<ClientId>>,
+    client_message_sender: Sender<ClientMessage>,
+    cluster_message_sender: Sender<ClusterMessage>,
 }
 
 impl Network {
     pub async fn new(
         cluster_name: String,
         id: NodeId,
-        peers: Vec<NodeId>,
+        nodes: Vec<NodeId>,
+        num_clients: usize,
         local_deployment: bool,
+        client_message_sender: Sender<ClientMessage>,
+        cluster_message_sender: Sender<ClusterMessage>,
     ) -> Result<Self, Error> {
-        let (connection_sink, connection_source) = mpsc::channel(100);
-        let (message_sink, message_source) = mpsc::channel(100);
-        let port = 8000 + id as u16;
-        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = TcpListener::bind(listening_address).await?;
+        let peers: Vec<u64> = nodes.into_iter().filter(|node| *node != id).collect();
+        let mut cluster_connections = vec![];
+        cluster_connections.resize_with(peers.len(), Default::default);
         let mut network = Self {
             cluster_name,
             id,
-            listener,
-            cluster_connections: HashMap::new(),
+            peers,
+            cluster_connections,
             client_connections: HashMap::new(),
             max_client_id: Arc::new(Mutex::new(0)),
-            connection_sink,
-            connection_source,
-            message_sink,
-            message_source,
+            client_message_sender,
+            cluster_message_sender,
             is_local: local_deployment,
         };
-        // // Create connections to other servers
-        // for peer in peers.into_iter().filter(|p| *p < id) {
-        //     network.connect_to_node(peer);
-        // }
+        network.initialize_connections(num_clients).await;
         Ok(network)
     }
 
-    pub fn connect_to_node(&mut self, to: NodeId) {
-        let message_sink = self.message_sink.clone();
-        let connection_sink = self.connection_sink.clone();
-        let from = self.id;
-        let to_address = match get_node_addr(&self.cluster_name, to, self.is_local) {
-            Ok(addr) => addr,
-            Err(e) => {
-                log::error!("Error resolving DNS name of node {to}: {e}");
-                return;
+    async fn initialize_connections(&mut self, num_clients: usize) {
+        let (connection_sink, mut connection_source) = mpsc::channel(10);
+        let listen_handle = tokio::spawn(Self::listen_for_connections(
+            self.id,
+            self.client_message_sender.clone(),
+            self.cluster_message_sender.clone(),
+            connection_sink.clone(),
+            self.max_client_id.clone(),
+        ));
+        let abort_listen_handle = listen_handle.abort_handle();
+        let reconnect_delay = Duration::from_secs(1);
+        let mut reconnect_interval = tokio::time::interval(reconnect_delay);
+        loop {
+            tokio::select! {
+                _ = reconnect_interval.tick() => self.connect_to_peers(connection_sink.clone()),
+                Some(new_connection) = connection_source.recv() => {
+                    match new_connection {
+                        NewEgressConnection::ToNode(id, conn) => {
+                            match self.cluster_id_to_idx(id) {
+                                Some(idx) => self.cluster_connections[idx] = Some(conn),
+                                None => error!("New connection from unexpected node {id}"),
+                            }
+                        },
+                        NewEgressConnection::ToClient(id, conn) => _ = {
+                            debug!("{}: Adding connection from client {id}", self.id);
+                            self.client_connections.insert(id, conn);
+                        },
+                    }
+                    let all_clients_connected = self.client_connections.len() >= num_clients;
+                    let a: Vec<&str> = self.cluster_connections.iter().map(|c| match c {Some(_) => "Some(conn)", None => "None"}).collect();
+                    debug!("{}: Connections remaining {:?}", self.id, a);
+                    let all_cluster_connected = self.cluster_connections.iter().all(|c| c.is_some());
+                    if all_clients_connected && all_cluster_connected {
+                        abort_listen_handle.abort();
+                        break;
+                    }
+                },
             }
-        };
-        tokio::spawn(async move {
-            match TcpStream::connect(to_address).await {
-                Ok(connection) => {
-                    debug!("New connection to node {to}");
-                    Self::handle_connection_to_node(
-                        connection,
-                        message_sink,
-                        connection_sink,
-                        from,
-                        to,
-                    )
-                    .await;
+        }
+        debug!("{}: Network initialized", self.id);
+    }
+
+    #[inline]
+    fn cluster_id_to_idx(&self, id: NodeId) -> Option<usize> {
+        self.peers.iter().position(|&p| p == id)
+    }
+
+    async fn listen_for_connections(
+        id: NodeId,
+        client_message_sender: Sender<ClientMessage>,
+        cluster_message_sender: Sender<ClusterMessage>,
+        connection_sender: Sender<NewEgressConnection>,
+        max_client_id_handle: Arc<Mutex<ClientId>>,
+    ) {
+        let port = 8000 + id as u16;
+        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = TcpListener::bind(listening_address).await.unwrap();
+
+        loop {
+            match listener.accept().await {
+                Ok((tcp_stream, socket_addr)) => {
+                    debug!("New connection from {socket_addr}");
+                    tokio::spawn(Self::handle_incoming_connection(
+                        tcp_stream,
+                        client_message_sender.clone(),
+                        cluster_message_sender.clone(),
+                        connection_sender.clone(),
+                        max_client_id_handle.clone(),
+                    ));
                 }
-                Err(err) => error!("Establishing connection to node {to} failed: {err}"),
+                Err(e) => error!("Error listening for new connection: {:?}", e),
             }
-        });
+        }
+    }
+
+    fn connect_to_peers(&self, connection_sender: Sender<NewEgressConnection>) {
+        let pending_peer_connections: Vec<u64> = self
+            .peers
+            .iter()
+            .cloned()
+            .filter(|&p| {
+                self.cluster_connections[self.cluster_id_to_idx(p).unwrap()].is_none()
+                    && self.id < p
+            })
+            .collect();
+        debug!("{}: Reconnecting to {pending_peer_connections:?}", self.id);
+        for pending_node in pending_peer_connections {
+            let cluster_message_sender = self.cluster_message_sender.clone();
+            let conn_sender = connection_sender.clone();
+            let from = self.id;
+            let to_address = match get_node_addr(&self.cluster_name, pending_node, self.is_local) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    log::error!("Error resolving DNS name of node {pending_node}: {e}");
+                    return;
+                }
+            };
+            tokio::spawn(async move {
+                match TcpStream::connect(to_address).await {
+                    Ok(connection) => {
+                        debug!("New connection to node {pending_node}");
+                        Self::handle_connection_to_node(
+                            connection,
+                            cluster_message_sender,
+                            conn_sender,
+                            from,
+                            pending_node,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        error!("Establishing connection to node {pending_node} failed: {err}")
+                    }
+                }
+            });
+        }
     }
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        message_sink: Sender<Incoming>,
-        connection_sink: Sender<NewConnection>,
+        client_message_sender: Sender<ClientMessage>,
+        cluster_message_sender: Sender<ClusterMessage>,
+        connection_sender: Sender<NewEgressConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
     ) {
         connection.set_nodelay(true).unwrap();
-        let (mut reader, writer) = wrap_split_stream(connection);
+        let mut registration_connection = frame_registration_connection(connection);
 
         // Identify connector's ID by handshake
-        let first_message = reader.next().await;
-        let connection_id = match first_message {
-            Some(Ok(NetworkMessage::NodeRegister(node_id))) => {
+        let registration_message = registration_connection.next().await;
+        let identified_connection = match registration_message {
+            Some(Ok(RegistrationMessage::NodeRegister(node_id))) => {
                 info!("Identified connection from node {node_id}");
-                let identified_connection = NewConnection::NodeConnection(node_id, writer);
-                connection_sink.send(identified_connection).await.unwrap();
-                ConnectionId::ServerConnection(node_id)
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                let (from_node, to_node) = frame_cluster_connection(underlying_stream);
+                connection_sender
+                    .send(NewEgressConnection::ToNode(node_id, to_node))
+                    .await
+                    .unwrap();
+                NewIngressConnection::FromNode(node_id, from_node)
             }
-            Some(Ok(NetworkMessage::ClientRegister)) => {
+            Some(Ok(RegistrationMessage::ClientRegister)) => {
                 let next_client_id = {
                     let mut max_client_id = max_client_id_handle.lock().unwrap();
                     *max_client_id += 1;
                     *max_client_id
                 };
                 debug!("Identified connection from client {next_client_id}");
-                // let handshake_finish =
-                //     NetworkMessage::ClientToMsg(ClientToMsg::AssignedID(next_client_id));
-                // debug!("Assigning id to client {next_client_id}");
-                // if let Err(err) = writer.send(handshake_finish).await {
-                //     error!("Error sending ID to client {next_client_id}: {err}");
-                //     return;
-                // }
-                let identified_connection = NewConnection::ClientConnection(next_client_id, writer);
-                connection_sink.send(identified_connection).await.unwrap();
-                ConnectionId::ClientConnection(next_client_id)
-            }
-            Some(Ok(msg)) => {
-                warn!("Received unknown message during handshake: {:?}", msg);
-                return;
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                let (from_client, to_client) = frame_servers_connection(underlying_stream);
+                connection_sender
+                    .send(NewEgressConnection::ToClient(next_client_id, to_client))
+                    .await
+                    .unwrap();
+                NewIngressConnection::FromClient(next_client_id, from_client)
             }
             Some(Err(err)) => {
                 error!("Error deserializing handshake: {:?}", err);
@@ -149,20 +230,19 @@ impl Network {
             }
         };
 
-        match connection_id {
-            ConnectionId::ClientConnection(id) => {
-                while let Some(msg) = reader.next().await {
+        // Receive messages
+        match identified_connection {
+            NewIngressConnection::FromClient(client_id, mut reader) => {
+                while let Some(mut msg) = reader.next().await {
+                    // TODO: Send client its assigned ID in handshake instead
+                    if let Ok(ClientMessage::Append(ref mut id, _, _)) = msg {
+                        *id = client_id;
+                    }
                     match msg {
-                        Ok(NetworkMessage::ClientMessage(m)) => {
-                            debug!("Received request from client {id}: {m:?}");
-                            let request = Incoming::ClientMessage(id, m);
-                            message_sink.send(request).await.unwrap();
+                        Ok(m) => {
+                            debug!("Received request from client {client_id}: {m:?}");
+                            client_message_sender.send(m).await.unwrap();
                         }
-                        Ok(NetworkMessage::KillServer) => {
-                            log::error!("Received kill signal");
-                            std::process::abort();
-                        }
-                        Ok(m) => warn!("Received unexpected message: {m:?}"),
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);
                             break;
@@ -170,15 +250,13 @@ impl Network {
                     }
                 }
             }
-            ConnectionId::ServerConnection(id) => {
+            NewIngressConnection::FromNode(_node_id, mut reader) => {
                 while let Some(msg) = reader.next().await {
                     match msg {
-                        Ok(NetworkMessage::ClusterMessage(m)) => {
+                        Ok(m) => {
                             trace!("Received: {m:?}");
-                            let request = Incoming::ClusterMessage(id, m);
-                            message_sink.send(request).await.unwrap();
+                            cluster_message_sender.send(m).await.unwrap();
                         }
-                        Ok(m) => warn!("Received unexpected message: {m:?}"),
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);
                             break;
@@ -191,32 +269,32 @@ impl Network {
 
     async fn handle_connection_to_node(
         connection: TcpStream,
-        message_sink: Sender<Incoming>,
-        connection_sink: Sender<NewConnection>,
+        cluster_message_sender: Sender<ClusterMessage>,
+        connection_sender: Sender<NewEgressConnection>,
         my_id: NodeId,
         to: NodeId,
     ) {
         connection.set_nodelay(true).unwrap();
-        let (mut reader, mut writer) = wrap_split_stream(connection);
+        let mut registration_connection = frame_registration_connection(connection);
 
         // Send handshake
-        let handshake = NetworkMessage::NodeRegister(my_id);
-        if let Err(err) = writer.send(handshake).await {
+        let handshake = RegistrationMessage::NodeRegister(my_id);
+        if let Err(err) = registration_connection.send(handshake).await {
             error!("Error sending handshake to {to}: {err}");
             return;
         }
-        let new_connection = NewConnection::NodeConnection(to, writer);
-        connection_sink.send(new_connection).await.unwrap();
+        let underlying_stream = registration_connection.into_inner().into_inner();
+        let (mut from_node, to_node) = frame_cluster_connection(underlying_stream);
+        let new_connection = NewEgressConnection::ToNode(to, to_node);
+        connection_sender.send(new_connection).await.unwrap();
 
         // Collect incoming messages
-        while let Some(msg) = reader.next().await {
+        while let Some(msg) = from_node.next().await {
             match msg {
-                Ok(NetworkMessage::ClusterMessage(m)) => {
+                Ok(m) => {
                     trace!("Received: {m:?}");
-                    let request = Incoming::ClusterMessage(to, m);
-                    message_sink.send(request).await.unwrap();
+                    cluster_message_sender.send(m).await.unwrap();
                 }
-                Ok(m) => warn!("Received unexpected message: {m:?}"),
                 Err(err) => {
                     error!("Error deserializing message: {:?}", err);
                     break;
@@ -225,107 +303,32 @@ impl Network {
         }
     }
 
-    fn handle_identified_connection(&mut self, connection: NewConnection) {
-        match connection {
-            NewConnection::NodeConnection(node_id, conn) => {
-                self.cluster_connections.insert(node_id, conn)
-            }
-            NewConnection::ClientConnection(client_id, conn) => {
-                self.client_connections.insert(client_id, conn)
-            }
-        };
-    }
-
-    pub async fn send(&mut self, message: Outgoing) {
-        match message {
-            Outgoing::ServerMessage(client_id, msg) => self.send_to_client(client_id, msg).await,
-            Outgoing::ClusterMessage(server_id, msg) => self.send_to_cluster(server_id, msg).await,
+    pub async fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+        match self.cluster_id_to_idx(to) {
+            Some(idx) => match &mut self.cluster_connections[idx] {
+                Some(ref mut writer) => {
+                    if let Err(err) = writer.send(msg).await {
+                        warn!("Couldn't send message to node {to}: {err}");
+                        warn!("Removing connection to node {to}");
+                        self.cluster_connections[idx] = None;
+                    }
+                }
+                None => warn!("Not connected to node {to}: couldn't send {msg:?}"),
+            },
+            None => error!("Sending to unexpected node {to}"),
         }
     }
 
-    async fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        if let Some(writer) = self.cluster_connections.get_mut(&to) {
-            trace!("Sending to node {to}: {msg:?}");
-            if let Err(err) = writer.send(NetworkMessage::ClusterMessage(msg)).await {
-                warn!("Couldn't send message to node {to}: {err}");
-                warn!("Removing connection to node {to}");
-                self.cluster_connections.remove(&to);
-            }
-        } else {
-            warn!("Not connected to node {to}: couldn't send {msg:?}");
-            // If HeartbeatRequest msg is what failed, try to reconnect to node.
-            // if let ClusterMessage::OmniPaxosMessage(OmniPaxosMessage::BLE(m)) = msg {
-            //     if m.to == to {
-            //         self.connect_to_node(to);
-            //     }
-            // }
-        }
-    }
-
-    async fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
+    pub async fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         if let Some(writer) = self.client_connections.get_mut(&to) {
             debug!("Responding to client {to}: {msg:?}");
-            let net_msg = NetworkMessage::ServerMessage(msg);
-            if let Err(err) = writer.send(net_msg).await {
+            if let Err(err) = writer.send(msg).await {
                 warn!("Couldn't send message to client {to}: {err}");
                 warn!("Removing connection to client {to}");
-                self.cluster_connections.remove(&to);
+                self.client_connections.remove(&to);
             }
         } else {
             warn!("Not connected to client {to}");
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum NetworkError {
-    SocketListenerFailure,
-    InternalChannelFailure,
-}
-
-impl Stream for Network {
-    type Item = Result<Incoming, NetworkError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Poll new incoming connection
-        if let Poll::Ready(val) = Pin::new(&mut self.as_mut().listener).poll_accept(cx) {
-            match val {
-                Ok((tcp_stream, socket_addr)) => {
-                    debug!("New connection from {socket_addr}");
-                    tokio::spawn(Self::handle_incoming_connection(
-                        tcp_stream,
-                        self.message_sink.clone(),
-                        self.connection_sink.clone(),
-                        self.max_client_id.clone(),
-                    ));
-                    cx.waker().wake_by_ref();
-                }
-                Err(err) => {
-                    error!("Error checking for new requests: {:?}", err);
-                    return Poll::Ready(Some(Err(NetworkError::SocketListenerFailure)));
-                }
-            }
-        }
-        // Poll new identified connection
-        if let Poll::Ready(val) = self.connection_source.poll_recv(cx) {
-            match val {
-                Some(new_conn) => {
-                    self.handle_identified_connection(new_conn);
-                    cx.waker().wake_by_ref();
-                }
-                None => return Poll::Ready(Some(Err(NetworkError::InternalChannelFailure))),
-            }
-        }
-        // Poll new incoming message
-        if let Poll::Ready(val) = self.message_source.poll_recv(cx) {
-            match val {
-                Some(msg) => return Poll::Ready(Some(Ok(msg))),
-                None => return Poll::Ready(Some(Err(NetworkError::InternalChannelFailure))),
-            }
-        }
-        // Nothing to yield yet
-        // NOTE: don't need to call waker here because previous poll_recv and poll_accept will
-        // handle scheduling the wake up???
-        return Poll::Pending;
     }
 }
