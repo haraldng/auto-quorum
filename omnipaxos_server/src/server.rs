@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 use omnipaxos::ballot_leader_election::Ballot;
 use omnipaxos::messages::sequence_paxos::{PaxosMessage, PaxosMsg};
@@ -30,7 +30,6 @@ pub struct OmniPaxosServerConfig {
     pub optimize_threshold: Option<f64>,
     pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
-    pub initial_read_strat: Option<Vec<ReadStrategy>>,
     pub storage_duration_micros: Option<u64>,
 }
 
@@ -41,13 +40,13 @@ pub struct OmniPaxosServer {
     nodes: Vec<NodeId>,
     database: Database,
     network: Network,
+    cluster_messages: Receiver<ClusterMessage>,
+    client_messages: Receiver<ClientMessage>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
     current_decided_idx: usize,
     leader_attempt: u32,
     storage_delay: Option<Duration>,
-    delayed_accepted_sink: Sender<Outgoing>,
-    delayed_accepted_source: Receiver<Outgoing>,
 }
 
 impl OmniPaxosServer {
@@ -76,28 +75,31 @@ impl OmniPaxosServer {
             true => 1,
             false => 0,
         };
+        let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(10000);
+        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(10000);
         let network = Network::new(
             server_config.cluster_name,
             server_id,
             nodes.clone(),
             initial_clients,
             local_deployment,
+            client_message_sender,
+            cluster_message_sender,
         )
         .await
         .unwrap();
-        let (delayed_accepted_sink, delayed_accepted_source) = tokio::sync::mpsc::channel(10000);
         let mut server = OmniPaxosServer {
             id: server_id,
             nodes,
             database: Database::new(),
             network,
+            cluster_messages,
+            client_messages,
             omnipaxos,
             initial_leader,
             current_decided_idx: 0,
             leader_attempt: 0,
             storage_delay,
-            delayed_accepted_sink,
-            delayed_accepted_source,
         };
         // Clears outgoing_messages of initial BLE messages
         let _ = server.omnipaxos.outgoing_messages();
@@ -117,13 +119,16 @@ impl OmniPaxosServer {
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
                             debug!("{}: Leader fully initialized", self.id);
-                            self.network.send(Outgoing::ServerMessage(self.id, ServerMessage::Ready)).await;
+                            self.network.send_to_client(self.id, ServerMessage::Ready).await;
                             break;
                         }
                     },
-                    // Still necessary for sending handshakes and polling for new connections
-                    Some(msg) = self.network.next() => {
-                        self.handle_incoming_msg(msg).await;
+                    // Still necessary for sending handshakes
+                    Some(msg) = self.cluster_messages.recv() => {
+                        self.handle_cluster_message(msg).await;
+                    },
+                    Some(msg) = self.client_messages.recv() => {
+                        self.handle_client_request(msg).await;
                     },
                 }
             }
@@ -131,12 +136,11 @@ impl OmniPaxosServer {
 
         loop {
             tokio::select! {
-                biased;
-                Some(ready_accepted) = self.delayed_accepted_source.recv() => {
-                    self.network.send(ready_accepted).await;
+                Some(msg) = self.client_messages.recv() => {
+                    self.handle_client_request(msg).await;
                 },
-                Some(msg) = self.network.next() => {
-                    self.handle_incoming_msg(msg).await;
+                Some(msg) = self.cluster_messages.recv() => {
+                    self.handle_cluster_message(msg).await;
                 },
             }
         }
@@ -198,7 +202,7 @@ impl OmniPaxosServer {
                     None => ServerMessage::Write(command.id),
                 };
                 self.network
-                    .send(Outgoing::ServerMessage(command.client_id, response))
+                    .send_to_client(command.client_id, response)
                     .await;
             }
         }
@@ -225,37 +229,29 @@ impl OmniPaxosServer {
                     //     delayed_accepted_sink.send(outgoing_msg).await.unwrap();
                     // });
                     tokio::time::sleep(delay).await;
-                    let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
-                    self.network.send(outgoing_msg).await;
+                    self.network.send_to_cluster(to, cluster_msg).await;
                 }
-                _ => {
-                    let outgoing_msg = Outgoing::ClusterMessage(to, cluster_msg);
-                    self.network.send(outgoing_msg).await;
-                }
+                _ => self.network.send_to_cluster(to, cluster_msg).await,
             }
         }
     }
 
-    async fn handle_incoming_msg(&mut self, msg: Incoming) {
-        match msg {
-            Incoming::ClientMessage(from, request) => {
-                self.handle_client_request(from, request).await;
-            }
-            Incoming::ClusterMessage(_from, ClusterMessage::OmniPaxosMessage(m)) => {
+    async fn handle_cluster_message(&mut self, message: ClusterMessage) {
+        match message {
+            ClusterMessage::OmniPaxosMessage(m) => {
                 self.omnipaxos.handle_incoming(m);
                 self.send_outgoing_msgs().await;
                 if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
                     self.handle_decided_entries().await;
                 }
             }
-            _ => unimplemented!(),
         }
     }
 
-    async fn handle_client_request(&mut self, from: ClientId, request: ClientMessage) {
+    async fn handle_client_request(&mut self, request: ClientMessage) {
         match request {
-            ClientMessage::Append(command_id, kv_command) => {
-                self.commit_command_to_log(from, command_id, kv_command)
+            ClientMessage::Append(client_id, command_id, kv_command) => {
+                self.commit_command_to_log(client_id, command_id, kv_command)
                     .await;
             }
         };

@@ -8,7 +8,9 @@ use tokio::net::TcpStream;
 use tokio::time::interval;
 use tokio_stream::StreamExt;
 
-use common::util::{get_node_addr, wrap_stream, Connection as ServerConnection};
+use common::util::{
+    frame_clients_connection, frame_registration_connection, get_node_addr, ServerConnection,
+};
 use common::{kv::*, messages::*};
 use histogram::Histogram;
 
@@ -97,7 +99,13 @@ async fn get_server_connection(server_address: SocketAddr) -> ServerConnection {
         match TcpStream::connect(server_address).await {
             Ok(stream) => {
                 stream.set_nodelay(true).unwrap();
-                break wrap_stream(stream);
+                let mut registration_connection = frame_registration_connection(stream);
+                registration_connection
+                    .send(RegistrationMessage::ClientRegister)
+                    .await
+                    .expect("Couldn't send message to server");
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                break frame_clients_connection(underlying_stream);
             }
             Err(e) => eprintln!("Unable to connect to server: {e}"),
         }
@@ -110,7 +118,7 @@ impl Client {
         let server_address = get_node_addr(&config.cluster_name, config.server_id, is_local)
             .expect("Couldn't resolve server IP");
         let server = get_server_connection(server_address).await;
-        let mut client = Self {
+        Self {
             server,
             command_id: 0,
             request_data: Vec::with_capacity(8000),
@@ -120,9 +128,7 @@ impl Client {
             iterations: config.iterations.expect("Iterations not set"),
             current_iteration: 0,
             num_responses: 0,
-        };
-        client.send_registration().await;
-        client
+        }
     }
 
     pub async fn put(&mut self, key: String, value: String) {
@@ -140,7 +146,7 @@ impl Client {
     pub async fn run(&mut self) {
         let first_msg = self.server.next().await.unwrap();
         match first_msg.unwrap() {
-            NetworkMessage::ServerMessage(ServerMessage::Ready) => (),
+            ServerMessage::Ready => (),
             _ => panic!("Recieved unexpected message during handshake"),
         }
 
@@ -153,7 +159,7 @@ impl Client {
                 // Handle the next server message when it arrives
                 Some(msg) = self.server.next() => self.handle_response(msg.unwrap()),
                 // Send request according to rate of current request interval setting. (defined in
-                    // TOML config)
+                // TOML config)
                 _ = batch_interval.tick() => {
                     if self.current_iteration == self.iterations {
                         if self.num_responses == self.request_data.len() {
@@ -173,25 +179,23 @@ impl Client {
     }
 
     async fn send_command(&mut self, command: KVCommand) {
-        let request = ClientMessage::Append(self.command_id, command);
+        // TODO: Get client ID from handshake
+        let request = ClientMessage::Append(0, self.command_id, command);
         let data = RequestData {
             time_sent_utc: Utc::now().timestamp_micros(),
             response: None,
         };
         self.request_data.push(data);
         self.command_id += 1;
-        if let Err(e) = self
-            .server
-            .send(NetworkMessage::ClientMessage(request))
-            .await
-        {
+        if let Err(e) = self.server.send(request).await {
             log::error!("Couldn't send command to server: {e}");
         }
     }
 
-    fn handle_response(&mut self, msg: NetworkMessage) {
+    fn handle_response(&mut self, msg: ServerMessage) {
         match msg {
-            NetworkMessage::ServerMessage(response) => {
+            ServerMessage::Ready => panic!("Recieved unexpected message: {msg:?}"),
+            response => {
                 let cmd_id = response.command_id();
                 let response_time = Utc::now().timestamp_micros();
                 self.request_data[cmd_id].response = Some(Response {
@@ -200,22 +204,7 @@ impl Client {
                 });
                 self.num_responses += 1;
             }
-            _ => panic!("Recieved unexpected message: {msg:?}"),
         }
-    }
-
-    async fn send_registration(&mut self) {
-        self.server
-            .send(NetworkMessage::ClientRegister)
-            .await
-            .expect("Couldn't send message to server");
-    }
-
-    async fn send_kill_signal(&mut self) {
-        self.server
-            .send(NetworkMessage::KillServer)
-            .await
-            .expect("Couldn't send message to server")
     }
 
     fn print_results(&self) {

@@ -4,19 +4,7 @@ use tokio::net::TcpStream;
 use tokio_serde::{formats::Bincode, Framed};
 use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
-use crate::{kv::NodeId, messages::NetworkMessage};
-
-pub type Connection = Framed<
-    CodecFramed<TcpStream, LengthDelimitedCodec>,
-    NetworkMessage,
-    NetworkMessage,
-    Bincode<NetworkMessage, NetworkMessage>,
->;
-
-pub fn wrap_stream(stream: TcpStream) -> Connection {
-    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    Framed::new(length_delimited, Bincode::default())
-}
+use crate::{kv::NodeId, messages::*};
 
 pub fn get_node_addr(
     cluster_name: &String,
@@ -33,26 +21,92 @@ pub fn get_node_addr(
     Ok(address)
 }
 
-pub type NetworkSource = Framed<
-    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    NetworkMessage,
-    (),
-    Bincode<NetworkMessage, ()>,
->;
-pub type NetworkSink = Framed<
-    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
-    (),
-    NetworkMessage,
-    Bincode<(), NetworkMessage>,
+pub type RegistrationConnection = Framed<
+    CodecFramed<TcpStream, LengthDelimitedCodec>,
+    RegistrationMessage,
+    RegistrationMessage,
+    Bincode<RegistrationMessage, RegistrationMessage>,
 >;
 
-/// Turns tcp stream into a framed read and write sink/source
-pub fn wrap_split_stream(stream: TcpStream) -> (NetworkSource, NetworkSink) {
+pub fn frame_registration_connection(stream: TcpStream) -> RegistrationConnection {
+    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
+    Framed::new(length_delimited, Bincode::default())
+}
+
+pub type FromNodeConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    ClusterMessage,
+    (),
+    Bincode<ClusterMessage, ()>,
+>;
+pub type ToNodeConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    ClusterMessage,
+    Bincode<(), ClusterMessage>,
+>;
+
+pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNodeConnection) {
     let (reader, writer) = stream.into_split();
     let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
     let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
     (
-        NetworkSource::new(stream, Bincode::default()),
-        NetworkSink::new(sink, Bincode::default()),
+        FromNodeConnection::new(stream, Bincode::default()),
+        ToNodeConnection::new(sink, Bincode::default()),
+    )
+}
+
+pub type ServerConnection = Framed<
+    CodecFramed<TcpStream, LengthDelimitedCodec>,
+    ServerMessage,
+    ClientMessage,
+    Bincode<ServerMessage, ClientMessage>,
+>;
+pub type FromServerConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    ServerMessage,
+    (),
+    Bincode<ServerMessage, ()>,
+>;
+pub type ToServerConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    ClientMessage,
+    Bincode<(), ClientMessage>,
+>;
+pub type FromClientConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    ClientMessage,
+    (),
+    Bincode<ClientMessage, ()>,
+>;
+pub type ToClientConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    ServerMessage,
+    Bincode<(), ServerMessage>,
+>;
+
+// pub fn frame_clients_connection(stream: TcpStream) -> (FromServerConnection, ToServerConnection) {
+//     let (reader, writer) = stream.into_split();
+//     let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+//     let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+//     (
+//         FromServerConnection::new(stream, Bincode::default()),
+//         ToServerConnection::new(sink, Bincode::default()),
+//     )
+// }
+pub fn frame_clients_connection(stream: TcpStream) -> ServerConnection {
+    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
+    Framed::new(length_delimited, Bincode::default())
+}
+
+pub fn frame_servers_connection(stream: TcpStream) -> (FromClientConnection, ToClientConnection) {
+    let (reader, writer) = stream.into_split();
+    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    (
+        FromClientConnection::new(stream, Bincode::default()),
+        ToClientConnection::new(sink, Bincode::default()),
     )
 }

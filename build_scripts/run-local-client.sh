@@ -18,7 +18,7 @@ client1_config_path="./client-${server_id}-config.toml"
 
 run_id=$(date +%s%N)
 
-mkdir "../logs/run-${run_id}"
+mkdir -p "../logs/run-${run_id}"
 client1_log_path="../logs/run-${run_id}/client-${server_id}.log"
 #client2_log_path="../logs/run-${run_id}/client-${other_id}.log"
 
