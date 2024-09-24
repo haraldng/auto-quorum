@@ -241,18 +241,6 @@ impl Client {
                 }
             }
         }
-        let avg_latency = (latency_sum as f64 / 1000.) / num_responses as f64;
-        let variance = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .map(|value| {
-                let diff = (value as f64 / 1000.) - avg_latency;
-                diff * diff
-            })
-            .sum::<f64>()
-            / num_responses as f64;
-        let std_dev = variance.sqrt();
         if dropped_sequence > 0 {
             println!("dropped requests: {dropped_sequence}");
         }
@@ -265,21 +253,58 @@ impl Client {
         } else {
             (num_responses - missed_responses) as f64 / duration_s
         };
+
+        // Request latency
+        let (avg_latency, std_dev) = self.calc_avg_response_latency();
         let res_str = format!(
-            "Avg latency: {avg_latency} ms, Std dev: {std_dev} ms Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
+            "Avg latency: {avg_latency:.3} ms, Std dev: {std_dev:.3} ms Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
         );
         println!("{res_str}");
         eprintln!("{res_str}");
 
-        let mut p_str = String::from("Latency percentiles:");
-        for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
-            p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
-        }
-        println!("{p_str}");
-        eprintln!("{p_str}");
+        // let mut p_str = String::from("Latency percentiles:");
+        // for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
+        //     p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
+        // }
+        // println!("{p_str}");
+        // eprintln!("{p_str}");
 
         // Batch latency
-        //
+        let (avg_batch_latency, std_dev) = self.calc_avg_batch_latency();
+        let res_str =
+            format!("Avg batch latency: {avg_batch_latency:.3} ms, Batch std dev: {std_dev:.3} ms");
+        println!("{res_str}");
+        eprintln!("{res_str}");
+
+        // Batch position latency
+        let batch_position_latency = self.calc_avg_batch_latency_by_position();
+        let res_str = format!("Avg batch position latency: {batch_position_latency:?} ms");
+        println!("{res_str}");
+        eprintln!("{res_str}");
+    }
+
+    fn calc_avg_response_latency(&self) -> (f64, f64) {
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let num_responses = latencies.len();
+        let avg_latency = latencies.iter().sum::<i64>() as f64 / num_responses as f64;
+        let variance = latencies
+            .into_iter()
+            .map(|value| {
+                let diff = (value as f64) - avg_latency;
+                diff * diff
+            })
+            .sum::<f64>()
+            / num_responses as f64;
+        let std_dev = variance.sqrt();
+        // Convert from microseconds to ms
+        (avg_latency / 1000., std_dev / 1000.)
+    }
+
+    fn calc_avg_batch_latency(&self) -> (f64, f64) {
         let latencies: Vec<i64> = self
             .request_data
             .iter()
@@ -300,12 +325,31 @@ impl Client {
             .sum::<f64>()
             / num_batches as f64;
         let std_dev = variance.sqrt();
-        let res_str = format!(
-            "Avg batch latency: {} ms, Batch std dev: {} ms",
-            avg_batch_latency / 1000.,
-            std_dev / 1000.,
-        );
-        println!("{res_str}");
-        eprintln!("{res_str}");
+        // Convert from microseconds to ms
+        (avg_batch_latency / 1000., std_dev / 1000.)
+    }
+
+    fn calc_avg_batch_latency_by_position(&self) -> Vec<f64> {
+        let latencies: Vec<i64> = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .collect();
+        let batch_count = latencies.len() / self.req_batch_size;
+        let mut sums = vec![0i64; self.req_batch_size]; // to accumulate sums for each index in chunks
+        for batch in latencies.chunks(self.req_batch_size) {
+            for i in 0..self.req_batch_size {
+                sums[i] += batch[i];
+            }
+        }
+        let avg_latencies: Vec<f64> = sums
+            .iter()
+            .map(|&sum| (sum as f64 / 1000.) / batch_count as f64)
+            .collect();
+        // let variances = sums.into_iter().enumerate().map(|(i, sum)| {
+        //     let diff = (sum as f64) - avg_latencies[i];
+        //     diff * diff
+        // }).sum::<f64>();
+        avg_latencies
     }
 }
