@@ -1,5 +1,6 @@
 use chrono::Utc;
 use futures::SinkExt;
+use log::*;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -12,9 +13,6 @@ use common::util::{
     frame_clients_connection, frame_registration_connection, get_node_addr, ServerConnection,
 };
 use common::{kv::*, messages::*};
-use histogram::Histogram;
-
-const PERCENTILES: [f64; 6] = [50.0, 70.0, 80.0, 90.0, 95.0, 99.0];
 
 #[derive(Debug, Serialize)]
 struct RequestData {
@@ -36,7 +34,7 @@ struct Response {
     message: ServerMessage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
     cluster_name: String,
     location: String,
@@ -50,6 +48,19 @@ pub struct ClientConfig {
     pub(crate) iterations: Option<usize>,
     pub storage_duration_micros: Option<usize>,
     pub nodes: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientOutput {
+    client_config: ClientConfig,
+    throughput: f64,
+    num_requests: usize,
+    missed_responses: usize,
+    request_latency_average: f64,
+    request_latency_std_dev: f64,
+    batch_latency_average: f64,
+    batch_latency_std_dev: f64,
+    batch_position_latency: Vec<f64>,
 }
 
 /*
@@ -90,6 +101,7 @@ pub struct Client {
     iterations: usize,
     current_iteration: usize,
     num_responses: usize,
+    config: ClientConfig,
 }
 
 async fn get_server_connection(server_address: SocketAddr) -> (ServerConnection, ClientId) {
@@ -133,6 +145,7 @@ impl Client {
             iterations: config.iterations.expect("Iterations not set"),
             current_iteration: 0,
             num_responses: 0,
+            config,
         }
     }
 
@@ -140,10 +153,12 @@ impl Client {
         self.send_command(KVCommand::Put(key, value)).await;
     }
 
+    #[allow(dead_code)]
     pub async fn delete(&mut self, key: String) {
         self.send_command(KVCommand::Delete(key)).await;
     }
 
+    #[allow(dead_code)]
     pub async fn get(&mut self, key: String) {
         self.send_command(KVCommand::Get(key)).await;
     }
@@ -192,7 +207,7 @@ impl Client {
         self.request_data.push(data);
         self.command_id += 1;
         if let Err(e) = self.server.send(request).await {
-            log::error!("Couldn't send command to server: {e}");
+            error!("Couldn't send command to server: {e}");
         }
     }
 
@@ -212,81 +227,59 @@ impl Client {
     }
 
     fn print_results(&self) {
+        let (request_latency_average, request_latency_std_dev) = self.calc_avg_response_latency();
+        let throughput = self.calc_throughput();
         let num_requests = self.request_data.len();
-        let mut missed_responses = 0;
-        let mut dropped_sequence: usize = 0;
-        let mut histo = Histogram::new(7, 32).unwrap();
-        let mut latency_sum = 0;
-        let mut num_responses = 0;
-        for request_data in &self.request_data {
-            let response_time = request_data.response_time();
-            match response_time {
-                Some(latency) => {
-                    histo.increment(latency as u64).unwrap();
-                    latency_sum += latency;
-                    num_responses += 1;
-                    // if dropped_sequence > 0 {
-                    //     println!("dropped requests: {dropped_sequence}");
-                    //     dropped_sequence = 0;
-                    // }
-                    // if latency > 10 {
-                    //     println!("SLOW REQUEST {request_data:?}");
-                    // }
-                    println!(
-                        "request: {:?}, latency: {:?}, sent: {:?}",
-                        request_data.response.as_ref().unwrap().message.command_id(),
-                        latency,
-                        request_data.time_sent_utc
-                    );
-                }
-                None => {
-                    missed_responses += 1;
-                    dropped_sequence += 1;
-                }
+        let missed_responses = self
+            .request_data
+            .iter()
+            .filter(|r| r.response.is_none())
+            .count();
+        let (batch_latency_average, batch_latency_std_dev) = self.calc_avg_batch_latency();
+        let batch_position_latency = self.calc_avg_batch_latency_by_position();
+        let output = ClientOutput {
+            client_config: self.config.clone(),
+            throughput,
+            num_requests,
+            missed_responses,
+            request_latency_average,
+            request_latency_std_dev,
+            batch_latency_average,
+            batch_latency_std_dev,
+            batch_position_latency,
+        };
+        let json_output = serde_json::to_string_pretty(&output).unwrap();
+        println!("{json_output}\n");
+        eprintln!("{json_output}");
+
+        // Individual response times
+        for (cmd_idx, request) in self.request_data.iter().enumerate() {
+            match &request.response {
+                Some(response) => println!(
+                    "request: {:?}, latency: {:?}, sent: {:?}",
+                    response.message.command_id(),
+                    request.response_time().unwrap(),
+                    request.time_sent_utc
+                ),
+                None => println!(
+                    "request: {:?}, latency: NO RESPONSE, sent: {:?}",
+                    cmd_idx, request.time_sent_utc
+                ),
             }
         }
-        if dropped_sequence > 0 {
-            println!("dropped requests: {dropped_sequence}");
-        }
-        let duration_s = self.iterations as f64 * self.batch_interval.as_secs_f64();
-        let throughput = if num_responses <= missed_responses {
-            eprintln!(
-                "More dropped requests ({num_responses}) than completed requests ({num_responses})"
-            );
-            0.0
-        } else {
-            (num_responses - missed_responses) as f64 / duration_s
-        };
-
-        // Request latency
-        let (avg_latency, std_dev) = self.calc_avg_response_latency();
-        let res_str = format!(
-            "Avg latency: {avg_latency:.3} ms, Std dev: {std_dev:.3} ms Throughput: {throughput} ops/s, num requests: {num_requests}, missed: {missed_responses}"
-        );
-        println!("{res_str}");
-        eprintln!("{res_str}");
-
-        // let mut p_str = String::from("Latency percentiles:");
-        // for (percentile, bucket) in histo.percentiles(&PERCENTILES).unwrap().unwrap() {
-        //     p_str.push_str(&format!("\np{percentile}: {:?},", bucket));
-        // }
-        // println!("{p_str}");
-        // eprintln!("{p_str}");
-
-        // Batch latency
-        let (avg_batch_latency, std_dev) = self.calc_avg_batch_latency();
-        let res_str =
-            format!("Avg batch latency: {avg_batch_latency:.3} ms, Batch std dev: {std_dev:.3} ms");
-        println!("{res_str}");
-        eprintln!("{res_str}");
-
-        // Batch position latency
-        let batch_position_latency = self.calc_avg_batch_latency_by_position();
-        let res_str = format!("Avg batch position latency: {batch_position_latency:?} ms");
-        println!("{res_str}");
-        eprintln!("{res_str}");
     }
 
+    fn calc_throughput(&self) -> f64 {
+        let num_responses = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.response_time())
+            .count();
+        let duration_sec = self.iterations as f64 * self.batch_interval.as_secs_f64();
+        num_responses as f64 / duration_sec
+    }
+
+    // The (average, std dev) response latency of all requests
     fn calc_avg_response_latency(&self) -> (f64, f64) {
         let latencies: Vec<i64> = self
             .request_data
@@ -308,6 +301,7 @@ impl Client {
         (avg_latency / 1000., std_dev / 1000.)
     }
 
+    // The (average, std dev) respose latency for each batch of requests
     fn calc_avg_batch_latency(&self) -> (f64, f64) {
         let latencies: Vec<i64> = self
             .request_data
@@ -333,6 +327,7 @@ impl Client {
         (avg_batch_latency / 1000., std_dev / 1000.)
     }
 
+    // The average latency for each response by position in request batch
     fn calc_avg_batch_latency_by_position(&self) -> Vec<f64> {
         let latencies: Vec<i64> = self
             .request_data
@@ -340,7 +335,7 @@ impl Client {
             .filter_map(|data| data.response_time())
             .collect();
         let batch_count = latencies.len() / self.req_batch_size;
-        let mut sums = vec![0i64; self.req_batch_size]; // to accumulate sums for each index in chunks
+        let mut sums = vec![0i64; self.req_batch_size];
         for batch in latencies.chunks(self.req_batch_size) {
             for i in 0..self.req_batch_size {
                 sums[i] += batch[i];
@@ -350,10 +345,19 @@ impl Client {
             .iter()
             .map(|&sum| (sum as f64 / 1000.) / batch_count as f64)
             .collect();
-        // let variances = sums.into_iter().enumerate().map(|(i, sum)| {
-        //     let diff = (sum as f64) - avg_latencies[i];
-        //     diff * diff
-        // }).sum::<f64>();
         avg_latencies
     }
 }
+
+// // Function to serialize client data to JSON and compress with gzip
+// fn compress_raw_output(data: &RawOutput) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+//     // Step 1: Serialize the entire struct to JSON
+//     let json_representation = serde_json::to_string(data)?;
+//
+//     // Step 2: Compress the JSON representation using Gzip
+//     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+//     encoder.write_all(json_representation.as_bytes())?;
+//     let compressed_data = encoder.finish()?;
+//
+//     Ok(compressed_data)
+// }
