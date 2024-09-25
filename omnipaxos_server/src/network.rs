@@ -87,14 +87,9 @@ impl Network {
                                 None => error!("New connection from unexpected node {id}"),
                             }
                         },
-                        NewEgressConnection::ToClient(id, conn) => _ = {
-                            debug!("{}: Adding connection from client {id}", self.id);
-                            self.client_connections.insert(id, conn);
-                        },
+                        NewEgressConnection::ToClient(id, conn) => _ = self.client_connections.insert(id, conn),
                     }
                     let all_clients_connected = self.client_connections.len() >= num_clients;
-                    let a: Vec<&str> = self.cluster_connections.iter().map(|c| match c {Some(_) => "Some(conn)", None => "None"}).collect();
-                    debug!("{}: Connections remaining {:?}", self.id, a);
                     let all_cluster_connected = self.cluster_connections.iter().all(|c| c.is_some());
                     if all_clients_connected && all_cluster_connected {
                         abort_listen_handle.abort();
@@ -103,7 +98,6 @@ impl Network {
                 },
             }
         }
-        debug!("{}: Network initialized", self.id);
     }
 
     #[inline]
@@ -149,7 +143,12 @@ impl Network {
                     && self.id < p
             })
             .collect();
-        debug!("{}: Reconnecting to {pending_peer_connections:?}", self.id);
+        if !pending_peer_connections.is_empty() {
+            debug!(
+                "{}: Trying to connect to nodes {pending_peer_connections:?}",
+                self.id
+            );
+        }
         for pending_node in pending_peer_connections {
             let cluster_message_sender = self.cluster_message_sender.clone();
             let conn_sender = connection_sender.clone();

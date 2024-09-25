@@ -1,9 +1,7 @@
 use core::panic;
-use std::time::Duration;
-
-use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 
 use omnipaxos::ballot_leader_election::Ballot;
@@ -26,9 +24,6 @@ pub struct OmniPaxosServerConfig {
     pub cluster_name: String,
     pub location: String,
     pub initial_leader: Option<NodeId>,
-    pub optimize: Option<bool>,
-    pub optimize_threshold: Option<f64>,
-    pub congestion_control: Option<bool>,
     pub local_deployment: Option<bool>,
     pub storage_duration_micros: Option<u64>,
 }
@@ -37,7 +32,6 @@ type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 
 pub struct OmniPaxosServer {
     id: NodeId,
-    nodes: Vec<NodeId>,
     database: Database,
     network: Network,
     cluster_messages: Receiver<ClusterMessage>,
@@ -90,7 +84,6 @@ impl OmniPaxosServer {
         .unwrap();
         let mut server = OmniPaxosServer {
             id: server_id,
-            nodes,
             database: Database::new(),
             network,
             cluster_messages,
@@ -114,7 +107,6 @@ impl OmniPaxosServer {
                     // Ensures cluster is connected and leader is promoted before client starts sending
                     // requests.
                     _ = election_interval.tick() => {
-                        debug!("{}: Leader check initialized", self.id);
                         self.become_initial_leader().await;
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
@@ -229,6 +221,7 @@ impl OmniPaxosServer {
                     //     delayed_accepted_sink.send(outgoing_msg).await.unwrap();
                     // });
                     tokio::time::sleep(delay).await;
+                    // std::thread::sleep(delay);
                     self.network.send_to_cluster(to, cluster_msg).await;
                 }
                 _ => self.network.send_to_cluster(to, cluster_msg).await,

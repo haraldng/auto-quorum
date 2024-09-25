@@ -36,16 +36,15 @@ struct Response {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
-    cluster_name: String,
-    location: String,
+    pub cluster_name: String,
+    pub location: String,
     pub server_id: u64,
-    local_deployment: Option<bool>,
-    kill_signal_sec: Option<u64>,
+    pub local_deployment: Option<bool>,
     pub scheduled_start_utc_ms: Option<i64>,
     pub use_metronome: Option<usize>,
     pub req_batch_size: Option<usize>,
-    pub(crate) interval_ms: Option<u64>,
-    pub(crate) iterations: Option<usize>,
+    pub interval_ms: Option<u64>,
+    pub iterations: Option<usize>,
     pub storage_duration_micros: Option<usize>,
     pub nodes: Option<Vec<usize>>,
 }
