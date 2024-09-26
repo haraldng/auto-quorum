@@ -65,118 +65,94 @@ impl Network {
     }
 
     async fn initialize_connections(&mut self, num_clients: usize) {
-        let (connection_sink, mut connection_source) = mpsc::channel(10);
-        let listen_handle = tokio::spawn(Self::listen_for_connections(
-            self.id,
-            self.client_message_sender.clone(),
-            self.cluster_message_sender.clone(),
-            connection_sink.clone(),
-            self.max_client_id.clone(),
-        ));
-        let abort_listen_handle = listen_handle.abort_handle();
-        let reconnect_delay = Duration::from_secs(1);
-        let mut reconnect_interval = tokio::time::interval(reconnect_delay);
-        loop {
-            tokio::select! {
-                _ = reconnect_interval.tick() => self.connect_to_peers(connection_sink.clone()),
-                Some(new_connection) = connection_source.recv() => {
-                    match new_connection {
-                        NewEgressConnection::ToNode(id, conn) => {
-                            match self.cluster_id_to_idx(id) {
-                                Some(idx) => self.cluster_connections[idx] = Some(conn),
-                                None => error!("New connection from unexpected node {id}"),
-                            }
-                        },
-                        NewEgressConnection::ToClient(id, conn) => _ = self.client_connections.insert(id, conn),
-                    }
-                    let all_clients_connected = self.client_connections.len() >= num_clients;
-                    let all_cluster_connected = self.cluster_connections.iter().all(|c| c.is_some());
-                    if all_clients_connected && all_cluster_connected {
-                        abort_listen_handle.abort();
-                        break;
-                    }
+        let (connection_sink, mut connection_source) = mpsc::channel(30);
+        let listener_handle = self.spawn_connection_listener(connection_sink.clone());
+        self.spawn_peer_connectors(connection_sink.clone());
+        while let Some(new_connection) = connection_source.recv().await {
+            match new_connection {
+                NewEgressConnection::ToNode(id, conn) => match self.cluster_id_to_idx(id) {
+                    Some(idx) => self.cluster_connections[idx] = Some(conn),
+                    None => error!("New connection from unexpected node {id}"),
                 },
-            }
-        }
-    }
-
-    #[inline]
-    fn cluster_id_to_idx(&self, id: NodeId) -> Option<usize> {
-        self.peers.iter().position(|&p| p == id)
-    }
-
-    async fn listen_for_connections(
-        id: NodeId,
-        client_message_sender: Sender<ClientMessage>,
-        cluster_message_sender: Sender<ClusterMessage>,
-        connection_sender: Sender<NewEgressConnection>,
-        max_client_id_handle: Arc<Mutex<ClientId>>,
-    ) {
-        let port = 8000 + id as u16;
-        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = TcpListener::bind(listening_address).await.unwrap();
-
-        loop {
-            match listener.accept().await {
-                Ok((tcp_stream, socket_addr)) => {
-                    debug!("New connection from {socket_addr}");
-                    tokio::spawn(Self::handle_incoming_connection(
-                        tcp_stream,
-                        client_message_sender.clone(),
-                        cluster_message_sender.clone(),
-                        connection_sender.clone(),
-                        max_client_id_handle.clone(),
-                    ));
+                NewEgressConnection::ToClient(id, conn) => {
+                    _ = self.client_connections.insert(id, conn)
                 }
-                Err(e) => error!("Error listening for new connection: {:?}", e),
+            }
+            let all_clients_connected = self.client_connections.len() >= num_clients;
+            let all_cluster_connected = self.cluster_connections.iter().all(|c| c.is_some());
+            if all_clients_connected && all_cluster_connected {
+                listener_handle.abort();
+                break;
             }
         }
     }
 
-    fn connect_to_peers(&self, connection_sender: Sender<NewEgressConnection>) {
-        let pending_peer_connections: Vec<u64> = self
-            .peers
-            .iter()
-            .cloned()
-            .filter(|&p| {
-                self.cluster_connections[self.cluster_id_to_idx(p).unwrap()].is_none()
-                    && self.id < p
-            })
-            .collect();
-        if !pending_peer_connections.is_empty() {
-            debug!(
-                "{}: Trying to connect to nodes {pending_peer_connections:?}",
-                self.id
-            );
-        }
-        for pending_node in pending_peer_connections {
-            let cluster_message_sender = self.cluster_message_sender.clone();
-            let conn_sender = connection_sender.clone();
-            let from = self.id;
-            let to_address = match get_node_addr(&self.cluster_name, pending_node, self.is_local) {
+    fn spawn_connection_listener(
+        &self,
+        connection_sender: Sender<NewEgressConnection>,
+    ) -> tokio::task::JoinHandle<()> {
+        let port = 8000 + self.id as u16;
+        let listening_address = SocketAddr::from(([0, 0, 0, 0], port));
+        let client_sender = self.client_message_sender.clone();
+        let cluster_sender = self.cluster_message_sender.clone();
+        let max_client_id_handle = self.max_client_id.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(listening_address).await.unwrap();
+            loop {
+                match listener.accept().await {
+                    Ok((tcp_stream, socket_addr)) => {
+                        debug!("New connection from {socket_addr}");
+                        tokio::spawn(Self::handle_incoming_connection(
+                            tcp_stream,
+                            client_sender.clone(),
+                            cluster_sender.clone(),
+                            connection_sender.clone(),
+                            max_client_id_handle.clone(),
+                        ));
+                    }
+                    Err(e) => error!("Error listening for new connection: {:?}", e),
+                }
+            }
+        })
+    }
+
+    fn spawn_peer_connectors(&self, connection_sender: Sender<NewEgressConnection>) {
+        let my_id = self.id;
+        let peers_to_contact: Vec<NodeId> =
+            self.peers.iter().cloned().filter(|&p| p > my_id).collect();
+        for peer in peers_to_contact {
+            let cluster_sender = self.cluster_message_sender.clone();
+            let connection_sender = connection_sender.clone();
+            let to_address = match get_node_addr(&self.cluster_name, peer, self.is_local) {
                 Ok(addr) => addr,
                 Err(e) => {
-                    log::error!("Error resolving DNS name of node {pending_node}: {e}");
+                    log::error!("Error resolving DNS name of node {peer}: {e}");
                     return;
                 }
             };
+            let reconnect_delay = Duration::from_secs(1);
+            let mut reconnect_interval = tokio::time::interval(reconnect_delay);
             tokio::spawn(async move {
-                match TcpStream::connect(to_address).await {
-                    Ok(connection) => {
-                        debug!("New connection to node {pending_node}");
-                        Self::handle_connection_to_node(
-                            connection,
-                            cluster_message_sender,
-                            conn_sender,
-                            from,
-                            pending_node,
-                        )
-                        .await;
+                let peer_connection = loop {
+                    reconnect_interval.tick().await;
+                    match TcpStream::connect(to_address).await {
+                        Ok(connection) => {
+                            debug!("New connection to node {peer}");
+                            break connection;
+                        }
+                        Err(err) => {
+                            error!("Establishing connection to node {peer} failed: {err}")
+                        }
                     }
-                    Err(err) => {
-                        error!("Establishing connection to node {pending_node} failed: {err}")
-                    }
-                }
+                };
+                Self::handle_connection_to_node(
+                    peer_connection,
+                    cluster_sender,
+                    connection_sender,
+                    my_id,
+                    peer,
+                )
+                .await;
             });
         }
     }
@@ -333,5 +309,10 @@ impl Network {
         } else {
             warn!("Not connected to client {to}");
         }
+    }
+
+    #[inline]
+    fn cluster_id_to_idx(&self, id: NodeId) -> Option<usize> {
+        self.peers.iter().position(|&p| p == id)
     }
 }
