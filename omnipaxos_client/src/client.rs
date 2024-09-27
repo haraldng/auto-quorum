@@ -309,7 +309,7 @@ impl Client {
             .collect();
         let batch_latencies: Vec<i64> = latencies
             .chunks(self.req_batch_size)
-            .map(|batch| batch.into_iter().sum())
+            .map(|batch| *batch.into_iter().max().unwrap())
             .collect();
         let num_batches = batch_latencies.len();
         let avg_batch_latency = batch_latencies.iter().sum::<i64>() as f64 / num_batches as f64;
