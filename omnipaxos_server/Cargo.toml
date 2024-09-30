@@ -25,6 +25,7 @@ tokio-util = { version = "0.7.10", features = ["codec"] }
 lazy_static = "1.4.0"
 chrono = "0.4.34"
 toml = "0.8.11"
+tempfile = "3.13.0"
 
 [[bin]]
 name = "server"

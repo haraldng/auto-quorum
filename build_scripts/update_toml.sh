@@ -1,11 +1,13 @@
 #!/bin/bash
 
-usage="Usage: update-toml.sh <use_metronome_value> <storage_duration_micros_value>"
+usage="Usage: update-toml.sh <use_metronome_value> <storage_duration_micros_value> <data_size_value>"
 [ -z "$1" ] && echo "No use_metronome value provided! $usage" && exit 1
 [ -z "$2" ] && echo "No storage_duration_micros value provided! $usage" && exit 1
+[ -z "$3" ] && echo "No data_size value provided! $usage" && exit 1
 
 use_metronome_value=$1
 storage_duration_micros_value=$2
+data_size_value=$3
 
 # Loop through each .toml file in the current directory
 for file in ./*.toml; do
@@ -16,6 +18,9 @@ for file in ./*.toml; do
 
         # Update the storage_duration_micros field
         sed -i "s/^storage_duration_micros = .*/storage_duration_micros = $storage_duration_micros_value/" "$file"
+
+        # Update the data_size field
+        sed -i "s/^data_size = .*/data_size = $data_size_value/" "$file"
 
         echo "Updated $file"
     else

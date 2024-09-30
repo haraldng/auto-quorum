@@ -10,4 +10,5 @@ req_batch_size = 10
 interval_ms = 100
 iterations = 100
 storage_duration_micros = 0
+data_size = 100000
 nodes = [1, 2, 3,4,5]

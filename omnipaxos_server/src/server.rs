@@ -1,7 +1,10 @@
 use core::panic;
 use log::*;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Write;
 use std::time::Duration;
+use tempfile::tempfile;
 use tokio::sync::mpsc::Receiver;
 
 use omnipaxos::ballot_leader_election::Ballot;
@@ -26,9 +29,16 @@ pub struct OmniPaxosServerConfig {
     pub initial_leader: Option<NodeId>,
     pub local_deployment: Option<bool>,
     pub storage_duration_micros: Option<u64>,
+    pub data_size: Option<usize>,
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
+
+enum DelayStrategy {
+    NoDelay,
+    Sleep(Duration),
+    FileWrite(File, usize),
+}
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -40,7 +50,7 @@ pub struct OmniPaxosServer {
     initial_leader: NodeId,
     current_decided_idx: usize,
     leader_attempt: u32,
-    storage_delay: Option<Duration>,
+    delay_strategy: DelayStrategy,
 }
 
 impl OmniPaxosServer {
@@ -52,10 +62,19 @@ impl OmniPaxosServer {
         let server_id = omnipaxos_config.server_config.pid;
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
-        let storage_delay = match server_config.storage_duration_micros {
-            None => panic!("Storage duration must be set"),
-            Some(0) => None, // sleeping with duration 0 yields the task
-            Some(dur) => Some(Duration::from_micros(dur)),
+        let delay_strategy = match (
+            server_config.data_size,
+            server_config.storage_duration_micros,
+        ) {
+            (Some(size), _) if size > 0 => {
+                let file = tempfile().expect("Failed to open temp file");
+                DelayStrategy::FileWrite(file, size)
+            }
+            (_, Some(0)) => DelayStrategy::NoDelay,
+            (_, Some(micros)) => DelayStrategy::Sleep(Duration::from_micros(micros)),
+            (_, None) => panic!(
+                "Either data_size or storage_duration_micros configuration fields must be set."
+            ),
         };
         let storage = MemoryStorage::default();
         info!(
@@ -92,7 +111,7 @@ impl OmniPaxosServer {
             initial_leader,
             current_decided_idx: 0,
             leader_attempt: 0,
-            storage_delay,
+            delay_strategy,
         };
         // Clears outgoing_messages of initial BLE messages
         let _ = server.omnipaxos.outgoing_messages();
@@ -205,16 +224,21 @@ impl OmniPaxosServer {
         for msg in messages {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            match (self.storage_delay, &cluster_msg) {
-                (
-                    Some(delay),
-                    ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(PaxosMessage {
-                        from: _,
-                        to: _,
-                        msg: PaxosMsg::Accepted(_),
-                    })),
-                ) => {
-                    std::thread::sleep(delay);
+            match &cluster_msg {
+                ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(PaxosMessage {
+                    from: _,
+                    to: _,
+                    msg: PaxosMsg::Accepted(_),
+                })) => {
+                    match &mut self.delay_strategy {
+                        DelayStrategy::Sleep(delay) => std::thread::sleep(*delay),
+                        DelayStrategy::FileWrite(ref mut file, data_size) => {
+                            let buffer = vec![b'A'; *data_size];
+                            file.write_all(&buffer).expect("Failed to write file");
+                            file.flush().expect("Failed to flush file");
+                        }
+                        DelayStrategy::NoDelay => (),
+                    }
                     self.network.send_to_cluster(to, cluster_msg).await;
                 }
                 _ => self.network.send_to_cluster(to, cluster_msg).await,

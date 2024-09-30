@@ -46,6 +46,7 @@ pub struct ClientConfig {
     pub interval_ms: Option<u64>,
     pub iterations: Option<usize>,
     pub storage_duration_micros: Option<usize>,
+    pub data_size: Option<usize>,
     pub nodes: Option<Vec<usize>>,
 }
 
