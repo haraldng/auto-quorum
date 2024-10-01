@@ -1,29 +1,36 @@
-#!/bin/bash
+set -u
 
-usage="Usage: update-toml.sh <use_metronome_value> <storage_duration_micros_value> <data_size_value>"
-[ -z "$1" ] && echo "No use_metronome value provided! $usage" && exit 1
-[ -z "$2" ] && echo "No storage_duration_micros value provided! $usage" && exit 1
-[ -z "$3" ] && echo "No data_size value provided! $usage" && exit 1
+# Parse key-value arguments
+declare -A args
+while [[ "$#" > "0" ]]; do
+  case "$1" in 
+    (*=*)
+        _key="${1%%=*}" &&  _key="${_key/--/}" && _val="${1#*=}"
+        args[${_key}]="${_val}"
+        ;;
+  esac
+  shift
+done
 
-use_metronome_value=$1
-storage_duration_micros_value=$2
-data_size_value=$3
+if [ -z "${args[*]}" ]; then
+  echo "Usage: update_toml <toml-key-1>=<toml-value-1> [ <toml-key-2>=<toml-value-2> ]"
+  echo "Surround values in quotes if they contain spaces and use value 'None' to comment out key"
+fi
 
-# Loop through each .toml file in the current directory
-for file in ./*.toml; do
-    # Check if the file exists
+# For each key-value update the TOML keys with the value, or if value is "None" comment out the key
+for key in "${!args[@]}"; do
+  value="${args[$key]}"
+  echo "Key: $key, Value: $value"
+  for file in ./*.toml; do
     if [[ -f $file ]]; then
-        # Update the use_metronome field
-        sed -i "s/^use_metronome = .*/use_metronome = $use_metronome_value/" "$file"
-
-        # Update the storage_duration_micros field
-        sed -i "s/^storage_duration_micros = .*/storage_duration_micros = $storage_duration_micros_value/" "$file"
-
-        # Update the data_size field
-        sed -i "s/^data_size = .*/data_size = $data_size_value/" "$file"
-
-        echo "Updated $file"
-    else
-        echo "No .toml files found in the current directory"
+      if ! grep -q "^#\?$key = .*" "$file"; then
+        echo "WARNING: Key $key does not exist in file $file"
+      fi
+      if [[ "$value" == "None" ]]; then
+        sed -i "s/^\($key = .*\)/#\1/" "$file"
+      else
+        sed -i "s/^#\?$key = .*/$key = $value/" "$file"
+      fi
     fi
+  done
 done

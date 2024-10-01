@@ -11,6 +11,8 @@ data_size = 100000
 configuration_id = 1
 nodes = [1, 2, 3, 4, 5]
 use_metronome = 0
+metronome_quorum_size = 3
+#flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
 
 [server_config]
 pid = 5

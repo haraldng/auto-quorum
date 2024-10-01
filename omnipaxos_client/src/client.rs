@@ -1,6 +1,7 @@
 use chrono::Utc;
 use futures::SinkExt;
 use log::*;
+use omnipaxos::util::FlexibleQuorum;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -34,6 +35,8 @@ struct Response {
     message: ServerMessage,
 }
 
+// TODO: Server config parameters like flexible_quorum should be taken from server, since
+// there may be a mismatch between the client's config and the servers' configs.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
     pub cluster_name: String,
@@ -42,6 +45,8 @@ pub struct ClientConfig {
     pub local_deployment: Option<bool>,
     pub scheduled_start_utc_ms: Option<i64>,
     pub use_metronome: Option<usize>,
+    pub metronome_quorum_size: Option<usize>,
+    pub flexible_quorum: Option<FlexibleQuorum>,
     pub req_batch_size: Option<usize>,
     pub interval_ms: Option<u64>,
     pub iterations: Option<usize>,
