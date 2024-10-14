@@ -66,6 +66,7 @@ struct ClientOutput {
     batch_latency_average: f64,
     batch_latency_std_dev: f64,
     batch_position_latency: Vec<f64>,
+    batch_position_std_dev: Vec<f64>,
 }
 
 /*
@@ -241,7 +242,8 @@ impl Client {
             .filter(|r| r.response.is_none())
             .count();
         let (batch_latency_average, batch_latency_std_dev) = self.calc_avg_batch_latency();
-        let batch_position_latency = self.calc_avg_batch_latency_by_position();
+        let (batch_position_latency, batch_position_std_dev) =
+            self.calc_avg_batch_latency_by_position();
         let output = ClientOutput {
             client_config: self.config.clone(),
             throughput,
@@ -252,6 +254,7 @@ impl Client {
             batch_latency_average,
             batch_latency_std_dev,
             batch_position_latency,
+            batch_position_std_dev,
         };
         let json_output = serde_json::to_string_pretty(&output).unwrap();
         println!("{json_output}\n");
@@ -333,7 +336,7 @@ impl Client {
     }
 
     // The average latency for each response by position in request batch
-    fn calc_avg_batch_latency_by_position(&self) -> Vec<f64> {
+    fn calc_avg_batch_latency_by_position(&self) -> (Vec<f64>, Vec<f64>) {
         let latencies: Vec<i64> = self
             .request_data
             .iter()
@@ -350,7 +353,19 @@ impl Client {
             .iter()
             .map(|&sum| (sum as f64 / 1000.) / batch_count as f64)
             .collect();
-        avg_latencies
+
+        let mut variances = vec![0f64; self.req_batch_size];
+        for batch in latencies.chunks(self.req_batch_size) {
+            for i in 0..self.req_batch_size {
+                let diff = (batch[i] as f64 / 1000.) - avg_latencies[i];
+                variances[i] += diff * diff;
+            }
+        }
+        let std_devs = variances
+            .into_iter()
+            .map(|v| (v / batch_count as f64).sqrt())
+            .collect();
+        (avg_latencies, std_devs)
     }
 }
 
