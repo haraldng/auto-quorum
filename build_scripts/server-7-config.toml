@@ -5,13 +5,13 @@ local_deployment = true
 optimize = true
 optimize_threshold = 0.97
 storage_duration_micros = 0
-data_size = 100000
+#data_size = 4000
 
 [cluster_config]
 configuration_id = 1
 nodes = [1, 2, 3, 4, 5]
 use_metronome = 0
-metronome_quorum_size = 3
+#metronome_quorum_size = 3
 #flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
 
 [server_config]

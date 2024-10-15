@@ -4,11 +4,11 @@ server_id = 3
 local_deployment = true
 scheduled_start_utc_ms = 0
 use_metronome = 0
-metronome_quorum_size = 3
+#metronome_quorum_size = 3
 #flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
 req_batch_size = 10
 interval_ms = 100
 iterations = 100
 storage_duration_micros = 0
-data_size = 100000
+#data_size = 4000
 nodes = [1, 2, 3, 4, 5]
