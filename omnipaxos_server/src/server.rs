@@ -6,6 +6,7 @@ use std::io::Write;
 use std::time::Duration;
 use tempfile::tempfile;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 use omnipaxos::ballot_leader_election::Ballot;
 use omnipaxos::messages::sequence_paxos::{PaxosMessage, PaxosMsg};
@@ -40,6 +41,25 @@ enum DelayStrategy {
     FileWrite(File, usize),
 }
 
+#[derive(Debug, Clone)]
+struct RequestInstrumentation {
+    channel_recieve: Instant,
+    send_accdec: Option<Instant>,
+    send_dec: Option<Instant>,
+    sending_response: Option<Instant>,
+}
+
+impl RequestInstrumentation {
+    fn with(receive_time: Instant) -> Self {
+        Self {
+            channel_recieve: receive_time,
+            send_accdec: None,
+            send_dec: None,
+            sending_response: None,
+        }
+    }
+}
+
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Database,
@@ -51,6 +71,8 @@ pub struct OmniPaxosServer {
     current_decided_idx: usize,
     leader_attempt: u32,
     delay_strategy: DelayStrategy,
+    batch_size: usize,
+    request_data: Vec<RequestInstrumentation>,
 }
 
 impl OmniPaxosServer {
@@ -83,13 +105,14 @@ impl OmniPaxosServer {
             omnipaxos_config.cluster_config.use_metronome,
             server_config.storage_duration_micros
         );
+        let batch_size = omnipaxos_config.server_config.batch_size;
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let initial_clients = match server_id == initial_leader {
             true => 1,
             false => 0,
         };
-        let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(10000);
-        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(10000);
+        let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(1000);
+        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(1000);
         let network = Network::new(
             server_config.cluster_name,
             server_id,
@@ -112,6 +135,8 @@ impl OmniPaxosServer {
             current_decided_idx: 0,
             leader_attempt: 0,
             delay_strategy,
+            batch_size,
+            request_data: vec![],
         };
         // Clears outgoing_messages of initial BLE messages
         let _ = server.omnipaxos.outgoing_messages();
@@ -148,7 +173,10 @@ impl OmniPaxosServer {
         loop {
             tokio::select! {
                 Some(msg) = self.client_messages.recv() => {
-                    self.handle_client_request(msg).await;
+                    let client_done = self.handle_client_request(msg).await;
+                    if client_done {
+                        break;
+                    }
                 },
                 Some(msg) = self.cluster_messages.recv() => {
                     self.handle_cluster_message(msg).await;
@@ -178,49 +206,109 @@ impl OmniPaxosServer {
     }
 
     async fn handle_decided_entries(&mut self) {
-        let new_decided_idx = self.omnipaxos.get_decided_idx();
-        if self.current_decided_idx < new_decided_idx {
-            let decided_entries = self.omnipaxos.read_decided_suffix(self.current_decided_idx);
-            match decided_entries {
-                Some(ents) => {
-                    self.current_decided_idx = new_decided_idx;
-                    let decided_commands = ents.into_iter().filter_map(|e| match e {
-                        LogEntry::Decided(cmd) => Some(cmd),
-                        // TODO: handle snapshotted entries
-                        _ => None,
-                    });
-                    self.update_database_and_respond(decided_commands.collect())
-                        .await;
+        let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
+        eprintln!("{decided_slots:?}");
+        for slot in decided_slots {
+            let decided_entry = self.omnipaxos.read(slot).unwrap();
+            match decided_entry {
+                LogEntry::Decided(cmd) => self.update_database_and_respond(cmd).await,
+                // TODO: fix slot indexing
+                LogEntry::Undecided(cmd) => {
+                    warn!("Omnipaxos said slot {slot} was decided, but reading from that index was undecided.");
+                    self.update_database_and_respond(cmd).await
                 }
-                None => {
-                    let log_len = self.omnipaxos.read_entries(0..).unwrap_or_default().len();
-                    warn!(
-                        "Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}",
-                        self.id
-                    );
-                }
+                LogEntry::Snapshotted(_) => unimplemented!(),
+                _ => unreachable!(),
             }
         }
     }
 
-    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here.
-        for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
-            if command.coordinator_id == self.id {
-                let response = match read {
-                    Some(read_result) => ServerMessage::Read(command.id, read_result),
-                    None => ServerMessage::Write(command.id),
-                };
-                self.network
-                    .send_to_client(command.client_id, response)
-                    .await;
-            }
+    async fn update_database_and_respond(&mut self, command: Command) {
+        let read = self.database.handle_command(command.kv_cmd);
+        if command.coordinator_id == self.id {
+            let response = match read {
+                Some(read_result) => ServerMessage::Read(command.id, read_result),
+                None => ServerMessage::Write(command.id),
+            };
+            let response_time = Instant::now();
+            self.request_data[command.id].sending_response = Some(response_time);
+            self.network
+                .send_to_client(command.client_id, response)
+                .await;
         }
     }
+    // async fn handle_decided_entries(&mut self) {
+    //     let new_decided_idx = self.omnipaxos.get_decided_idx();
+    //     if self.current_decided_idx < new_decided_idx {
+    //         let decided_entries = self.omnipaxos.read_decided_suffix(self.current_decided_idx);
+    //         match decided_entries {
+    //             Some(ents) => {
+    //                 self.current_decided_idx = new_decided_idx;
+    //                 let decided_commands = ents.into_iter().filter_map(|e| match e {
+    //                     LogEntry::Decided(cmd) => Some(cmd),
+    //                     LogEntry::Snapshotted(_) => unimplemented!(),
+    //                     _ => None,
+    //                 });
+    //                 self.update_database_and_respond(decided_commands.collect())
+    //                     .await;
+    //             }
+    //             None => {
+    //                 let log_len = self.omnipaxos.read_entries(0..).unwrap_or_default().len();
+    //                 warn!(
+    //                     "Node: {:?}, Decided {new_decided_idx} but log len is: {log_len}",
+    //                     self.id
+    //                 );
+    //             }
+    //         }
+    //     }
+    // }
+    //
+    // async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
+    //     // TODO: batching responses possible here.
+    //     for command in commands {
+    //         let read = self.database.handle_command(command.kv_cmd);
+    //         if command.coordinator_id == self.id {
+    //             let response = match read {
+    //                 Some(read_result) => ServerMessage::Read(command.id, read_result),
+    //                 None => ServerMessage::Write(command.id),
+    //             };
+    //             let response_time = Instant::now();
+    //             self.request_data[command.id].sending_response = Some(response_time);
+    //             self.network
+    //                 .send_to_client(command.client_id, response)
+    //                 .await;
+    //         }
+    //     }
+    // }
 
     async fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
+        if self.id == 1 && !messages.is_empty() {
+            for m in &messages {
+                // debug!("{m:?}");
+                match m {
+                    Message::SequencePaxos(PaxosMessage {
+                        from: _,
+                        to: _,
+                        msg: PaxosMsg::Decide(dec),
+                    }) => {
+                        let dec_time = Instant::now();
+                        self.request_data[dec.decided_idx - 1].send_dec = Some(dec_time);
+                    }
+                    Message::SequencePaxos(PaxosMessage {
+                        from: _,
+                        to: _,
+                        msg: PaxosMsg::AcceptDecide(accdec),
+                    }) => {
+                        let accdec_time = Instant::now();
+                        for entry in &accdec.entries {
+                            self.request_data[entry.id].send_accdec = Some(accdec_time);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
         for msg in messages {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
@@ -235,7 +323,7 @@ impl OmniPaxosServer {
                         DelayStrategy::FileWrite(ref mut file, data_size) => {
                             let buffer = vec![b'A'; *data_size];
                             file.write_all(&buffer).expect("Failed to write file");
-                            file.flush().expect("Failed to flush file");
+                            file.sync_all().expect("Failed to flush file");
                         }
                         DelayStrategy::NoDelay => (),
                     }
@@ -258,13 +346,21 @@ impl OmniPaxosServer {
         }
     }
 
-    async fn handle_client_request(&mut self, request: ClientMessage) {
+    async fn handle_client_request(&mut self, request: ClientMessage) -> bool {
         match request {
             ClientMessage::Append(client_id, command_id, kv_command) => {
+                debug!("Request from client {client_id}: {command_id} {kv_command:?}");
+                let req_data = RequestInstrumentation::with(Instant::now());
+                self.request_data.push(req_data);
                 self.commit_command_to_log(client_id, command_id, kv_command)
                     .await;
+                false
             }
-        };
+            ClientMessage::Done => {
+                self.debug_request_data();
+                true
+            }
+        }
     }
 
     async fn commit_command_to_log(
@@ -283,5 +379,86 @@ impl OmniPaxosServer {
             .append(command)
             .expect("Append to Omnipaxos log failed");
         self.send_outgoing_msgs().await;
+    }
+
+    fn debug_request_data(&mut self) {
+        // let missing: Vec<(usize, RequestInstrumentation)> = self
+        //     .request_data
+        //     .iter()
+        //     .cloned()
+        //     .enumerate()
+        //     .filter_map(|(i, d)| {
+        //         if d.send_dec.is_none() || d.send_accdec.is_none() || d.sending_response.is_none() {
+        //             Some((i, d.clone()))
+        //         } else {
+        //             None
+        //         }
+        //     })
+        //     .collect();
+        // if !missing.is_empty() {
+        //     error!("The send decideds\n{missing:?}");
+        //
+        //     self.request_data = self
+        //         .request_data
+        //         .iter()
+        //         .cloned()
+        //         .filter(|d| d.send_dec.is_some())
+        //         .collect();
+        // }
+        let response_latencies: Vec<Duration> = self
+            .request_data
+            .iter()
+            .map(|data| data.sending_response.unwrap() - data.channel_recieve)
+            .collect();
+        let avg_response_latency = self.get_average(response_latencies);
+
+        let accdec_latencies: Vec<Duration> = self
+            .request_data
+            .iter()
+            .map(|data| data.send_accdec.unwrap() - data.channel_recieve)
+            .collect();
+        let avg_accdec_latency = self.get_average(accdec_latencies);
+
+        let resp_latencies: Vec<Duration> = self
+            .request_data
+            .iter()
+            .map(|data| data.sending_response.unwrap() - data.send_accdec.unwrap())
+            .collect();
+        let avg_resp_latency = self.get_average(resp_latencies);
+
+        // TODO: Last entry may not have a send decide time
+        // let dec_latencies: Vec<Duration> = self
+        //     .request_data
+        //     .iter()
+        //     .map(|data| data.send_dec.unwrap() - data.send_accdec.unwrap())
+        //     .collect();
+        // let avg_dec_latency = self.get_average(dec_latencies);
+
+        eprintln!("Request -> Send AccDec  {avg_accdec_latency:?}");
+        eprintln!("Send AccDec -> Response {avg_resp_latency:?}");
+        // eprintln!("Response -> Send Dec    {avg_dec_latency:?}");
+        eprintln!("Total latency           {avg_response_latency:?}");
+    }
+
+    fn get_average(&self, latencies: Vec<Duration>) -> Vec<Duration> {
+        let batch_count = latencies.len() / self.batch_size;
+        let mut sums = vec![Duration::from_millis(0); self.batch_size];
+        for batch in latencies.chunks(self.batch_size) {
+            for (i, latency) in batch.into_iter().enumerate() {
+                sums[i] += *latency;
+            }
+        }
+        sums.iter().map(|&sum| sum / batch_count as u32).collect()
+        // let mut variances = vec![Duration::from_millis(0); self.batch_size];
+        // for batch in latencies.chunks(self.batch_size) {
+        //     for i in 0..self.batch_size {
+        //         let diff = batch[i] - avg_latencies[i];
+        //         variances[i] += diff * diff;
+        //     }
+        // }
+        // let std_devs = variances
+        //     .into_iter()
+        //     .map(|v| (v / batch_count as f64).sqrt())
+        //     .collect();
     }
 }

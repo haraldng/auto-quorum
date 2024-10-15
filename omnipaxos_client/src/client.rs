@@ -201,6 +201,9 @@ impl Client {
                 },
             }
         }
+        if let Err(e) = self.server.send(ClientMessage::Done).await {
+            error!("Couldn't send done signal to server: {e}");
+        }
         self.print_results();
     }
 

@@ -26,6 +26,7 @@ pub enum ServerMessage {
 pub enum ClientMessage {
     Append(ClientId, CommandId, KVCommand),
     // BatchAppend(ClientId, Vec<(CommandId, KVCommand)>),
+    Done,
 }
 
 impl ServerMessage {

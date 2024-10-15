@@ -215,13 +215,10 @@ impl Network {
 
         // Receive messages
         match identified_connection {
-            NewIngressConnection::FromClient(client_id, mut reader) => {
+            NewIngressConnection::FromClient(_client_id, mut reader) => {
                 while let Some(msg) = reader.next().await {
                     match msg {
-                        Ok(m) => {
-                            debug!("Received request from client {client_id}: {m:?}");
-                            client_message_sender.send(m).await.unwrap();
-                        }
+                        Ok(m) => client_message_sender.send(m).await.unwrap(),
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);
                             break;
