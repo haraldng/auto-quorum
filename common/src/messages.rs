@@ -13,6 +13,7 @@ pub enum RegistrationMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterMessage {
     OmniPaxosMessage(OmniPaxosMessage<Command>),
+    Done,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

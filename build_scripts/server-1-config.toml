@@ -11,7 +11,7 @@ storage_duration_micros = 0
 configuration_id = 1
 nodes = [1, 2, 3, 4, 5]
 # 1 = shuffle but still flush tail, 2 = no tail flush
-use_metronome = 2
+use_metronome = 0
 #metronome_quorum_size = 3
 #flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
 

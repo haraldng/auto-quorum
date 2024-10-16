@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use tokio::time::Instant;
 
 use common::{
     kv::{ClientId, NodeId},
@@ -32,7 +33,7 @@ pub struct Network {
     cluster_connections: Vec<Option<ToNodeConnection>>,
     client_connections: HashMap<ClientId, ToClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
-    client_message_sender: Sender<ClientMessage>,
+    client_message_sender: Sender<(ClientMessage, Instant)>,
     cluster_message_sender: Sender<ClusterMessage>,
 }
 
@@ -40,13 +41,12 @@ impl Network {
     pub async fn new(
         cluster_name: String,
         id: NodeId,
-        nodes: Vec<NodeId>,
+        peers: Vec<NodeId>,
         num_clients: usize,
         local_deployment: bool,
-        client_message_sender: Sender<ClientMessage>,
+        client_message_sender: Sender<(ClientMessage, Instant)>,
         cluster_message_sender: Sender<ClusterMessage>,
     ) -> Result<Self, Error> {
-        let peers: Vec<u64> = nodes.into_iter().filter(|node| *node != id).collect();
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peers.len(), Default::default);
         let mut network = Self {
@@ -159,7 +159,7 @@ impl Network {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<ClientMessage>,
+        client_message_sender: Sender<(ClientMessage, Instant)>,
         cluster_message_sender: Sender<ClusterMessage>,
         connection_sender: Sender<NewEgressConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
@@ -215,10 +215,14 @@ impl Network {
 
         // Receive messages
         match identified_connection {
-            NewIngressConnection::FromClient(_client_id, mut reader) => {
+            NewIngressConnection::FromClient(client_id, mut reader) => {
                 while let Some(msg) = reader.next().await {
+                    debug!("Network: Request from client {client_id}: {msg:?}");
                     match msg {
-                        Ok(m) => client_message_sender.send(m).await.unwrap(),
+                        Ok(m) => client_message_sender
+                            .send((m, Instant::now()))
+                            .await
+                            .unwrap(),
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);
                             break;
@@ -283,11 +287,16 @@ impl Network {
         match self.cluster_id_to_idx(to) {
             Some(idx) => match &mut self.cluster_connections[idx] {
                 Some(ref mut writer) => {
+                    let now = Instant::now();
                     if let Err(err) = writer.send(msg).await {
                         warn!("Couldn't send message to node {to}: {err}");
                         warn!("Removing connection to node {to}");
                         self.cluster_connections[idx] = None;
                     }
+                    // let send_time = now.elapsed();
+                    // if send_time > Duration::from_micros(100) {
+                    //     eprintln!("Send cluster message {send_time:?}");
+                    // }
                 }
                 None => warn!("Not connected to node {to}: couldn't send {msg:?}"),
             },
@@ -298,11 +307,16 @@ impl Network {
     pub async fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         if let Some(writer) = self.client_connections.get_mut(&to) {
             debug!("Responding to client {to}: {msg:?}");
+            let now = Instant::now();
             if let Err(err) = writer.send(msg).await {
                 warn!("Couldn't send message to client {to}: {err}");
                 warn!("Removing connection to client {to}");
                 self.client_connections.remove(&to);
             }
+            // let send_time = now.elapsed();
+            // if send_time > Duration::from_micros(100) {
+            //     eprintln!("Send client message {send_time:?}");
+            // }
         } else {
             warn!("Not connected to client {to}");
         }

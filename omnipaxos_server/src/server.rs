@@ -43,6 +43,7 @@ enum DelayStrategy {
 
 #[derive(Debug, Clone)]
 struct RequestInstrumentation {
+    net_recieve: Instant,
     channel_recieve: Instant,
     send_accdec: Option<Instant>,
     send_dec: Option<Instant>,
@@ -50,9 +51,10 @@ struct RequestInstrumentation {
 }
 
 impl RequestInstrumentation {
-    fn with(receive_time: Instant) -> Self {
+    fn with(net_receive_time: Instant, ch_receive_time: Instant) -> Self {
         Self {
-            channel_recieve: receive_time,
+            net_recieve: net_receive_time,
+            channel_recieve: ch_receive_time,
             send_accdec: None,
             send_dec: None,
             sending_response: None,
@@ -62,13 +64,13 @@ impl RequestInstrumentation {
 
 pub struct OmniPaxosServer {
     id: NodeId,
+    peers: Vec<NodeId>,
     database: Database,
     network: Network,
     cluster_messages: Receiver<ClusterMessage>,
-    client_messages: Receiver<ClientMessage>,
+    client_messages: Receiver<(ClientMessage, Instant)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
-    current_decided_idx: usize,
     leader_attempt: u32,
     delay_strategy: DelayStrategy,
     batch_size: usize,
@@ -83,6 +85,10 @@ impl OmniPaxosServer {
     ) -> Self {
         let server_id = omnipaxos_config.server_config.pid;
         let nodes = omnipaxos_config.cluster_config.nodes.clone();
+        let peers: Vec<u64> = nodes
+            .into_iter()
+            .filter(|node| *node != server_id)
+            .collect();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
         let delay_strategy = match (
             server_config.data_size,
@@ -105,7 +111,8 @@ impl OmniPaxosServer {
             omnipaxos_config.cluster_config.use_metronome,
             server_config.storage_duration_micros
         );
-        let batch_size = omnipaxos_config.server_config.batch_size;
+        // let batch_size = omnipaxos_config.server_config.batch_size;
+        let batch_size = 10;
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let initial_clients = match server_id == initial_leader {
             true => 1,
@@ -116,7 +123,7 @@ impl OmniPaxosServer {
         let network = Network::new(
             server_config.cluster_name,
             server_id,
-            nodes.clone(),
+            peers.clone(),
             initial_clients,
             local_deployment,
             client_message_sender,
@@ -126,13 +133,13 @@ impl OmniPaxosServer {
         .unwrap();
         let mut server = OmniPaxosServer {
             id: server_id,
+            peers,
             database: Database::new(),
             network,
             cluster_messages,
             client_messages,
             omnipaxos,
             initial_leader,
-            current_decided_idx: 0,
             leader_attempt: 0,
             delay_strategy,
             batch_size,
@@ -170,17 +177,31 @@ impl OmniPaxosServer {
             }
         }
 
+        let reasonable_process_time = Duration::from_micros(200);
         loop {
-            tokio::select! {
+            let done_signal = tokio::select! {
                 Some(msg) = self.client_messages.recv() => {
-                    let client_done = self.handle_client_request(msg).await;
-                    if client_done {
-                        break;
-                    }
+                    // let now = Instant::now();
+                    let is_done = self.handle_client_request(msg.clone()).await;
+                    // let process_time = now.elapsed();
+                    // let process_time = now.elapsed();
+                    // if process_time > reasonable_process_time {
+                    // eprintln!("Handle client request time {process_time:?}\n{msg:?}",);
+                    // }
+                    is_done
                 },
                 Some(msg) = self.cluster_messages.recv() => {
-                    self.handle_cluster_message(msg).await;
+                    // let now = Instant::now();
+                    let is_done = self.handle_cluster_message(msg.clone()).await;
+                    // let process_time = now.elapsed();
+                    // if process_time > reasonable_process_time {
+                    // eprintln!("Handle cluster message time {process_time:?}\n{msg:?}",);
+                    // }
+                    is_done
                 },
+            };
+            if done_signal {
+                break;
             }
         }
     }
@@ -207,16 +228,12 @@ impl OmniPaxosServer {
 
     async fn handle_decided_entries(&mut self) {
         let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
-        eprintln!("{decided_slots:?}");
         for slot in decided_slots {
             let decided_entry = self.omnipaxos.read(slot).unwrap();
             match decided_entry {
                 LogEntry::Decided(cmd) => self.update_database_and_respond(cmd).await,
                 // TODO: fix slot indexing
-                LogEntry::Undecided(cmd) => {
-                    warn!("Omnipaxos said slot {slot} was decided, but reading from that index was undecided.");
-                    self.update_database_and_respond(cmd).await
-                }
+                LogEntry::Undecided(cmd) => self.update_database_and_respond(cmd).await,
                 LogEntry::Snapshotted(_) => unimplemented!(),
                 _ => unreachable!(),
             }
@@ -230,11 +247,12 @@ impl OmniPaxosServer {
                 Some(read_result) => ServerMessage::Read(command.id, read_result),
                 None => ServerMessage::Write(command.id),
             };
-            let response_time = Instant::now();
-            self.request_data[command.id].sending_response = Some(response_time);
             self.network
                 .send_to_client(command.client_id, response)
                 .await;
+            let response_time = Instant::now();
+            // eprintln!("Sending response {}", command.id);
+            self.request_data[command.id].sending_response = Some(response_time);
         }
     }
     // async fn handle_decided_entries(&mut self) {
@@ -293,6 +311,7 @@ impl OmniPaxosServer {
                         msg: PaxosMsg::Decide(dec),
                     }) => {
                         let dec_time = Instant::now();
+                        // eprintln!("Sending decide {}", dec.decided_idx);
                         self.request_data[dec.decided_idx - 1].send_dec = Some(dec_time);
                     }
                     Message::SequencePaxos(PaxosMessage {
@@ -302,6 +321,7 @@ impl OmniPaxosServer {
                     }) => {
                         let accdec_time = Instant::now();
                         for entry in &accdec.entries {
+                            // eprintln!("Sending Acceptdecide {}", entry.id);
                             self.request_data[entry.id].send_accdec = Some(accdec_time);
                         }
                     }
@@ -334,7 +354,7 @@ impl OmniPaxosServer {
         }
     }
 
-    async fn handle_cluster_message(&mut self, message: ClusterMessage) {
+    async fn handle_cluster_message(&mut self, message: ClusterMessage) -> bool {
         match message {
             ClusterMessage::OmniPaxosMessage(m) => {
                 self.omnipaxos.handle_incoming(m);
@@ -342,21 +362,27 @@ impl OmniPaxosServer {
                 if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
                     self.handle_decided_entries().await;
                 }
+                false
             }
+            ClusterMessage::Done => true,
         }
     }
 
-    async fn handle_client_request(&mut self, request: ClientMessage) -> bool {
+    async fn handle_client_request(&mut self, request: (ClientMessage, Instant)) -> bool {
         match request {
-            ClientMessage::Append(client_id, command_id, kv_command) => {
-                debug!("Request from client {client_id}: {command_id} {kv_command:?}");
-                let req_data = RequestInstrumentation::with(Instant::now());
+            (ClientMessage::Append(client_id, command_id, kv_command), net_recv_time) => {
+                debug!("Server: Request from client {client_id}: {command_id} {kv_command:?}");
+                let req_data = RequestInstrumentation::with(net_recv_time, Instant::now());
                 self.request_data.push(req_data);
                 self.commit_command_to_log(client_id, command_id, kv_command)
                     .await;
                 false
             }
-            ClientMessage::Done => {
+            (ClientMessage::Done, _) => {
+                let done_msg = ClusterMessage::Done;
+                for peer in &self.peers {
+                    self.network.send_to_cluster(*peer, done_msg.clone()).await;
+                }
                 self.debug_request_data();
                 true
             }
@@ -405,12 +431,25 @@ impl OmniPaxosServer {
         //         .filter(|d| d.send_dec.is_some())
         //         .collect();
         // }
-        let response_latencies: Vec<Duration> = self
+        let server_task_request_latencies: Vec<Duration> = self
             .request_data
             .iter()
             .map(|data| data.sending_response.unwrap() - data.channel_recieve)
             .collect();
-        let avg_response_latency = self.get_average(response_latencies);
+        let avg_server_task_latency = self.get_average(server_task_request_latencies);
+        let server_total_request_latencies: Vec<Duration> = self
+            .request_data
+            .iter()
+            .map(|data| data.sending_response.unwrap() - data.net_recieve)
+            .collect();
+        let avg_server_total_latency = self.get_average(server_total_request_latencies);
+
+        let recv_latencies: Vec<Duration> = self
+            .request_data
+            .iter()
+            .map(|data| data.channel_recieve - data.net_recieve)
+            .collect();
+        let avg_recv_latency = self.get_average(recv_latencies);
 
         let accdec_latencies: Vec<Duration> = self
             .request_data
@@ -434,10 +473,11 @@ impl OmniPaxosServer {
         //     .collect();
         // let avg_dec_latency = self.get_average(dec_latencies);
 
+        eprintln!("Net Recv -> Task Recv   {avg_recv_latency:?}");
         eprintln!("Request -> Send AccDec  {avg_accdec_latency:?}");
         eprintln!("Send AccDec -> Response {avg_resp_latency:?}");
-        // eprintln!("Response -> Send Dec    {avg_dec_latency:?}");
-        eprintln!("Total latency           {avg_response_latency:?}");
+        eprintln!("Server Task Latency     {avg_server_task_latency:?}");
+        eprintln!("Server Total Latency    {avg_server_total_latency:?}");
     }
 
     fn get_average(&self, latencies: Vec<Duration>) -> Vec<Duration> {
