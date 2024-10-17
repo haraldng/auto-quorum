@@ -1,4 +1,6 @@
-FROM rust:1.76 as chef
+# NOTE: Only works with parent directory as build context so ../common/ can be included
+# NOTE: cargo-chef doesn'nt work when there are local dependancies like ../common/
+FROM rust:1.76 as rust-toolchain
 
 # Stop if a command fails
 RUN set -eux
@@ -6,18 +8,18 @@ RUN set -eux
 # Only fetch crates.io index for used crates
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-# cargo-chef will be cached from the second build onwards
-RUN cargo install cargo-chef
+# # cargo-chef will be cached from the second build onwards
+# RUN cargo install cargo-chef
 WORKDIR app
 
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+# FROM rust-toolchain AS planner
+# COPY . .
+# RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-# Build dependencies - this is the caching Docker layer!
-RUN cargo chef cook --release --recipe-path recipe.json
+FROM rust-toolchain AS builder
+# COPY --from=planner /app/recipe.json recipe.json
+# # Build dependencies - this is the caching Docker layer!
+# RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build application
 COPY . .

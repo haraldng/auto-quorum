@@ -1,0 +1,10 @@
+# Exclude everything
+*
+
+# Whitelist Rust modules
+!omnipaxos_client/
+!omnipaxos_server/
+!common/
+!Cargo.toml
+!Cargo.lock
+
