@@ -38,6 +38,5 @@ pub async fn main() {
     };
     client_config.req_batch_size = Some(batch_size);
     // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
-    let mut client = Client::with(client_config).await;
-    client.run().await;
+    Client::run(client_config).await;
 }

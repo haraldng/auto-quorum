@@ -87,19 +87,19 @@ pub type ToClientConnection = Framed<
     Bincode<(), ServerMessage>,
 >;
 
-// pub fn frame_clients_connection(stream: TcpStream) -> (FromServerConnection, ToServerConnection) {
-//     let (reader, writer) = stream.into_split();
-//     let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
-//     let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
-//     (
-//         FromServerConnection::new(stream, Bincode::default()),
-//         ToServerConnection::new(sink, Bincode::default()),
-//     )
-// }
-pub fn frame_clients_connection(stream: TcpStream) -> ServerConnection {
-    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    Framed::new(length_delimited, Bincode::default())
+pub fn frame_clients_connection(stream: TcpStream) -> (FromServerConnection, ToServerConnection) {
+    let (reader, writer) = stream.into_split();
+    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    (
+        FromServerConnection::new(stream, Bincode::default()),
+        ToServerConnection::new(sink, Bincode::default()),
+    )
 }
+// pub fn frame_clients_connection(stream: TcpStream) -> ServerConnection {
+//     let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
+//     Framed::new(length_delimited, Bincode::default())
+// }
 
 pub fn frame_servers_connection(stream: TcpStream) -> (FromClientConnection, ToClientConnection) {
     let (reader, writer) = stream.into_split();

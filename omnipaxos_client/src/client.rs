@@ -1,5 +1,5 @@
-use chrono::Utc;
-use futures::SinkExt;
+use chrono::{DateTime, Utc};
+use futures::{SinkExt, StreamExt};
 use log::*;
 use omnipaxos::util::FlexibleQuorum;
 use serde::{Deserialize, Serialize};
@@ -8,32 +8,12 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::time::interval;
-use tokio_stream::StreamExt;
 
 use common::util::{
-    frame_clients_connection, frame_registration_connection, get_node_addr, ServerConnection,
+    frame_clients_connection, frame_registration_connection, get_node_addr, FromServerConnection,
+    ToServerConnection,
 };
 use common::{kv::*, messages::*};
-
-#[derive(Debug, Serialize)]
-struct RequestData {
-    time_sent_utc: i64,
-    response: Option<Response>,
-}
-
-impl RequestData {
-    fn response_time(&self) -> Option<i64> {
-        self.response
-            .as_ref()
-            .map(|r| r.time_recieved_utc - self.time_sent_utc)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct Response {
-    time_recieved_utc: i64,
-    message: ServerMessage,
-}
 
 // TODO: Server config parameters like flexible_quorum should be taken from server, since
 // there may be a mismatch between the client's config and the servers' configs.
@@ -69,48 +49,22 @@ struct ClientOutput {
     batch_position_std_dev: Vec<f64>,
 }
 
-/*
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub struct RequestInterval {
-    duration_sec: u64,
-    requests_per_sec: u64,
-    read_ratio: f64,
-}
-
-impl RequestInterval {
-    fn get_interval_duration(self) -> Duration {
-        Duration::from_secs(self.duration_sec)
-    }
-
-    fn get_request_delay(self) -> (Duration, usize) {
-        if self.requests_per_sec == 0 {
-            return (Duration::from_secs(999999), 0);
-        }
-        if self.requests_per_sec > 1000 {
-            let ops_per_ms = self.requests_per_sec / 1000;
-            (Duration::from_millis(1), ops_per_ms as usize)
-        } else {
-            let delay_ms = 1000 / self.requests_per_sec;
-            (Duration::from_millis(2000), 10)
-        }
-    }
-}
-*/
-
 pub struct Client {
-    id: ClientId,
-    server: ServerConnection,
-    command_id: CommandId,
-    request_data: Vec<RequestData>,
-    req_batch_size: usize,
-    batch_interval: Duration,
-    iterations: usize,
-    current_iteration: usize,
-    num_responses: usize,
-    config: ClientConfig,
+    // id: ClientId,
+    // server: ServerConnection,
+    // command_id: CommandId,
+    // request_data: Vec<RequestData>,
+    // req_batch_size: usize,
+    // batch_interval: Duration,
+    // iterations: usize,
+    // current_iteration: usize,
+    // num_responses: usize,
+    // config: ClientConfig,
 }
 
-async fn get_server_connection(server_address: SocketAddr) -> (ServerConnection, ClientId) {
+async fn get_server_connection(
+    server_address: SocketAddr,
+) -> ((FromServerConnection, ToServerConnection), ClientId) {
     let mut retry_connection = interval(Duration::from_secs(1));
     loop {
         retry_connection.tick().await;
@@ -128,7 +82,7 @@ async fn get_server_connection(server_address: SocketAddr) -> (ServerConnection,
                     _ => panic!("Recieved unexpected message during handshake"),
                 };
                 let underlying_stream = registration_connection.into_inner().into_inner();
-                break (frame_clients_connection(underlying_stream), assigned_id);
+                break ((frame_clients_connection(underlying_stream)), assigned_id);
             }
             Err(e) => eprintln!("Unable to connect to server: {e}"),
         }
@@ -136,122 +90,127 @@ async fn get_server_connection(server_address: SocketAddr) -> (ServerConnection,
 }
 
 impl Client {
-    pub async fn with(config: ClientConfig) -> Self {
+    pub async fn run(config: ClientConfig) {
+        // Get connection to server
         let is_local = config.local_deployment.unwrap_or(false);
         let server_address = get_node_addr(&config.cluster_name, config.server_id, is_local)
             .expect("Couldn't resolve server IP");
-        let (server, assigned_id) = get_server_connection(server_address).await;
-        Self {
-            id: assigned_id,
-            server,
-            command_id: 0,
-            request_data: Vec::with_capacity(8000),
-            req_batch_size: config.req_batch_size.expect("Batch size not set"),
-            batch_interval: Duration::from_millis(config.interval_ms.expect("Interval not set")),
-            iterations: config.iterations.expect("Iterations not set"),
-            current_iteration: 0,
-            num_responses: 0,
-            config,
-        }
-    }
-
-    pub async fn put(&mut self, key: String, value: String) {
-        self.send_command(KVCommand::Put(key, value)).await;
-    }
-
-    #[allow(dead_code)]
-    pub async fn delete(&mut self, key: String) {
-        self.send_command(KVCommand::Delete(key)).await;
-    }
-
-    #[allow(dead_code)]
-    pub async fn get(&mut self, key: String) {
-        self.send_command(KVCommand::Get(key)).await;
-    }
-
-    pub async fn run(&mut self) {
-        let first_msg = self.server.next().await.unwrap();
+        let ((mut from_server_conn, to_server_conn), assigned_id) =
+            get_server_connection(server_address).await;
+        // Complete handshake with server
+        let first_msg = from_server_conn.next().await.unwrap();
         match first_msg.unwrap() {
             ServerMessage::Ready => (),
             _ => panic!("Recieved unexpected message during handshake"),
         }
+        // Spawn reader and writer actors
+        let batch_size = config.req_batch_size.expect("Batch size not configured");
+        let batch_delay =
+            Duration::from_millis(config.interval_ms.expect("Interval not configured"));
+        let num_iterations = config.iterations.expect("Iterations not configured");
+        let num_of_requests = batch_size * num_iterations;
+        let reader_task = tokio::spawn(Self::reader_actor(from_server_conn, num_of_requests));
+        let writer_task = tokio::spawn(Self::writer_actor(
+            to_server_conn,
+            assigned_id,
+            batch_size,
+            batch_delay,
+            num_iterations,
+        ));
+        // Collect request data
+        let (request_data, response_data) = tokio::join!(writer_task, reader_task);
+        let request_data = request_data.expect("Error collecting requests");
+        let response_data = response_data.expect("Error collecting responses");
+        Self::print_results(config, request_data, response_data);
+    }
 
-        let mut batch_interval = interval(self.batch_interval);
-        batch_interval.tick().await;
-
-        loop {
-            tokio::select! {
-                biased;
-                // Handle the next server message when it arrives
-                Some(msg) = self.server.next() => self.handle_response(msg.unwrap()),
-                // Send request according to rate of current request interval setting. (defined in
-                // TOML config)
-                _ = batch_interval.tick() => {
-                    if self.current_iteration == self.iterations {
-                        if self.num_responses == self.request_data.len() {
-                            break;
-                        }
-                    } else {
-                        for _ in 0..self.req_batch_size {
-                            let key = self.command_id.to_string();
-                            self.put(key.clone(), key).await;
-                        }
-                        self.current_iteration += 1;
+    async fn reader_actor(
+        from_server_conn: FromServerConnection,
+        num_responses: usize,
+    ) -> Vec<(CommandId, DateTime<Utc>)> {
+        let mut response_data = Vec::with_capacity(num_responses);
+        let mut buf_reader = from_server_conn.ready_chunks(100);
+        while let Some(messages) = buf_reader.next().await {
+            for msg in messages {
+                match msg {
+                    Ok(ServerMessage::Ready) => panic!("Recieved unexpected message: {msg:?}"),
+                    Ok(response) => {
+                        response_data.push((response.command_id(), Utc::now()));
                     }
-                },
+                    Err(err) => panic!("Error deserializing message: {err:?}"),
+                }
+            }
+            if response_data.len() >= num_responses {
+                if response_data.len() > num_responses {
+                    warn!(
+                        "Expected {} responses from server, but got {} responses",
+                        num_responses,
+                        response_data.len()
+                    );
+                }
+                return response_data;
             }
         }
-        if let Err(e) = self.server.send(ClientMessage::Done).await {
-            error!("Couldn't send done signal to server: {e}");
-        }
-        self.print_results();
+        eprintln!("Finished collecting responses");
+        return response_data;
     }
 
-    async fn send_command(&mut self, command: KVCommand) {
-        let request = ClientMessage::Append(self.id, self.command_id, command);
-        let data = RequestData {
-            time_sent_utc: Utc::now().timestamp_micros(),
-            response: None,
-        };
-        self.request_data.push(data);
-        self.command_id += 1;
-        if let Err(e) = self.server.send(request).await {
-            error!("Couldn't send command to server: {e}");
-        }
-    }
-
-    fn handle_response(&mut self, msg: ServerMessage) {
-        match msg {
-            ServerMessage::Ready => panic!("Recieved unexpected message: {msg:?}"),
-            response => {
-                let cmd_id = response.command_id();
-                let response_time = Utc::now().timestamp_micros();
-                self.request_data[cmd_id].response = Some(Response {
-                    time_recieved_utc: response_time,
-                    message: response,
-                });
-                self.num_responses += 1;
+    async fn writer_actor(
+        mut to_server_conn: ToServerConnection,
+        client_id: ClientId,
+        batch_size: usize,
+        batch_delay: Duration,
+        num_iterations: usize,
+    ) -> Vec<DateTime<Utc>> {
+        let mut request_id = 0;
+        let mut request_data = Vec::with_capacity(batch_size * num_iterations);
+        let mut batch_interval = interval(batch_delay);
+        for _ in 0..num_iterations {
+            let _ = batch_interval.tick().await;
+            for _ in 0..batch_size {
+                let key = request_id.to_string();
+                let cmd = KVCommand::Put(key.clone(), key);
+                let request = ClientMessage::Append(client_id, request_id, cmd);
+                request_id += 1;
+                if let Err(e) = to_server_conn.send(request).await {
+                    error!("Couldn't send command to server: {e}");
+                }
+                request_data.push(Utc::now());
             }
         }
+        to_server_conn.send(ClientMessage::Done).await.unwrap();
+        eprintln!("Finished sending requests");
+        return request_data;
     }
 
-    fn print_results(&self) {
-        let (request_latency_average, request_latency_std_dev) = self.calc_avg_response_latency();
-        let throughput = self.calc_throughput();
-        let num_requests = self.request_data.len();
-        let missed_responses = self
-            .request_data
-            .iter()
-            .filter(|r| r.response.is_none())
-            .count();
-        let (batch_latency_average, batch_latency_std_dev) = self.calc_avg_batch_latency();
+    fn print_results(
+        config: ClientConfig,
+        request_data: Vec<DateTime<Utc>>,
+        response_data: Vec<(CommandId, DateTime<Utc>)>,
+    ) {
+        let response_latencies_μs = response_data
+            .into_iter()
+            .map(|(cmd_id, response_time)| {
+                (response_time - request_data[cmd_id as usize])
+                    .num_microseconds()
+                    .expect("UTC overflow")
+            })
+            .collect::<Vec<i64>>();
+        let batch_size = config.req_batch_size.unwrap();
+        let num_requests = config.iterations.unwrap() * batch_size;
+
+        let throughput = calc_request_throughput(&config);
+        let (request_latency_average, request_latency_std_dev) =
+            calc_avg_response_latency(&response_latencies_μs);
+        let (batch_latency_average, batch_latency_std_dev) =
+            calc_avg_batch_latency(&response_latencies_μs, batch_size);
         let (batch_position_latency, batch_position_std_dev) =
-            self.calc_avg_batch_latency_by_position();
+            calc_avg_batch_latency_by_position(&response_latencies_μs, batch_size);
         let output = ClientOutput {
-            client_config: self.config.clone(),
+            client_config: config,
             throughput,
             num_requests,
-            missed_responses,
+            missed_responses: 0,
             request_latency_average,
             request_latency_std_dev,
             batch_latency_average,
@@ -263,113 +222,95 @@ impl Client {
         println!("{json_output}\n");
         eprintln!("{json_output}");
 
-        // Individual response times
-        for (cmd_idx, request) in self.request_data.iter().enumerate() {
-            match &request.response {
-                Some(response) => println!(
-                    "request: {:?}, latency: {:?}, sent: {:?}",
-                    response.message.command_id(),
-                    request.response_time().unwrap(),
-                    request.time_sent_utc
-                ),
-                None => println!(
-                    "request: {:?}, latency: NO RESPONSE, sent: {:?}",
-                    cmd_idx, request.time_sent_utc
-                ),
-            }
+        // // Individual response times
+        // for (cmd_idx, request) in self.request_data.iter().enumerate() {
+        //     match &request.response {
+        //         Some(response) => println!(
+        //             "request: {:?}, latency: {:?}, sent: {:?}",
+        //             response.message.command_id(),
+        //             request.response_time().unwrap(),
+        //             request.time_sent_utc
+        //         ),
+        //         None => println!(
+        //             "request: {:?}, latency: NO RESPONSE, sent: {:?}",
+        //             cmd_idx, request.time_sent_utc
+        //         ),
+        //     }
+        // }
+    }
+}
+
+fn calc_request_throughput(config: &ClientConfig) -> f64 {
+    let request_duration_sec =
+        config.iterations.unwrap() as f64 * (config.interval_ms.unwrap() as f64 / 1000.);
+    let num_requests = config.req_batch_size.unwrap() * config.iterations.unwrap();
+    num_requests as f64 / request_duration_sec
+}
+
+// The (average, std dev) response latency of all requests
+fn calc_avg_response_latency(latencies: &Vec<i64>) -> (f64, f64) {
+    let num_responses = latencies.len() as f64;
+    let avg_latency = latencies.iter().sum::<i64>() as f64 / num_responses;
+    let variance = latencies
+        .iter()
+        .map(|&value| {
+            let diff = (value as f64) - avg_latency;
+            diff * diff
+        })
+        .sum::<f64>()
+        / num_responses;
+    let std_dev = variance.sqrt();
+    (avg_latency / 1000., std_dev / 1000.)
+}
+
+// The (average, std dev) respose latency for each batch of requests
+fn calc_avg_batch_latency(latencies: &Vec<i64>, batch_size: usize) -> (f64, f64) {
+    let batch_latencies: Vec<i64> = latencies
+        .chunks(batch_size)
+        .map(|batch| *batch.into_iter().max().unwrap())
+        .collect();
+    let num_batches = batch_latencies.len() as f64;
+    let avg_batch_latency = batch_latencies.iter().sum::<i64>() as f64 / num_batches;
+    let variance = batch_latencies
+        .into_iter()
+        .map(|value| {
+            let diff = (value as f64) - avg_batch_latency;
+            diff * diff
+        })
+        .sum::<f64>()
+        / num_batches;
+    let std_dev = variance.sqrt();
+    (avg_batch_latency / 1000., std_dev / 1000.)
+}
+
+// The average latency for each response by position in request batch
+fn calc_avg_batch_latency_by_position(
+    latencies: &Vec<i64>,
+    batch_size: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let batch_count = (latencies.len() / batch_size) as f64;
+    let mut sums = vec![0i64; batch_size];
+    for batch in latencies.chunks(batch_size) {
+        for i in 0..batch_size {
+            sums[i] += batch[i];
         }
     }
-
-    fn calc_throughput(&self) -> f64 {
-        let num_responses = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .count();
-        let duration_sec = self.iterations as f64 * self.batch_interval.as_secs_f64();
-        num_responses as f64 / duration_sec
-    }
-
-    // The (average, std dev) response latency of all requests
-    fn calc_avg_response_latency(&self) -> (f64, f64) {
-        let latencies: Vec<i64> = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .collect();
-        let num_responses = latencies.len();
-        let avg_latency = latencies.iter().sum::<i64>() as f64 / num_responses as f64;
-        let variance = latencies
-            .into_iter()
-            .map(|value| {
-                let diff = (value as f64) - avg_latency;
-                diff * diff
-            })
-            .sum::<f64>()
-            / num_responses as f64;
-        let std_dev = variance.sqrt();
-        // Convert from microseconds to ms
-        (avg_latency / 1000., std_dev / 1000.)
-    }
-
-    // The (average, std dev) respose latency for each batch of requests
-    fn calc_avg_batch_latency(&self) -> (f64, f64) {
-        let latencies: Vec<i64> = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .collect();
-        let batch_latencies: Vec<i64> = latencies
-            .chunks(self.req_batch_size)
-            .map(|batch| *batch.into_iter().max().unwrap())
-            .collect();
-        let num_batches = batch_latencies.len();
-        let avg_batch_latency = batch_latencies.iter().sum::<i64>() as f64 / num_batches as f64;
-        let variance = batch_latencies
-            .into_iter()
-            .map(|value| {
-                let diff = (value as f64) - avg_batch_latency;
-                diff * diff
-            })
-            .sum::<f64>()
-            / num_batches as f64;
-        let std_dev = variance.sqrt();
-        // Convert from microseconds to ms
-        (avg_batch_latency / 1000., std_dev / 1000.)
-    }
-
-    // The average latency for each response by position in request batch
-    fn calc_avg_batch_latency_by_position(&self) -> (Vec<f64>, Vec<f64>) {
-        let latencies: Vec<i64> = self
-            .request_data
-            .iter()
-            .filter_map(|data| data.response_time())
-            .collect();
-        let batch_count = latencies.len() / self.req_batch_size;
-        let mut sums = vec![0i64; self.req_batch_size];
-        for batch in latencies.chunks(self.req_batch_size) {
-            for i in 0..self.req_batch_size {
-                sums[i] += batch[i];
-            }
+    let avg_latencies: Vec<f64> = sums
+        .iter()
+        .map(|&sum| (sum as f64 / 1000.) / batch_count)
+        .collect();
+    let mut variances = vec![0f64; batch_size];
+    for batch in latencies.chunks(batch_size) {
+        for i in 0..batch_size {
+            let diff = (batch[i] as f64 / 1000.) - avg_latencies[i];
+            variances[i] += diff * diff;
         }
-        let avg_latencies: Vec<f64> = sums
-            .iter()
-            .map(|&sum| (sum as f64 / 1000.) / batch_count as f64)
-            .collect();
-
-        let mut variances = vec![0f64; self.req_batch_size];
-        for batch in latencies.chunks(self.req_batch_size) {
-            for i in 0..self.req_batch_size {
-                let diff = (batch[i] as f64 / 1000.) - avg_latencies[i];
-                variances[i] += diff * diff;
-            }
-        }
-        let std_devs = variances
-            .into_iter()
-            .map(|v| (v / batch_count as f64).sqrt())
-            .collect();
-        (avg_latencies, std_devs)
     }
+    let std_devs = variances
+        .into_iter()
+        .map(|v| (v / batch_count).sqrt())
+        .collect();
+    (avg_latencies, std_devs)
 }
 
 // // Function to serialize client data to JSON and compress with gzip
