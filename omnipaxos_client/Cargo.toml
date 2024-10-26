@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch", features = ["serde", "toml_config", "logging"] }
+# omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch", features = ["serde", "toml_config", "logging"] }
+omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide", features = ["serde", "toml_config", "logging"] }
 # omnipaxos = { path = "/home/kevin/rise/omnipaxos/omnipaxos/", features = ["serde", "toml_config", "logging"] }
 common = { path = "../common" }
 tokio = { version = "1.35.1", features = ["full"] }

@@ -10,8 +10,10 @@ anyhow = "1.0.79"
 env_logger = "0.10.1"
 futures = "0.3.30"
 log = "0.4.20"
-omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch", features = ["serde", "toml_config"] }
-omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch" }
+# omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch", features = ["serde", "toml_config"] }
+# omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch" }
+omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide", features = ["serde", "toml_config", "logging"] }
+omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide" }
 # omnipaxos = { path = "/home/kevin/rise/omnipaxos/omnipaxos/", features = ["serde", "toml_config", "logging"] }
 # omnipaxos_storage = { path = "/home/kevin/rise/omnipaxos/omnipaxos_storage/" }
 common = { path = "../common" }

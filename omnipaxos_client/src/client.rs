@@ -117,9 +117,10 @@ impl Client {
             batch_delay,
             num_iterations,
         ));
-        // Collect request data
+        // Collect request data and shutdown cluster
         let (request_data, response_data) = tokio::join!(writer_task, reader_task);
-        let request_data = request_data.expect("Error collecting requests");
+        let (request_data, mut server_writer) = request_data.expect("Error collecting requests");
+        server_writer.send(ClientMessage::Done).await.unwrap();
         let response_data = response_data.expect("Error collecting responses");
         Self::print_results(config, request_data, response_data);
     }
@@ -151,7 +152,7 @@ impl Client {
                 return response_data;
             }
         }
-        eprintln!("Finished collecting responses");
+        eprintln!("Finished collecting {} responses", response_data.len());
         return response_data;
     }
 
@@ -161,7 +162,7 @@ impl Client {
         batch_size: usize,
         batch_delay: Duration,
         num_iterations: usize,
-    ) -> Vec<DateTime<Utc>> {
+    ) -> (Vec<DateTime<Utc>>, ToServerConnection) {
         let mut request_id = 0;
         let mut request_data = Vec::with_capacity(batch_size * num_iterations);
         let mut batch_interval = interval(batch_delay);
@@ -178,9 +179,8 @@ impl Client {
                 request_data.push(Utc::now());
             }
         }
-        to_server_conn.send(ClientMessage::Done).await.unwrap();
         eprintln!("Finished sending requests");
-        return request_data;
+        return (request_data, to_server_conn);
     }
 
     fn print_results(
@@ -198,6 +198,12 @@ impl Client {
             .collect::<Vec<i64>>();
         let batch_size = config.req_batch_size.unwrap();
         let num_requests = config.iterations.unwrap() * batch_size;
+        if num_requests != response_latencies_μs.len() {
+            panic!(
+                "Expected {num_requests} responses, but got {}",
+                response_latencies_μs.len()
+            );
+        }
 
         let throughput = calc_request_throughput(&config);
         let (request_latency_average, request_latency_std_dev) =
