@@ -56,12 +56,12 @@ pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNod
     )
 }
 
-pub type ServerConnection = Framed<
-    CodecFramed<TcpStream, LengthDelimitedCodec>,
-    ServerMessage,
-    ClientMessage,
-    Bincode<ServerMessage, ClientMessage>,
->;
+// pub type ServerConnection = Framed<
+//     CodecFramed<TcpStream, LengthDelimitedCodec>,
+//     ServerMessage,
+//     ClientMessage,
+//     Bincode<ServerMessage, ClientMessage>,
+// >;
 pub type FromServerConnection = Framed<
     FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
     ServerMessage,

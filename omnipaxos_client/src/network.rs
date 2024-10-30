@@ -1,112 +1,126 @@
-use anyhow::Error;
-use futures::SinkExt; //Stream};
+use common::{kv::NodeId, messages::*, util::*};
+use futures::{SinkExt, Stream, StreamExt};
 use log::*;
-use std::net::ToSocketAddrs;
-use std::task::{Context, Poll};
-use std::{net::SocketAddr, pin::Pin};
-use tokio::net::TcpStream;
-use tokio_serde::{formats::Cbor, Framed};
-use tokio_stream::{Stream, StreamMap};
-use tokio_util::codec::{Framed as CodecFramed, LengthDelimitedCodec};
-
-use common::messages::*;
-use omnipaxos::util::NodeId;
-
-type NodeConnection = Framed<
-    CodecFramed<TcpStream, LengthDelimitedCodec>,
-    NetworkMessage,
-    NetworkMessage,
-    Cbor<NetworkMessage, NetworkMessage>,
->;
-
-fn wrap_stream(stream: TcpStream) -> NodeConnection {
-    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    Framed::new(length_delimited, Cbor::default())
-}
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    net::TcpStream,
+    sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    time::interval,
+};
 
 pub struct Network {
-    is_local: bool,
-    connections: StreamMap<u64, NodeConnection>,
+    // cluster_name: String,
+    // server_id: NodeId,
+    // is_local: bool,
+    // reader_handle: JoinHandle<()>,
+    // writer_handle: JoinHandle<()>,
+    incoming_messages: Receiver<ServerMessage>,
+    outgoing_messages: UnboundedSender<ClientMessage>,
 }
 
 impl Network {
-    fn get_node_addr(node: NodeId, is_local: bool) -> Result<SocketAddr, Error> {
-        let dns_name = if is_local {
-            // format!("s{node}:800{node}")
-            format!("localhost:800{node}")
-        } else {
-            format!("server-{node}.internal.zone.:800{node}")
-        };
-        let address = dns_name.to_socket_addrs()?.next().unwrap();
-        Ok(address)
-    }
-
-    pub async fn new(nodes: Vec<NodeId>, is_local: bool) -> Self {
-        let mut network = Self {
-            is_local,
-            connections: StreamMap::with_capacity(nodes.len()),
-        };
-        for node in nodes {
-            if let Err(err) = network.add_node(node).await {
-                error!("Couldn't connect to server {node}: {err}");
-            }
-        }
-        network
-    }
-
-    pub async fn send(&mut self, to: NodeId, messge: ClientMessage) {
-        let found_connection = self.connections.iter_mut().find(|(id, _conn)| *id == to);
-        match found_connection {
-            Some((_id, connection)) => {
-                trace!("Sending to server {to}: {message:?}");
-                if let Err(err) = connection
-                    .send(NetworkMessage::ClientMessage(message))
-                    .await
-                {
-                    warn!("Couldn't send message to node {to}: {err}");
-                    warn!("Removing connection to node {to}");
-                    self.connections.remove(&to);
-                }
-            }
-            None => {
-                // TODO: sending to other servers gets blocked on this await
-                warn!("Not connected to node {to}");
-                if let Err(err) = self.add_node(to).await {
-                    error!("Couldn't connect to node {to}: {err}");
-                }
-            }
+    pub async fn new(cluster_name: String, server_id: NodeId, local_deployment: bool) -> Self {
+        // Get connection to server
+        let server_address = Self::get_server_address(&cluster_name, server_id, local_deployment);
+        let (from_server_conn, to_server_conn) = Self::get_server_connection(server_address).await;
+        // Spawn reader and writer actors
+        let (incoming_message_tx, incoming_message_rx) = tokio::sync::mpsc::channel(1000);
+        let (outgoing_message_tx, outgoing_message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _reader_handle =
+            tokio::spawn(Self::reader_actor(from_server_conn, incoming_message_tx));
+        let _writer_handle = tokio::spawn(Self::writer_actor(to_server_conn, outgoing_message_rx));
+        Self {
+            // cluster_name,
+            // server_id,
+            // is_local: local_deployment,
+            // reader_handle,
+            // writer_handle,
+            incoming_messages: incoming_message_rx,
+            outgoing_messages: outgoing_message_tx,
         }
     }
 
-    async fn add_node(&mut self, node: NodeId) -> Result<(), Error> {
-        let address = Self::get_node_addr(node, self.is_local)?;
-        let tcp_stream = TcpStream::connect(address).await?;
-        tcp_stream.set_nodelay(true)?;
-        let mut framed_stream = wrap_stream(tcp_stream);
-        framed_stream.send(NetworkMessage::ClientRegister).await?;
-        self.connections.insert(node, framed_stream);
-        return Ok(());
+    fn get_server_address(
+        cluster_name: &String,
+        server_id: NodeId,
+        local_deployment: bool,
+    ) -> SocketAddr {
+        match get_node_addr(cluster_name, server_id, local_deployment) {
+            Ok(address) => address,
+            Err(e) => panic!("Couldn't resolve server's DNS name: {e}"),
+        }
+    }
+
+    async fn get_server_connection(
+        server_address: SocketAddr,
+    ) -> (FromServerConnection, ToServerConnection) {
+        let mut retry_connection = interval(Duration::from_secs(1));
+        loop {
+            retry_connection.tick().await;
+            match TcpStream::connect(server_address).await {
+                Ok(stream) => {
+                    stream.set_nodelay(true).unwrap();
+                    let mut registration_connection = frame_registration_connection(stream);
+                    registration_connection
+                        .send(RegistrationMessage::ClientRegister)
+                        .await
+                        .expect("Couldn't send message to server");
+                    // let first_msg = registration_connection.next().await.unwrap();
+                    // let assigned_id = match first_msg.unwrap() {
+                    //     RegistrationMessage::AssignedId(id) => id,
+                    //     _ => panic!("Recieved unexpected message during handshake"),
+                    // };
+                    let underlying_stream = registration_connection.into_inner().into_inner();
+                    break frame_clients_connection(underlying_stream);
+                }
+                Err(e) => error!("Unable to connect to server: {e}"),
+            }
+        }
+    }
+
+    async fn reader_actor(reader: FromServerConnection, incoming_messages: Sender<ServerMessage>) {
+        let mut buf_reader = reader.ready_chunks(100);
+        while let Some(messages) = buf_reader.next().await {
+            for msg in messages {
+                match msg {
+                    Ok(m) => incoming_messages.send(m).await.unwrap(),
+                    Err(err) => error!("Error deserializing message: {:?}", err),
+                }
+            }
+        }
+    }
+
+    async fn writer_actor(
+        mut writer: ToServerConnection,
+        mut outgoing_messages: UnboundedReceiver<ClientMessage>,
+    ) {
+        let mut buffer = Vec::with_capacity(100);
+        while outgoing_messages.recv_many(&mut buffer, 100).await != 0 {
+            for msg in buffer.drain(..) {
+                if let Err(err) = writer.feed(msg).await {
+                    warn!("Couldn't send message to server: {err}");
+                }
+            }
+            writer.flush().await.unwrap();
+        }
+    }
+
+    pub fn send(&mut self, message: ClientMessage) {
+        if let Err(e) = self.outgoing_messages.send(message) {
+            error!("Couldn't send message to server: {e}");
+        }
     }
 }
 
 impl Stream for Network {
-    type Item = (NodeId, Result<ClientResponse, std::io::Error>);
+    type Item = ServerMessage;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.connections).poll_next(cx) {
-            Poll::Ready(Some((id, Ok(msg)))) => match msg {
-                NetworkMessage::ServerMessage(m) => Poll::Ready(Some((id, Ok(m)))),
-                m => {
-                    let unexpected_input = std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Unexpected incoming message {m}",
-                    );
-                    Poll::Ready(Some((id, Err(unexpected_input))))
-                }
-            },
-            Poll::Ready(Some((id, Err(err)))) => Poll::Ready(Some((id, Err(err)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        self.incoming_messages.poll_recv(cx)
     }
 }

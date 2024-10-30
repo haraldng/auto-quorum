@@ -1,13 +1,12 @@
 use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
 use serde::{Deserialize, Serialize};
 
-use crate::kv::{ClientId, Command, CommandId, KVCommand};
+use crate::kv::{Command, CommandId, KVCommand};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RegistrationMessage {
     NodeRegister(NodeId),
     ClientRegister,
-    AssignedId(ClientId),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,7 +24,7 @@ pub enum ServerMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Append(ClientId, CommandId, KVCommand),
+    Append(CommandId, KVCommand),
     // BatchAppend(ClientId, Vec<(CommandId, KVCommand)>),
     Done,
 }

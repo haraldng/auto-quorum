@@ -2,13 +2,12 @@ cluster_name = "local-cluster"
 location = "local-1"
 server_id = 1
 local_deployment = true
-scheduled_start_utc_ms = 0
-use_metronome = 2
+total_requests = 100
+num_parallel_requests = 10
+# Cluster settings
 #metronome_quorum_size = 3
 #flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
-req_batch_size = 10
-interval_ms = 10
-iterations = 100
+use_metronome = 0
 storage_duration_micros = 0
 data_size = 256
 nodes = [1, 2, 3, 4, 5]

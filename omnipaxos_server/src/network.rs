@@ -24,7 +24,7 @@ pub struct Network {
     peer_connections: Vec<Option<PeerConnection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
-    client_message_sender: Sender<(ClientMessage, Instant)>,
+    client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
     cluster_message_sender: Sender<ClusterMessage>,
 }
 
@@ -35,7 +35,7 @@ impl Network {
         peers: Vec<NodeId>,
         num_clients: usize,
         local_deployment: bool,
-        client_message_sender: Sender<(ClientMessage, Instant)>,
+        client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
         cluster_message_sender: Sender<ClusterMessage>,
     ) -> Result<Self, Error> {
         let mut cluster_connections = vec![];
@@ -112,7 +112,7 @@ impl Network {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<(ClientMessage, Instant)>,
+        client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
         cluster_message_sender: Sender<ClusterMessage>,
         connection_sender: Sender<NewConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
@@ -137,20 +137,12 @@ impl Network {
                     *max_client_id
                 };
                 debug!("Identified connection from client {next_client_id}");
-                registration_connection
-                    .send(RegistrationMessage::AssignedId(next_client_id))
-                    .await
-                    .unwrap();
                 let underlying_stream = registration_connection.into_inner().into_inner();
                 NewConnection::ToClient(ClientConnection::new(
                     next_client_id,
                     underlying_stream,
                     client_message_sender,
                 ))
-            }
-            Some(Ok(RegistrationMessage::AssignedId(_))) => {
-                error!("Handshake failed");
-                return;
             }
             Some(Err(err)) => {
                 error!("Error deserializing handshake: {:?}", err);
@@ -322,7 +314,7 @@ impl ClientConnection {
     pub fn new(
         client_id: ClientId,
         connection: TcpStream,
-        incoming_messages: Sender<(ClientMessage, Instant)>,
+        incoming_messages: Sender<(ClientId, ClientMessage, Instant)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
@@ -333,7 +325,10 @@ impl ClientConnection {
                     // debug!("Network: Request from client {client_id}: {msg:?}");
                     match msg {
                         Ok(m) => {
-                            incoming_messages.send((m, Instant::now())).await.unwrap();
+                            incoming_messages
+                                .send((client_id, m, Instant::now()))
+                                .await
+                                .unwrap();
                         }
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);

@@ -1,11 +1,11 @@
 use chrono::Utc;
 use client::{Client, ClientConfig};
-use itertools::Itertools;
 use std::{env, fs};
 use tokio::time::Duration;
 use toml;
 
 mod client;
+mod network;
 
 // Wait until the scheduled start time to synchronize client starts.
 // If start time has already passed, start immediately.
@@ -24,19 +24,17 @@ async fn wait_until_sync_time(scheduled_start_utc_ms: Option<i64>) {
 
 #[tokio::main]
 pub async fn main() {
+    env_logger::init();
     let config_file = match env::var("CONFIG_FILE") {
         Ok(file_path) => file_path,
         Err(_) => panic!("Requires CONFIG_FILE environment variable"),
     };
-    let config_string = fs::read_to_string(config_file).unwrap();
-    let mut client_config: ClientConfig = toml::from_str(&config_string).unwrap();
-    let num_nodes = client_config.nodes.as_ref().unwrap().len();
-    let majority = num_nodes / 2 + 1;
-    let batch_size = match client_config.req_batch_size {
-        Some(size) => size,
-        None => (1..=num_nodes).combinations(majority).count(),
+    let config_string = match fs::read_to_string(config_file.clone()) {
+        Ok(string) => string,
+        Err(e) => panic!("Couldn't read config file {config_file}: {e}"),
     };
-    client_config.req_batch_size = Some(batch_size);
+    let client_config: ClientConfig = toml::from_str(&config_string).unwrap();
     // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
-    Client::run(client_config).await;
+    let mut client = Client::new(client_config).await;
+    client.run().await;
 }
