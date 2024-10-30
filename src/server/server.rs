@@ -1,25 +1,23 @@
+use crate::{database::Database, network::Network};
+use auto_quorum::common::{kv::*, messages::*};
 use core::panic;
 use log::*;
-use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::Write;
-use std::time::Duration;
-use tempfile::tempfile;
-use tokio::sync::mpsc::Receiver;
-use tokio::time::Instant;
-
-use omnipaxos::ballot_leader_election::Ballot;
-use omnipaxos::messages::sequence_paxos::{PaxosMessage, PaxosMsg};
-use omnipaxos::messages::Message;
-use omnipaxos::sequence_paxos::Phase;
 use omnipaxos::{
+    ballot_leader_election::Ballot,
+    messages::{
+        sequence_paxos::{PaxosMessage, PaxosMsg},
+        Message,
+    },
+    sequence_paxos::Phase,
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
 use omnipaxos_storage::memory_storage::MemoryStorage;
-
-use crate::{database::Database, network::Network};
-use common::{kv::*, messages::*};
+use serde::{Deserialize, Serialize};
+use std::{fs::File, io::Write, time::Duration};
+use tempfile::tempfile;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 
@@ -197,8 +195,7 @@ impl OmniPaxosServer {
             client_message_sender,
             cluster_message_sender,
         )
-        .await
-        .unwrap();
+        .await;
         let mut server = OmniPaxosServer {
             id: server_id,
             peers,

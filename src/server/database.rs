@@ -1,6 +1,5 @@
+use auto_quorum::common::kv::KVCommand;
 use std::collections::HashMap;
-
-use common::kv::KVCommand;
 
 pub struct Database {
     db: HashMap<String, String>,

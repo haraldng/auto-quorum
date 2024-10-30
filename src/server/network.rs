@@ -1,4 +1,8 @@
-use anyhow::Error;
+use auto_quorum::common::{
+    kv::{ClientId, NodeId},
+    messages::*,
+    utils::*,
+};
 use futures::{SinkExt, StreamExt};
 use log::*;
 use std::collections::HashMap;
@@ -9,12 +13,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::time::Instant;
-
-use common::{
-    kv::{ClientId, NodeId},
-    messages::*,
-    util::*,
-};
 
 pub struct Network {
     cluster_name: String,
@@ -37,7 +35,7 @@ impl Network {
         local_deployment: bool,
         client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
         cluster_message_sender: Sender<ClusterMessage>,
-    ) -> Result<Self, Error> {
+    ) -> Self {
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peers.len(), Default::default);
         let mut network = Self {
@@ -52,7 +50,7 @@ impl Network {
             is_local: local_deployment,
         };
         network.initialize_connections(num_clients).await;
-        Ok(network)
+        network
     }
 
     async fn initialize_connections(&mut self, num_clients: usize) {

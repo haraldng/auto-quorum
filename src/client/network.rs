@@ -1,4 +1,4 @@
-use common::{kv::NodeId, messages::*, util::*};
+use auto_quorum::common::{kv::NodeId, messages::*, utils::*};
 use futures::{SinkExt, Stream, StreamExt};
 use log::*;
 use std::{
@@ -70,11 +70,6 @@ impl Network {
                         .send(RegistrationMessage::ClientRegister)
                         .await
                         .expect("Couldn't send message to server");
-                    // let first_msg = registration_connection.next().await.unwrap();
-                    // let assigned_id = match first_msg.unwrap() {
-                    //     RegistrationMessage::AssignedId(id) => id,
-                    //     _ => panic!("Recieved unexpected message during handshake"),
-                    // };
                     let underlying_stream = registration_connection.into_inner().into_inner();
                     break frame_clients_connection(underlying_stream);
                 }

@@ -1,5 +1,5 @@
 use crate::network::Network;
-use common::{kv::*, messages::*};
+use auto_quorum::common::{kv::*, messages::*};
 use futures::StreamExt;
 use log::*;
 use omnipaxos::util::FlexibleQuorum;
@@ -16,10 +16,6 @@ pub struct ClientConfig {
     pub local_deployment: Option<bool>,
     pub total_requests: Option<usize>,
     pub num_parallel_requests: Option<usize>,
-    // pub scheduled_start_utc_ms: Option<i64>,
-    // pub req_batch_size: Option<usize>,
-    // pub interval_ms: Option<u64>,
-    // pub iterations: Option<usize>,
     // Cluster Config for debugging
     pub use_metronome: Option<usize>,
     pub metronome_quorum_size: Option<usize>,
