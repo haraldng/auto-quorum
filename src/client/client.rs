@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::network::Network;
 use auto_quorum::common::{kv::*, messages::*};
 use futures::StreamExt;
@@ -74,21 +76,26 @@ impl Client {
         }
 
         // Send new requests on reponse until total requests reached
-        let mut responses_received = 0;
-        while let Some(message) = self.network.next().await {
-            match message {
-                ServerMessage::Ready => error!("Unexpected ready message"),
-                msg => {
-                    debug!("Received {msg:?}");
-                    responses_received += 1;
-                    let response_id = msg.command_id();
-                    self.response_data.push((response_id, Instant::now()));
-                    let next_request_id = response_id + self.num_parallel_requests;
-                    if next_request_id < self.total_requests {
-                        self.send_request(next_request_id);
-                    } else if responses_received >= self.total_requests {
-                        break;
+        loop {
+            match self.network.next().await {
+                Some(message) => match message {
+                    ServerMessage::Ready => error!("Unexpected ready message"),
+                    msg => {
+                        debug!("Received {msg:?}");
+                        let response_id = msg.command_id();
+                        self.response_data.push((response_id, Instant::now()));
+                        let next_request_id = response_id + self.num_parallel_requests;
+                        if next_request_id < self.total_requests {
+                            self.send_request(next_request_id);
+                        } else if self.response_data.len() >= self.total_requests {
+                            eprintln!("Client finished collecting responses");
+                            break;
+                        }
                     }
+                },
+                None => {
+                    error!("Server connection lost");
+                    break;
                 }
             }
         }
@@ -117,6 +124,7 @@ impl Client {
             .zip(self.response_data.iter())
             .map(|((_, req_time), (_, resp_time))| (*resp_time - *req_time).as_micros())
             .collect();
+        let total_time = self.calc_total_time();
         let throughput = self.calc_request_throughput();
         let (request_latency_average, request_latency_std_dev) =
             calc_avg_response_latency(&response_latencies);
@@ -126,6 +134,7 @@ impl Client {
             client_config: self.config.clone(),
             throughput,
             missed_responses: 0,
+            total_time: format!("{total_time:?}"),
             request_latency_average,
             request_latency_std_dev,
             client_latencies_average,
@@ -150,6 +159,12 @@ impl Client {
         //         ),
         //     }
         // }
+    }
+
+    fn calc_total_time(&self) -> Duration {
+        let first_request_time = self.request_data[0].1;
+        let last_response_time = self.response_data[self.response_data.len() - 1].1;
+        last_response_time - first_request_time
     }
 
     fn calc_request_throughput(&self) -> f64 {
@@ -182,6 +197,7 @@ struct ClientOutput {
     client_config: ClientConfig,
     throughput: f64,
     missed_responses: usize,
+    total_time: String,
     request_latency_average: f64,
     request_latency_std_dev: f64,
     client_latencies_average: Vec<f64>,

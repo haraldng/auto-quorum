@@ -116,7 +116,6 @@ pub struct OmniPaxosServer {
     leader_attempt: u32,
     delay_strategy: DelayStrategy,
     batch_size: usize,
-    use_metronome: bool,
     request_data: Vec<Option<RequestInstrumentation>>,
     acceptor_data: Vec<AcceptorInstrumentation>,
 }
@@ -161,7 +160,10 @@ impl OmniPaxosServer {
                 DelayStrategy::FileWrite(file, size)
             }
             (_, Some(0)) => DelayStrategy::NoDelay,
-            (_, Some(micros)) => DelayStrategy::Sleep(Duration::from_micros(micros)),
+            (_, Some(micros)) => DelayStrategy::Sleep(Duration::from_micros(
+                // (micros as f64 * (1. + (0.05) * server_id as f64)) as u64,
+                micros,
+            )),
             (_, None) => panic!(
                 "Either data_size or storage_duration_micros configuration fields must be set."
             ),
@@ -173,12 +175,6 @@ impl OmniPaxosServer {
             omnipaxos_config.cluster_config.use_metronome,
             server_config.storage_duration_micros
         );
-        // TODO:
-        let use_metronome = match omnipaxos_config.cluster_config.use_metronome {
-            0 => false,
-            2 => true,
-            _ => unreachable!(),
-        };
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let initial_clients = match server_id == initial_leader {
             true => 1,
@@ -208,7 +204,6 @@ impl OmniPaxosServer {
             leader_attempt: 0,
             delay_strategy,
             batch_size,
-            use_metronome,
             request_data: Vec::with_capacity(1000),
             acceptor_data: Vec::with_capacity(1000),
         };
@@ -299,14 +294,17 @@ impl OmniPaxosServer {
     fn handle_decided_entries(&mut self) {
         let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
         for slot in decided_slots {
-            let commit_time = Instant::now();
-            // eprintln!("Committing {slot}");
-            self.request_data[slot].as_mut().unwrap().commit = Some(commit_time);
             let decided_entry = self.omnipaxos.read(slot).unwrap();
             match decided_entry {
-                LogEntry::Decided(cmd) => self.update_database_and_respond(cmd),
+                LogEntry::Decided(cmd) => {
+                    debug!("Commit command {} at idx {slot}", cmd.id);
+                    self.update_database_and_respond(cmd);
+                }
                 // TODO: fix slot indexing
-                LogEntry::Undecided(cmd) => self.update_database_and_respond(cmd),
+                LogEntry::Undecided(cmd) => {
+                    debug!("Commit command {} at idx {slot}", cmd.id);
+                    self.update_database_and_respond(cmd);
+                }
                 LogEntry::Snapshotted(_) => unimplemented!(),
                 _ => unreachable!(),
             }
@@ -314,6 +312,8 @@ impl OmniPaxosServer {
     }
 
     fn update_database_and_respond(&mut self, command: Command) {
+        let commit_time = Instant::now();
+        self.request_data[command.id].as_mut().unwrap().commit = Some(commit_time);
         let read = self.database.handle_command(command.kv_cmd);
         if command.coordinator_id == self.id {
             let response = match read {
@@ -393,10 +393,22 @@ impl OmniPaxosServer {
                         to: _,
                         msg: PaxosMsg::Accepted(acc),
                     })) => {
-                        // eprintln!("Got accepted from {from}: {}", acc.slot_idx);
                         if acc.slot_idx != usize::MAX {
+                            let a = self
+                                .omnipaxos
+                                .read(acc.slot_idx)
+                                .expect("Accepted entry not in log");
+                            let command_id = match a {
+                                LogEntry::Undecided(cmd) => cmd.id,
+                                LogEntry::Decided(cmd) => cmd.id,
+                                _ => unimplemented!(),
+                            };
+                            debug!(
+                                "{from} Accepted command {command_id} at idx {}",
+                                acc.slot_idx
+                            );
                             let accepted_time = Instant::now();
-                            self.request_data[acc.slot_idx]
+                            self.request_data[command_id]
                                 .as_mut()
                                 .unwrap()
                                 .receive_accepted
@@ -442,13 +454,9 @@ impl OmniPaxosServer {
         for message in messages.drain(..) {
             match message {
                 (client_id, ClientMessage::Append(command_id, kv_command), net_recv_time) => {
-                    if command_id % 30 == 0 {
-                        debug!(
-                            "Server: Request from client {client_id}: {command_id} {kv_command:?}"
-                        );
-                    }
+                    debug!("Server: Request from client {client_id}: {command_id} {kv_command:?}");
                     let req_data = RequestInstrumentation::with(net_recv_time, Instant::now());
-                    for i in self.request_data.len()..command_id + 1 {
+                    for _ in self.request_data.len()..command_id + 1 {
                         self.request_data.push(None);
                     }
                     self.request_data[command_id] = Some(req_data);
@@ -570,20 +578,6 @@ impl OmniPaxosServer {
         let batch_count = latencies.len() / self.batch_size;
         let mut sums = vec![Duration::from_millis(0); self.batch_size];
         for batch in latencies.chunks(self.batch_size) {
-            for (i, latency) in batch.into_iter().enumerate() {
-                sums[i] += *latency;
-            }
-        }
-        sums.iter().map(|&sum| sum / batch_count as u32).collect()
-    }
-    fn get_average2(&self, latencies: &Vec<Duration>) -> Vec<Duration> {
-        let critical_len = match self.use_metronome {
-            true => 6,
-            false => 10,
-        };
-        let batch_count = latencies.len() / critical_len;
-        let mut sums = vec![Duration::from_millis(0); critical_len];
-        for batch in latencies.chunks(critical_len) {
             for (i, latency) in batch.into_iter().enumerate() {
                 sums[i] += *latency;
             }

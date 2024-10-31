@@ -88,6 +88,7 @@ impl Network {
                 }
             }
         }
+        error!("Connection from server lost");
     }
 
     async fn writer_actor(
@@ -103,6 +104,7 @@ impl Network {
             }
             writer.flush().await.unwrap();
         }
+        error!("Connection to server lost");
     }
 
     pub fn send(&mut self, message: ClientMessage) {
