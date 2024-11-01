@@ -1,5 +1,9 @@
 use crate::{database::Database, network::Network};
-use auto_quorum::common::{kv::*, messages::*};
+use auto_quorum::common::{
+    configs::{OmniPaxosServerConfig, *},
+    kv::*,
+    messages::*,
+};
 use core::panic;
 use log::*;
 use omnipaxos::{
@@ -13,7 +17,6 @@ use omnipaxos::{
     OmniPaxos, OmniPaxosConfig,
 };
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
 use tempfile::tempfile;
 use tokio::sync::mpsc::Receiver;
@@ -21,88 +24,42 @@ use tokio::time::Instant;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OmniPaxosServerConfig {
-    pub cluster_name: String,
-    pub location: String,
-    pub initial_leader: Option<NodeId>,
-    pub local_deployment: Option<bool>,
-    pub storage_duration_micros: Option<u64>,
-    pub data_size: Option<usize>,
-}
-
-type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
-
-enum DelayStrategy {
-    NoDelay,
+pub(crate) enum DelayStrategy {
     Sleep(Duration),
     FileWrite(File, usize),
 }
 
-#[derive(Debug, Clone)]
-struct RequestInstrumentation {
-    net_receive: Instant,
-    channel_receive: Instant,
-    send_accdec: Vec<(NodeId, Instant)>,
-    receive_accepted: Vec<(NodeId, Instant)>,
-    commit: Option<Instant>,
-    sending_response: Option<Instant>,
-}
-
-impl RequestInstrumentation {
-    fn with(net_receive_time: Instant, ch_receive_time: Instant) -> Self {
-        Self {
-            net_receive: net_receive_time,
-            channel_receive: ch_receive_time,
-            send_accdec: Vec::with_capacity(5),
-            receive_accepted: Vec::with_capacity(4),
-            commit: None,
-            sending_response: None,
-        }
-    }
-
-    fn get_num_acceptors(&self) -> usize {
-        self.send_accdec
-            .iter()
-            .map(|(node, _)| *node)
-            .max()
-            .unwrap() as usize
-    }
-
-    fn get_accepted_latencies(&self) -> Vec<Option<Duration>> {
-        let acceptors = self.get_num_acceptors();
-        let mut latencies = vec![None; acceptors];
-        for (acceptor, accepted_time) in &self.receive_accepted {
-            let accdec_time = self
-                .send_accdec
-                .iter()
-                .find(|(to, _accdec_time)| *to == *acceptor)
-                .unwrap()
-                .1;
-            let acceptor_idx = *acceptor as usize - 1;
-            let latency = *accepted_time - accdec_time;
-            latencies[acceptor_idx] = Some(latency);
-        }
-        latencies
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AcceptorInstrumentation {
-    // net_receive: Instant,
-    // channel_receive: Instant,
-    receive_accdec: Instant,
-    send_accepted: Option<Instant>,
-}
-
-impl AcceptorInstrumentation {
-    fn new(propose_time: Instant) -> Self {
-        AcceptorInstrumentation {
-            receive_accdec: propose_time,
-            send_accepted: None,
+impl From<DelayConfig> for DelayStrategy {
+    fn from(value: DelayConfig) -> Self {
+        match value {
+            DelayConfig::Sleep(μs) => DelayStrategy::Sleep(Duration::from_micros(μs)),
+            DelayConfig::File(data_size) => {
+                let file = tempfile().expect("Failed to open temp file");
+                DelayStrategy::FileWrite(file, data_size)
+            }
         }
     }
 }
+
+pub(crate) enum PersistMode {
+    NoPersist,
+    Individual,
+    Every(usize),
+    Opportunistic,
+}
+
+impl From<PersistConfig> for PersistMode {
+    fn from(value: PersistConfig) -> Self {
+        match value {
+            PersistConfig::NoPersist => PersistMode::NoPersist,
+            PersistConfig::Individual => PersistMode::Individual,
+            PersistConfig::Every(n) => PersistMode::Every(n),
+            PersistConfig::Opportunistic => PersistMode::Opportunistic,
+        }
+    }
+}
+
+type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -113,11 +70,13 @@ pub struct OmniPaxosServer {
     client_messages: Receiver<(ClientId, ClientMessage, Instant)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
-    leader_attempt: u32,
-    delay_strategy: DelayStrategy,
+    persist_mode: PersistMode,
+    delay_strat: DelayStrategy,
+    accepted_buffer: Vec<(usize, u64, ClusterMessage)>,
     batch_size: usize,
     request_data: Vec<Option<RequestInstrumentation>>,
     acceptor_data: Vec<AcceptorInstrumentation>,
+    config: OmniPaxosServerConfig,
 }
 
 fn n_choose_k(n: usize, k: usize) -> usize {
@@ -151,30 +110,11 @@ impl OmniPaxosServer {
             .filter(|node| *node != server_id)
             .collect();
         let local_deployment = server_config.local_deployment.unwrap_or(false);
-        let delay_strategy = match (
-            server_config.data_size,
-            server_config.storage_duration_micros,
-        ) {
-            (Some(size), _) if size > 0 => {
-                let file = tempfile().expect("Failed to open temp file");
-                DelayStrategy::FileWrite(file, size)
-            }
-            (_, Some(0)) => DelayStrategy::NoDelay,
-            (_, Some(micros)) => DelayStrategy::Sleep(Duration::from_micros(
-                // (micros as f64 * (1. + (0.05) * server_id as f64)) as u64,
-                micros,
-            )),
-            (_, None) => panic!(
-                "Either data_size or storage_duration_micros configuration fields must be set."
-            ),
-        };
-        let storage = MemoryStorage::default();
         info!(
-            "Node: {:?}: using metronome: {}, storage_duration: {:?}",
-            server_id,
-            omnipaxos_config.cluster_config.use_metronome,
-            server_config.storage_duration_micros
+            "Node: {:?}: using metronome: {}, persist_config: {:?}",
+            server_id, omnipaxos_config.cluster_config.use_metronome, server_config.persist_config
         );
+        let storage = MemoryStorage::default();
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         let initial_clients = match server_id == initial_leader {
             true => 1,
@@ -183,7 +123,7 @@ impl OmniPaxosServer {
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(1000);
         let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(1000);
         let network = Network::new(
-            server_config.cluster_name,
+            server_config.cluster_name.clone(),
             server_id,
             peers.clone(),
             initial_clients,
@@ -201,11 +141,13 @@ impl OmniPaxosServer {
             client_messages,
             omnipaxos,
             initial_leader,
-            leader_attempt: 0,
-            delay_strategy,
+            persist_mode: server_config.persist_config.into(),
+            delay_strat: server_config.delay_config.into(),
+            accepted_buffer: vec![],
             batch_size,
             request_data: Vec::with_capacity(1000),
             acceptor_data: Vec::with_capacity(1000),
+            config: server_config,
         };
         // Clears outgoing_messages of initial BLE messages
         let _ = server.omnipaxos.outgoing_messages();
@@ -217,17 +159,18 @@ impl OmniPaxosServer {
         let mut client_message_buffer = Vec::with_capacity(buffer_size);
         let mut cluster_message_buffer = Vec::with_capacity(buffer_size);
         if self.id == self.initial_leader {
+            let mut leader_attempt = 0;
             let mut election_interval = tokio::time::interval(LEADER_WAIT);
             loop {
                 tokio::select! {
                     // Ensures cluster is connected and leader is promoted before client starts sending
                     // requests.
                     _ = election_interval.tick() => {
-                        self.become_initial_leader();
+                        self.become_initial_leader(&mut leader_attempt);
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
                             info!("{}: Leader fully initialized", self.id);
-                            self.network.send_to_client(self.id, ServerMessage::Ready);
+                            self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into()));
                             break;
                         }
                     },
@@ -271,14 +214,14 @@ impl OmniPaxosServer {
         }
     }
 
-    fn become_initial_leader(&mut self) {
+    fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
         let (_leader, phase) = self.omnipaxos.get_current_leader_state();
         match phase {
             Phase::Accept => {}
             _ => {
                 let mut ballot = Ballot::default();
-                self.leader_attempt += 1;
-                ballot.n = self.leader_attempt;
+                *leader_attempt += 1;
+                ballot.n = *leader_attempt;
                 ballot.pid = self.id;
                 ballot.config_id = 1;
                 info!(
@@ -333,52 +276,118 @@ impl OmniPaxosServer {
     fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         if self.id == 1 {
-            for m in &messages {
-                match m {
-                    Message::SequencePaxos(PaxosMessage {
-                        from: _,
-                        to,
-                        msg: PaxosMsg::AcceptDecide(accdec),
-                    }) => {
-                        let accdec_time = Instant::now();
-                        for entry in &accdec.entries {
-                            // eprintln!("Sending Acceptdecide {}", entry.id);
-                            self.request_data[entry.id]
-                                .as_mut()
-                                .unwrap()
-                                .send_accdec
-                                .push((*to, accdec_time));
-                        }
-                    }
-                    _ => (),
+            self.instrument_accdec(&messages);
+            self.send_outgoing_no_persist(messages);
+            return;
+        }
+        match self.persist_mode {
+            PersistMode::NoPersist => self.send_outgoing_no_persist(messages),
+            PersistMode::Individual => self.send_outgoing_individual_persist(messages),
+            PersistMode::Every(n) => self.send_outgoing_batch_persist(messages, n),
+            PersistMode::Opportunistic => self.send_outgoing_opportunistic_persist(messages),
+        }
+    }
+
+    fn instrument_accdec(&mut self, messages: &Vec<Message<Command>>) {
+        for m in messages {
+            if let Message::SequencePaxos(PaxosMessage {
+                from: _,
+                to,
+                msg: PaxosMsg::AcceptDecide(accdec),
+            }) = m
+            {
+                let accdec_time = Instant::now();
+                for command in &accdec.entries {
+                    // eprintln!("Sending Acceptdecide {}", entry.id);
+                    self.request_data[command.id]
+                        .as_mut()
+                        .unwrap()
+                        .send_accdec
+                        .push((*to, accdec_time));
                 }
             }
         }
+    }
+
+    fn send_outgoing_no_persist(&mut self, messages: Vec<Message<Command>>) {
         for msg in messages {
+            if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
+                let accepted_time = Instant::now();
+                self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+            }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            match &cluster_msg {
-                ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(PaxosMessage {
-                    from: _,
-                    to: _,
-                    msg: PaxosMsg::Accepted(a),
-                })) => {
-                    match &mut self.delay_strategy {
-                        DelayStrategy::Sleep(delay) => std::thread::sleep(*delay),
-                        DelayStrategy::FileWrite(ref mut file, data_size) => {
-                            let buffer = vec![b'A'; *data_size];
-                            file.write_all(&buffer).expect("Failed to write file");
-                            file.sync_all().expect("Failed to flush file");
+            self.network.send_to_cluster(to, cluster_msg);
+        }
+    }
+
+    fn send_outgoing_individual_persist(&mut self, messages: Vec<Message<Command>>) {
+        for msg in messages {
+            if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
+                self.emulate_storage_delay(1);
+                let accepted_time = Instant::now();
+                self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+            }
+            let to = msg.get_receiver();
+            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+            self.network.send_to_cluster(to, cluster_msg);
+        }
+    }
+
+    fn send_outgoing_batch_persist(&mut self, messages: Vec<Message<Command>>, batch_size: usize) {
+        for msg in messages {
+            match Self::is_accepted_msg(&msg) {
+                Some(slot_idx) => {
+                    let to_node = msg.get_receiver();
+                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+                    self.accepted_buffer.push((slot_idx, to_node, cluster_msg));
+                    if self.accepted_buffer.len() >= batch_size {
+                        self.emulate_storage_delay(batch_size);
+                        for (accepted_idx, to, accepted_msg) in self.accepted_buffer.drain(..) {
+                            let accepted_time = Instant::now();
+                            self.acceptor_data[accepted_idx].send_accepted = Some(accepted_time);
+                            self.network.send_to_cluster(to, accepted_msg);
                         }
-                        DelayStrategy::NoDelay => (),
                     }
-                    if a.slot_idx != usize::MAX {
-                        let accepted_time = Instant::now();
-                        self.acceptor_data[a.slot_idx].send_accepted = Some(accepted_time);
-                    }
+                }
+                None => {
+                    let to = msg.get_receiver();
+                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
                     self.network.send_to_cluster(to, cluster_msg);
                 }
-                _ => self.network.send_to_cluster(to, cluster_msg),
+            }
+        }
+    }
+
+    fn send_outgoing_opportunistic_persist(&mut self, messages: Vec<Message<Command>>) {
+        let num_accepted_msgs = messages
+            .iter()
+            .filter_map(|m| Self::is_accepted_msg(m))
+            .count();
+        if num_accepted_msgs > 0 {
+            self.emulate_storage_delay(num_accepted_msgs);
+        }
+        self.send_outgoing_no_persist(messages);
+    }
+
+    fn is_accepted_msg(message: &Message<Command>) -> Option<usize> {
+        match message {
+            Message::SequencePaxos(PaxosMessage {
+                from: _,
+                to: _,
+                msg: PaxosMsg::Accepted(a),
+            }) if a.slot_idx != usize::MAX => Some(a.slot_idx),
+            _ => None,
+        }
+    }
+
+    fn emulate_storage_delay(&mut self, multiplier: usize) {
+        match self.delay_strat {
+            DelayStrategy::Sleep(delay) => std::thread::sleep(delay * multiplier as u32),
+            DelayStrategy::FileWrite(ref mut file, data_size) => {
+                let buffer = vec![b'A'; data_size * multiplier];
+                file.write_all(&buffer).expect("Failed to write file");
+                file.sync_all().expect("Failed to flush file");
             }
         }
     }
@@ -641,5 +650,70 @@ impl OmniPaxosServer {
             acceptor_delays.push(avg_delay_increase);
         }
         acceptor_delays
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestInstrumentation {
+    net_receive: Instant,
+    channel_receive: Instant,
+    send_accdec: Vec<(NodeId, Instant)>,
+    receive_accepted: Vec<(NodeId, Instant)>,
+    commit: Option<Instant>,
+    sending_response: Option<Instant>,
+}
+
+impl RequestInstrumentation {
+    fn with(net_receive_time: Instant, ch_receive_time: Instant) -> Self {
+        Self {
+            net_receive: net_receive_time,
+            channel_receive: ch_receive_time,
+            send_accdec: Vec::with_capacity(5),
+            receive_accepted: Vec::with_capacity(4),
+            commit: None,
+            sending_response: None,
+        }
+    }
+
+    fn get_num_acceptors(&self) -> usize {
+        self.send_accdec
+            .iter()
+            .map(|(node, _)| *node)
+            .max()
+            .unwrap() as usize
+    }
+
+    fn get_accepted_latencies(&self) -> Vec<Option<Duration>> {
+        let acceptors = self.get_num_acceptors();
+        let mut latencies = vec![None; acceptors];
+        for (acceptor, accepted_time) in &self.receive_accepted {
+            let accdec_time = self
+                .send_accdec
+                .iter()
+                .find(|(to, _accdec_time)| *to == *acceptor)
+                .unwrap()
+                .1;
+            let acceptor_idx = *acceptor as usize - 1;
+            let latency = *accepted_time - accdec_time;
+            latencies[acceptor_idx] = Some(latency);
+        }
+        latencies
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AcceptorInstrumentation {
+    // net_receive: Instant,
+    // channel_receive: Instant,
+    receive_accdec: Instant,
+    send_accepted: Option<Instant>,
+}
+
+impl AcceptorInstrumentation {
+    fn new(propose_time: Instant) -> Self {
+        AcceptorInstrumentation {
+            receive_accdec: propose_time,
+            send_accepted: None,
+        }
     }
 }

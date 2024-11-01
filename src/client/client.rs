@@ -4,12 +4,9 @@ use crate::network::Network;
 use auto_quorum::common::{kv::*, messages::*};
 use futures::StreamExt;
 use log::*;
-use omnipaxos::util::FlexibleQuorum;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-// TODO: Server/Cluster config parameters like flexible_quorum should be taken from server, since
-// there may be a mismatch between the client's config and the servers' configs.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
     pub cluster_name: String,
@@ -18,13 +15,6 @@ pub struct ClientConfig {
     pub local_deployment: Option<bool>,
     pub total_requests: Option<usize>,
     pub num_parallel_requests: Option<usize>,
-    // Cluster Config for debugging
-    pub use_metronome: Option<usize>,
-    pub metronome_quorum_size: Option<usize>,
-    pub flexible_quorum: Option<FlexibleQuorum>,
-    pub nodes: Option<Vec<usize>>,
-    pub storage_duration_micros: Option<usize>,
-    pub data_size: Option<usize>,
 }
 
 pub struct Client {
@@ -34,6 +24,7 @@ pub struct Client {
     request_data: Vec<(CommandId, Instant)>,
     response_data: Vec<(CommandId, Instant)>,
     config: ClientConfig,
+    leaders_config: Option<MetronomeConfigInfo>,
 }
 
 impl Client {
@@ -58,6 +49,7 @@ impl Client {
             request_data: Vec::with_capacity(total_requests),
             response_data: Vec::with_capacity(total_requests),
             config,
+            leaders_config: None,
         }
     }
 
@@ -65,7 +57,7 @@ impl Client {
         // Wait until server is ready
         let first_msg = self.network.next().await;
         match first_msg {
-            Some(ServerMessage::Ready) => (),
+            Some(ServerMessage::Ready(server_config)) => self.leaders_config = Some(server_config),
             Some(m) => panic!("Recieved unexpected message during handshake: {m:?}"),
             None => panic!("Lost connection to server"),
         }
@@ -79,7 +71,7 @@ impl Client {
         loop {
             match self.network.next().await {
                 Some(message) => match message {
-                    ServerMessage::Ready => error!("Unexpected ready message"),
+                    ServerMessage::Ready(_) => error!("Unexpected ready message"),
                     msg => {
                         debug!("Received {msg:?}");
                         let response_id = msg.command_id();
@@ -132,6 +124,7 @@ impl Client {
             calc_avg_client_latencies(&response_latencies, self.num_parallel_requests);
         let output = ClientOutput {
             client_config: self.config.clone(),
+            server_info: self.leaders_config.unwrap(),
             throughput,
             missed_responses: 0,
             total_time: format!("{total_time:?}"),
@@ -195,6 +188,7 @@ fn calc_avg_response_latency(latencies: &Vec<u128>) -> (f64, f64) {
 #[derive(Debug, Serialize)]
 struct ClientOutput {
     client_config: ClientConfig,
+    server_info: MetronomeConfigInfo,
     throughput: f64,
     missed_responses: usize,
     total_time: String,

@@ -1,8 +1,9 @@
-use crate::server::{OmniPaxosServer, OmniPaxosServerConfig};
+use crate::server::OmniPaxosServer;
+use auto_quorum::common::configs::OmniPaxosServerConfig;
 use chrono::Local;
 use env_logger::Builder;
 use log::LevelFilter;
-use omnipaxos::OmniPaxosConfig;
+use omnipaxos::{errors::ConfigError, OmniPaxosConfig};
 use std::{env, fs, io::Write};
 use toml;
 
@@ -39,9 +40,16 @@ pub async fn main() {
         Ok(file_path) => file_path,
         Err(_) => panic!("Requires CONFIG_FILE environment variable"),
     };
-    let omnipaxos_config = OmniPaxosConfig::with_toml(&config_file).unwrap();
+    let omnipaxos_config = match OmniPaxosConfig::with_toml(&config_file) {
+        Ok(parsed_config) => parsed_config,
+        Err(ConfigError::Parse(e)) => panic!("{e}",),
+        Err(e) => panic!("{e}"),
+    };
     let config_string = fs::read_to_string(config_file).unwrap();
-    let server_config: OmniPaxosServerConfig = toml::from_str(&config_string).unwrap();
+    let server_config: OmniPaxosServerConfig = match toml::from_str(&config_string) {
+        Ok(parsed_config) => parsed_config,
+        Err(e) => panic!("{e}"),
+    };
     let max_node_pid = omnipaxos_config.cluster_config.nodes.iter().max().unwrap();
     let initial_leader = server_config.initial_leader.unwrap_or(*max_node_pid);
     println!("{}", serde_json::to_string(&server_config).unwrap());

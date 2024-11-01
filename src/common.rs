@@ -1,5 +1,8 @@
 pub mod messages {
-    use super::kv::{Command, CommandId, KVCommand};
+    use super::{
+        configs::{DelayConfig, OmniPaxosServerConfig, PersistConfig},
+        kv::*,
+    };
     use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
     use serde::{Deserialize, Serialize};
 
@@ -17,7 +20,7 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
-        Ready,
+        Ready(MetronomeConfigInfo),
         Write(CommandId),
         Read(CommandId, Option<String>),
     }
@@ -33,9 +36,85 @@ pub mod messages {
             match self {
                 ServerMessage::Write(id) => *id,
                 ServerMessage::Read(id, _) => *id,
-                ServerMessage::Ready => unimplemented!(),
+                ServerMessage::Ready(_) => unimplemented!(),
             }
         }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    pub struct MetronomeConfigInfo {
+        pub use_metronome: usize,
+        pub metronome_quorum_size: Option<usize>,
+        pub persist_info: PersistInfo,
+        pub delay_info: DelayInfo,
+    }
+
+    impl From<OmniPaxosServerConfig> for MetronomeConfigInfo {
+        fn from(value: OmniPaxosServerConfig) -> Self {
+            let persist_info = match value.persist_config {
+                PersistConfig::NoPersist => PersistInfo::NoPersist,
+                PersistConfig::Individual => PersistInfo::Individual,
+                PersistConfig::Every(n) => PersistInfo::Every(n),
+                PersistConfig::Opportunistic => PersistInfo::Opportunistic,
+            };
+            let delay_info = match value.delay_config {
+                DelayConfig::Sleep(μs) => DelayInfo::Sleep(μs),
+                DelayConfig::File(d) => DelayInfo::File(d),
+            };
+            MetronomeConfigInfo {
+                use_metronome: value.cluster_config.use_metronome,
+                metronome_quorum_size: value.cluster_config.metronome_quorum_size,
+                persist_info,
+                delay_info,
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    pub enum PersistInfo {
+        NoPersist,
+        Individual,
+        Every(usize),
+        Opportunistic,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    pub enum DelayInfo {
+        Sleep(u64),
+        File(usize),
+    }
+}
+
+pub mod configs {
+    use omnipaxos::{util::NodeId, ClusterConfig, ServerConfig};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct OmniPaxosServerConfig {
+        pub cluster_name: String,
+        pub location: String,
+        pub initial_leader: Option<NodeId>,
+        pub local_deployment: Option<bool>,
+        pub persist_config: PersistConfig,
+        pub delay_config: DelayConfig,
+        pub server_config: ServerConfig,
+        pub cluster_config: ClusterConfig,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    #[serde(tag = "delay_type", content = "delay_value")]
+    pub enum DelayConfig {
+        Sleep(u64),
+        File(usize),
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    #[serde(tag = "persist_type", content = "persist_value")]
+    pub enum PersistConfig {
+        NoPersist,
+        Individual,
+        Every(usize),
+        Opportunistic,
     }
 }
 

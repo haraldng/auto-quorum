@@ -8,4 +8,3 @@ mkdir -p "../logs/run-${run_id}"
 client1_log_path="../logs/run-${run_id}/client-${server_id}.log"
 
 RUST_LOG=warn CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../Cargo.toml" --bin client 1> "$client1_log_path"
-debug

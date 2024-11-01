@@ -2,10 +2,14 @@ cluster_name = "local-cluster"
 location = "local-2"
 initial_leader = 1
 local_deployment = true
-optimize = true
-optimize_threshold = 0.97
-storage_duration_micros = 1000
-#data_size = 256
+
+[persist_config]
+persist_type = "Opportunistic"
+#persist_value = 6
+
+[delay_config]
+delay_type = "Sleep"
+delay_value = 1000
 
 [cluster_config]
 configuration_id = 1
