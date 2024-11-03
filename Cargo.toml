@@ -19,6 +19,7 @@ omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", b
 toml = "0.8.11"
 tempfile = "3.13.0"
 chrono = "0.4.38"
+serde_with = { version = "3.11.0", features = ["chrono_0_4"] }
 
 [[bin]]
 name = "client"

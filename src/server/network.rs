@@ -3,6 +3,7 @@ use auto_quorum::common::{
     messages::*,
     utils::*,
 };
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use log::*;
 use std::collections::HashMap;
@@ -12,7 +13,6 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::time::Instant;
 
 pub struct Network {
     cluster_name: String,
@@ -22,7 +22,7 @@ pub struct Network {
     peer_connections: Vec<Option<PeerConnection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
-    client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
+    client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
     cluster_message_sender: Sender<ClusterMessage>,
 }
 
@@ -33,7 +33,7 @@ impl Network {
         peers: Vec<NodeId>,
         num_clients: usize,
         local_deployment: bool,
-        client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
+        client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
         cluster_message_sender: Sender<ClusterMessage>,
     ) -> Self {
         let mut cluster_connections = vec![];
@@ -110,7 +110,7 @@ impl Network {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<(ClientId, ClientMessage, Instant)>,
+        client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
         cluster_message_sender: Sender<ClusterMessage>,
         connection_sender: Sender<NewConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
@@ -224,7 +224,7 @@ impl Network {
             // debug!("Responding to client {to}: {msg:?}");
             // TODO: remove connection if it closes
             // let now = Instant::now();
-            connection.send((msg, Instant::now()));
+            connection.send((msg, Utc::now()));
             // let send_time = now.elapsed();
             // if send_time > Duration::from_micros(100) {
             //     eprintln!("Send client message {send_time:?}");
@@ -305,14 +305,14 @@ impl PeerConnection {
 
 struct ClientConnection {
     client_id: ClientId,
-    outgoing_messages: UnboundedSender<(ServerMessage, Instant)>,
+    outgoing_messages: UnboundedSender<(ServerMessage, DateTime<Utc>)>,
 }
 
 impl ClientConnection {
     pub fn new(
         client_id: ClientId,
         connection: TcpStream,
-        incoming_messages: Sender<(ClientId, ClientMessage, Instant)>,
+        incoming_messages: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
@@ -324,7 +324,7 @@ impl ClientConnection {
                     match msg {
                         Ok(m) => {
                             incoming_messages
-                                .send((client_id, m, Instant::now()))
+                                .send((client_id, m, Utc::now()))
                                 .await
                                 .unwrap();
                         }
@@ -337,8 +337,8 @@ impl ClientConnection {
         });
         // Writer Actor
         let (message_tx, mut message_rx): (
-            UnboundedSender<(ServerMessage, Instant)>,
-            UnboundedReceiver<(ServerMessage, Instant)>,
+            UnboundedSender<(ServerMessage, DateTime<Utc>)>,
+            UnboundedReceiver<(ServerMessage, DateTime<Utc>)>,
         ) = mpsc::unbounded_channel();
         let _writer_task = tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(100);
@@ -372,7 +372,7 @@ impl ClientConnection {
         }
     }
 
-    pub fn send(&mut self, msg: (ServerMessage, Instant)) {
+    pub fn send(&mut self, msg: (ServerMessage, DateTime<Utc>)) {
         self.outgoing_messages
             .send(msg)
             .expect("Tried to send on a closed channel");
