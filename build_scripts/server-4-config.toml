@@ -8,7 +8,7 @@ persist_type = "Opportunistic"
 #persist_value = 6
 
 [delay_config]
-delay_type = "Sleep"
+delay_type = "File"
 delay_value = 1000
 
 [cluster_config]

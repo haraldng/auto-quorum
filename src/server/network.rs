@@ -3,7 +3,7 @@ use auto_quorum::common::{
     messages::*,
     utils::*,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::*;
 use std::collections::HashMap;
@@ -22,8 +22,8 @@ pub struct Network {
     peer_connections: Vec<Option<PeerConnection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
-    client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
-    cluster_message_sender: Sender<ClusterMessage>,
+    client_message_sender: Sender<(ClientId, ClientMessage, i64)>,
+    cluster_message_sender: Sender<(ClusterMessage, i64)>,
 }
 
 impl Network {
@@ -33,8 +33,8 @@ impl Network {
         peers: Vec<NodeId>,
         num_clients: usize,
         local_deployment: bool,
-        client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
-        cluster_message_sender: Sender<ClusterMessage>,
+        client_message_sender: Sender<(ClientId, ClientMessage, i64)>,
+        cluster_message_sender: Sender<(ClusterMessage, i64)>,
     ) -> Self {
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peers.len(), Default::default);
@@ -110,8 +110,8 @@ impl Network {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
-        cluster_message_sender: Sender<ClusterMessage>,
+        client_message_sender: Sender<(ClientId, ClientMessage, i64)>,
+        cluster_message_sender: Sender<(ClusterMessage, i64)>,
         connection_sender: Sender<NewConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
     ) {
@@ -222,13 +222,7 @@ impl Network {
     pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         if let Some(connection) = self.client_connections.get_mut(&to) {
             // debug!("Responding to client {to}: {msg:?}");
-            // TODO: remove connection if it closes
-            // let now = Instant::now();
-            connection.send((msg, Utc::now()));
-            // let send_time = now.elapsed();
-            // if send_time > Duration::from_micros(100) {
-            //     eprintln!("Send client message {send_time:?}");
-            // }
+            connection.send(msg);
         } else {
             warn!("Not connected to client {to}");
         }
@@ -254,18 +248,19 @@ impl PeerConnection {
     pub fn new(
         peer_id: NodeId,
         connection: TcpStream,
-        incoming_messages: Sender<ClusterMessage>,
+        incoming_messages: Sender<(ClusterMessage, i64)>,
     ) -> Self {
         let (reader, mut writer) = frame_cluster_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
             let mut buf_reader = reader.ready_chunks(100);
             while let Some(messages) = buf_reader.next().await {
+                let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
                     match msg {
                         Ok(m) => {
                             trace!("Received: {m:?}");
-                            if let Err(_) = incoming_messages.send(m).await {
+                            if let Err(_) = incoming_messages.send((m, receive_time)).await {
                                 break;
                             };
                         }
@@ -283,11 +278,14 @@ impl PeerConnection {
             while message_rx.recv_many(&mut buffer, 100).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
-                        warn!("Couldn't send message to node {peer_id}: {err}");
+                        warn!("Couldn't feed message to node {peer_id}: {err}");
                         error!("Cant Remove connection to node {peer_id}");
                     }
                 }
-                writer.flush().await.unwrap();
+                if let Err(err) = writer.flush().await {
+                    warn!("Couldn't flush message to node {peer_id}: {err}");
+                    error!("Cant Remove connection to node {peer_id}");
+                };
             }
         });
         PeerConnection {
@@ -305,26 +303,27 @@ impl PeerConnection {
 
 struct ClientConnection {
     client_id: ClientId,
-    outgoing_messages: UnboundedSender<(ServerMessage, DateTime<Utc>)>,
+    outgoing_messages: UnboundedSender<ServerMessage>,
 }
 
 impl ClientConnection {
     pub fn new(
         client_id: ClientId,
         connection: TcpStream,
-        incoming_messages: Sender<(ClientId, ClientMessage, DateTime<Utc>)>,
+        incoming_messages: Sender<(ClientId, ClientMessage, i64)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
             let mut buf_reader = reader.ready_chunks(100);
             while let Some(messages) = buf_reader.next().await {
+                let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
                     // debug!("Network: Request from client {client_id}: {msg:?}");
                     match msg {
                         Ok(m) => {
                             incoming_messages
-                                .send((client_id, m, Utc::now()))
+                                .send((client_id, m, receive_time))
                                 .await
                                 .unwrap();
                         }
@@ -337,34 +336,20 @@ impl ClientConnection {
         });
         // Writer Actor
         let (message_tx, mut message_rx): (
-            UnboundedSender<(ServerMessage, DateTime<Utc>)>,
-            UnboundedReceiver<(ServerMessage, DateTime<Utc>)>,
+            UnboundedSender<ServerMessage>,
+            UnboundedReceiver<ServerMessage>,
         ) = mpsc::unbounded_channel();
         let _writer_task = tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(100);
-            // let mut latencies = Vec::with_capacity(1000);
-            // let mut queue_latencies = Vec::with_capacity(1000);
-            // let mut queue_sizes = Vec::with_capacity(1000);
             while message_rx.recv_many(&mut buffer, 100).await != 0 {
-                // queue_sizes.push(buffer.len());
-                // let start = Instant::now();
-                for (msg, _server_send_time) in buffer.drain(..) {
-                    // queue_latencies.push(_server_send_time.elapsed());
+                for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
                         warn!("Couldn't send message to client {client_id}: {err}");
                         error!("Cant Remove connection to client {client_id}");
                     }
                 }
                 writer.flush().await.unwrap();
-                // latencies.push(start.elapsed());
             }
-            // let avg_queue_latencies =
-            //     queue_latencies.iter().sum::<Duration>() / queue_latencies.len() as u32;
-            // let avg_flush_latencies = latencies.iter().sum::<Duration>() / latencies.len() as u32;
-            // let avg_queue_size = queue_sizes.iter().sum::<usize>() / queue_sizes.len();
-            // eprintln!("Client actor queue avg:   {avg_queue_latencies:?}");
-            // eprintln!("Client actor queue size:  {avg_queue_size:?}");
-            // eprintln!("Client actor process avg: {avg_flush_latencies:?}");
         });
         ClientConnection {
             client_id,
@@ -372,7 +357,7 @@ impl ClientConnection {
         }
     }
 
-    pub fn send(&mut self, msg: (ServerMessage, DateTime<Utc>)) {
+    pub fn send(&mut self, msg: ServerMessage) {
         self.outgoing_messages
             .send(msg)
             .expect("Tried to send on a closed channel");

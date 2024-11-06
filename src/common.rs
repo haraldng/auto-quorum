@@ -43,6 +43,7 @@ pub mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
     pub struct MetronomeConfigInfo {
+        pub cluster_size: usize,
         pub use_metronome: usize,
         pub metronome_quorum_size: Option<usize>,
         pub persist_info: PersistInfo,
@@ -62,6 +63,7 @@ pub mod messages {
                 DelayConfig::File(d) => DelayInfo::File(d),
             };
             MetronomeConfigInfo {
+                cluster_size: value.cluster_config.nodes.len(),
                 use_metronome: value.cluster_config.use_metronome,
                 metronome_quorum_size: value.cluster_config.metronome_quorum_size,
                 persist_info,

@@ -2,12 +2,6 @@ cluster_name = "local-cluster"
 location = "local-1"
 server_id = 1
 local_deployment = true
-total_requests = 30
-num_parallel_requests = 10
-# Cluster settings
-#metronome_quorum_size = 3
-#flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
-# use_metronome = 2
-# storage_duration_micros = 1000
-#data_size = 256
-# nodes = [1, 2, 3, 4, 5]
+total_requests = 300
+num_parallel_requests = 30
+debug_file = "logs/client-1.csv"
