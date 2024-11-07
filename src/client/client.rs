@@ -5,7 +5,7 @@ use csv::Writer;
 use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::{fs::File, io::Write};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
@@ -15,7 +15,8 @@ pub struct ClientConfig {
     pub local_deployment: Option<bool>,
     pub total_requests: Option<usize>,
     pub num_parallel_requests: Option<usize>,
-    pub debug_file: Option<String>,
+    pub summary_filepath: String,
+    pub debug_filepath: Option<String>,
 }
 
 pub struct Client {
@@ -26,6 +27,7 @@ pub struct Client {
     response_data: Vec<(CommandId, i64)>,
     config: ClientConfig,
     leaders_config: Option<MetronomeConfigInfo>,
+    client_start_time: Option<i64>,
 }
 
 impl Client {
@@ -51,6 +53,7 @@ impl Client {
             response_data: Vec::with_capacity(total_requests),
             config,
             leaders_config: None,
+            client_start_time: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl Client {
         }
 
         // Send initial requests
+        self.client_start_time = Some(Utc::now().timestamp_micros());
         for request_id in 0..self.num_parallel_requests {
             self.send_request(request_id);
         }
@@ -128,6 +132,7 @@ impl Client {
         let output = ClientOutput {
             client_config: self.config.clone(),
             server_info: self.leaders_config.unwrap(),
+            client_start_time: self.client_start_time.unwrap(),
             throughput,
             missed_responses: 0,
             total_time,
@@ -135,11 +140,13 @@ impl Client {
             request_latency_std_dev,
         };
         let json_output = serde_json::to_string_pretty(&output).unwrap();
-        println!("{json_output}\n");
         eprintln!("{json_output}");
+        let mut summary_file = File::create(self.config.summary_filepath.clone()).unwrap();
+        summary_file.write_all(json_output.as_bytes()).unwrap();
+        summary_file.flush().unwrap();
 
         // Individual response times
-        if let Some(file_path) = self.config.debug_file.clone() {
+        if let Some(file_path) = self.config.debug_filepath.clone() {
             let file = File::create(file_path).unwrap();
             let mut writer = Writer::from_writer(file);
             for data in response_data {
@@ -160,7 +167,7 @@ impl Client {
         let first_request_time = self.request_data[0].1;
         let last_request_time = self.request_data[num_requests - 1].1;
         let messaging_duration = last_request_time - first_request_time;
-        num_requests as f64 / (messaging_duration as f64 / 1000.)
+        (num_requests as f64 / messaging_duration as f64) * 1_000_000.
     }
 }
 
@@ -184,6 +191,7 @@ fn calc_avg_response_latency(latencies: &Vec<i64>) -> (f64, f64) {
 struct ClientOutput {
     client_config: ClientConfig,
     server_info: MetronomeConfigInfo,
+    client_start_time: i64,
     throughput: f64,
     missed_responses: usize,
     total_time: f64,

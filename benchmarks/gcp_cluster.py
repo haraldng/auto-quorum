@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 import subprocess
 
@@ -93,11 +94,11 @@ Run: gcloud dns managed-zones create internal-network \\
 
     # TODO: Check if ssh without IAP tunnel (os login?) can be started faster
     # NOTE: It can take a good 60sec before IAP registers newly started instance
-    def scp_command(self, instance_name: str, src_path: str, dest_path: str) -> subprocess.Popen:
+    def scp_command(self, instance_name: str, src_dir: str, dest_dir: Path) -> subprocess.Popen:
         instance = self.instances[instance_name]
         name = instance.name
         zone = instance.zone
-        gcloud_command = f"gcloud compute scp --zone={zone} --tunnel-through-iap --project={self.project_id} {name}:{src_path} {dest_path}"
+        gcloud_command = f"gcloud compute scp --zone={zone} --tunnel-through-iap --project={self.project_id} {name}:{src_dir}/* {dest_dir}"
         p = subprocess.Popen(gcloud_command, shell=True)
         return p
 

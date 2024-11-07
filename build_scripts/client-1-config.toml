@@ -4,4 +4,5 @@ server_id = 1
 local_deployment = true
 total_requests = 300
 num_parallel_requests = 30
-debug_file = "logs/client-1.csv"
+summary_filepath = "../benchmarks/logs/local-experiments/client-1.json"
+debug_filepath = "../benchmarks/logs/local-experiments/client-1.csv"

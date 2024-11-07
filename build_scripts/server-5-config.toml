@@ -4,8 +4,8 @@ initial_leader = 1
 local_deployment = true
 
 [persist_config]
-persist_type = "Opportunistic"
-#persist_value = 6
+persist_type = "Every"
+persist_value = 6
 
 [delay_config]
 delay_type = "File"

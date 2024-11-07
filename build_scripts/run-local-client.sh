@@ -3,8 +3,8 @@ usage="Usage: run-local-client.sh first_clients_server_id second_clients_server_
 
 server_id=$1
 client1_config_path="./client-${server_id}-config.toml"
-run_id=$(date +%s%N)
-mkdir -p "../logs/run-${run_id}"
-client1_log_path="../logs/run-${run_id}/client-${server_id}.log"
+local_experiment_dir="../benchmarks/logs/local-experiments"
+mkdir -p "${local_experiment_dir}"
+client1_log_path="${local_experiment_dir}/client-${server_id}.json"
 
 RUST_LOG=warn CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../Cargo.toml" --bin client 1> "$client1_log_path"

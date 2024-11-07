@@ -35,6 +35,8 @@ class MetronomeCluster:
         instance_config: InstanceConfig
         total_requests: int
         num_parallel_requests: int
+        summary_filepath: str
+        debug_filepath: str
         rust_log: str="warn"
 
     @dataclass
@@ -137,33 +139,24 @@ class MetronomeCluster:
         self.stop_servers()
         self._gcp_cluster.shutdown_instances(instance_names)
 
-    def get_logs(self, dest_directory: Path, file_prefix: str):
+    def get_logs(self, dest_directory: Path):
         create_directories(dest_directory)
+        instance_results_dir = "./results"
         processes = []
         for config in self._server_configs.values():
             name = config.instance_config.name
-            # Get logs
-            log_src_path = f"~/server-{config.server_id}.json"
-            log_dest_path = f"{dest_directory}/{file_prefix}_server-{config.server_id}.json"
-            scp_process = self._gcp_cluster.scp_command(name, log_src_path, log_dest_path)
-            processes.append(scp_process)
-            # Get stderr
-            err_src_path = f"~/server-{config.server_id}-err.log"
-            err_dest_path = f"{dest_directory}/xerr-{file_prefix}_server-{config.server_id}.log"
-            scp_process = self._gcp_cluster.scp_command(name, err_src_path, err_dest_path)
+            scp_process = self._gcp_cluster.scp_command(name, instance_results_dir, dest_directory)
             processes.append(scp_process)
         for config in self._client_configs.values():
             name = config.instance_config.name
-            log_src_path = f"~/client-{config.client_id}.json"
-            log_dest_path = f"{dest_directory}/{file_prefix}_client-{config.client_id}.json"
-            scp_process = self._gcp_cluster.scp_command(name, log_src_path, log_dest_path)
+            scp_process = self._gcp_cluster.scp_command(name, instance_results_dir, dest_directory)
             processes.append(scp_process)
-        total_logs = 0
+        successes = 0
         for process in processes:
             process.wait()
             if process.returncode == 0:
-                total_logs += 1
-        print(f"Collected {total_logs} logs")
+                successes += 1
+        print(f"Collected logs from {successes} instances")
 
     def change_cluster_config(
         self,
@@ -274,6 +267,8 @@ class MetronomeClusterBuilder:
             instance_config,
             total_requests=total_requests,
             num_parallel_requests=num_parallel_requests,
+            summary_filepath=f"client-{nearest_server}.json",
+            debug_filepath=f"client-{nearest_server}.csv",
             rust_log=rust_log,
         )
         self._client_configs[nearest_server] = client_config
@@ -322,6 +317,7 @@ class MetronomeClusterBuilder:
             self.name,
             sorted(self._server_configs.keys()),
             use_metronome=self._use_metronome,
+            metronome_quorum_size=self._metronome_quorum_size,
             initial_leader=self._initial_leader,
         )
         return MetronomeCluster(self._project_id, self._credentials_file, cluster_config, self._server_configs, self._client_configs)
@@ -352,23 +348,27 @@ def start_server_command(
     user = "kevin"
     container_name = "server"
     container_image_location = "my-project-1499979282244/metronome_server"
-    logs_location = f"/home/{user}/server-{config.server_id}.json"
-    err_location = f"/home/{user}/server-{config.server_id}-err.log"
-    config_location = f"/home/{user}/server-config.toml"
+    instance_config_location = "~/server-config.toml"
+    container_config_location = f"/home/{user}/server-config.toml"
+    instance_output_dir = "./results"
+    container_output_dir = "/app"
+    instance_err_location = f"{instance_output_dir}/xerr-server-{config.server_id}.log"
+    instance_logs_location = f"{instance_output_dir}/server-{config.server_id}.json"
     server_config = _generate_server_config(cluster_config, config)
-    rust_log = config.rust_log
+
 
     kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
-    gen_config_command = f"echo -e '{server_config}' > {config_location}"
+    gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
         --name {container_name} \\
         -p 800{config.server_id}:800{config.server_id} \\
-        --env RUST_LOG={rust_log} \\
-        --env CONFIG_FILE="{config_location}" \\
-        -v {config_location}:{config_location} \\
+        --env RUST_LOG={config.rust_log} \\
+        --env CONFIG_FILE="{container_config_location}" \\
+        -v {instance_config_location}:{container_config_location} \\
+        -v {instance_output_dir}:{container_output_dir} \\
         --rm \\
         "gcr.io/{container_image_location}" \\
-        1> {logs_location} 2> {err_location}"""
+        1> {instance_logs_location} 2> {instance_err_location}"""
     # NOTE: We sleep here to ensure we don't connect to currently shutting
     # down servers.
     return f"{kill_prev_container_command} ; sleep 1 ; {gen_config_command} && {docker_command}"
@@ -430,7 +430,7 @@ sudo usermod -aG docker {user}
 # Pull the container as user
 sudo -u {user} docker pull "gcr.io/{container_image_location}"
 """
- 
+
 def start_client_command(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
@@ -438,19 +438,22 @@ def start_client_command(
     user = "kevin"
     container_name = "client"
     container_image_location = "my-project-1499979282244/metronome_client"
-    config_location = f"/home/{user}/client-config.toml"
-    logs_location = f"/home/{user}/client-{config.client_id}.json"
+    instance_config_location = "~/client-config.toml"
+    container_config_location = f"/home/{user}/client-config.toml"
+    instance_output_dir = "./results"
+    container_output_dir = "/app"
     client_config = _generate_client_config(cluster_config, config)
 
     kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
-    gen_config_command = f"echo -e '{client_config}' > {config_location}"
+    gen_config_command = f"echo -e '{client_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
     --name={container_name} \\
     --rm \\
     --env RUST_LOG={config.rust_log} \\
-    --env CONFIG_FILE={config_location} \\
-    -v {config_location}:{config_location} \\
-    gcr.io/{container_image_location} > {logs_location}"""
+    --env CONFIG_FILE={container_config_location} \\
+    -v {instance_config_location}:{container_config_location} \\
+    -v {instance_output_dir}:{container_output_dir} \\
+    gcr.io/{container_image_location}"""
     # NOTE: We sleep here to ensure we don't connect to currently shutting down servers.
     return f"{kill_prev_container_command} ; sleep 1 ; {gen_config_command} && {docker_command}"
 
@@ -458,18 +461,13 @@ def _generate_client_config(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
 ) -> str:
-    use_metronome_toml = f"use_metronome = {cluster_config.use_metronome}" if cluster_config.use_metronome is not None else ""
-    metronome_quorum_toml = f"metronome_quorum_size = {cluster_config.metronome_quorum_size}" if cluster_config.metronome_quorum_size is not None else ""
-    flex_quorum_toml = f"flexible_quorum = {{ read_quorum_size = {cluster_config.flexible_quorum[0]}, write_quorum_size = {cluster_config.flexible_quorum[1]} }}" if cluster_config.flexible_quorum is not None else ""
     toml = f"""
 cluster_name = \\"{cluster_config.name}\\"
 location = \\"{config.instance_config.zone}\\"
 server_id = {config.client_id}
 total_requests = {config.total_requests}
 num_parallel_requests = {config.num_parallel_requests}
-nodes = {cluster_config.nodes}
-{use_metronome_toml}
-{metronome_quorum_toml}
-{flex_quorum_toml}
+summary_filepath = \\"{config.summary_filepath}\\"
+debug_filepath = \\"{config.debug_filepath}\\"
 """
     return toml.strip().replace("\n", "\\n")
