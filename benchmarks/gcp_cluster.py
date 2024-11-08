@@ -98,7 +98,7 @@ Run: gcloud dns managed-zones create internal-network \\
         instance = self.instances[instance_name]
         name = instance.name
         zone = instance.zone
-        gcloud_command = f"gcloud compute scp --zone={zone} --tunnel-through-iap --project={self.project_id} {name}:{src_dir}/* {dest_dir}"
+        gcloud_command = f"gcloud compute scp --zone={zone} --tunnel-through-iap --project={self.project_id} --compress {name}:{src_dir}/* {dest_dir}"
         p = subprocess.Popen(gcloud_command, shell=True)
         return p
 

@@ -4,8 +4,9 @@ from metronome_cluster import MetronomeCluster, MetronomeClusterBuilder
 
 
 def closed_loop_experiment(cluster_size: int, total_messages: int, number_of_clients: int, persist_config: MetronomeCluster.PersistConfig=MetronomeCluster.PersistConfig.Individual()):
-    experiment_log_dir = Path(f"./logs/closed-loop-experiments-{persist_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients-metronome-quorum-4")
+    experiment_log_dir = Path(f"./logs/closed-loop-experiments-{persist_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
     print(f"RUNNING CLOSED LOOP EXPERIMENT: {cluster_size=}, {total_messages=}, {number_of_clients=}")
+    print(experiment_log_dir)
 
     # Create cluster instances
     cluster_name = f"cluster-{cluster_size}-1"
@@ -15,6 +16,7 @@ def closed_loop_experiment(cluster_size: int, total_messages: int, number_of_cli
             i,
             "us-central1-a",
             persist_config=persist_config,
+            instrumentation=True,
             rust_log="warn",
         )
     cluster = cluster.add_client(1,
@@ -24,10 +26,10 @@ def closed_loop_experiment(cluster_size: int, total_messages: int, number_of_cli
         rust_log="warn",
     ).build()
     print("Waiting for instances to be ssh-able...")
-    time.sleep(30)
+    time.sleep(1)
 
     # Run experiments
-    for data_size in [0, 4096, 1048*500]:
+    for data_size in [256, 4096, 1048*500]:
         for use_metronome in [0, 2]:
             print(f"{use_metronome=}, {data_size=}")
             for server_id in range(1, cluster_size + 1):
@@ -39,7 +41,7 @@ def closed_loop_experiment(cluster_size: int, total_messages: int, number_of_cli
             cluster.await_servers()
             iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{use_metronome}-datasize-{data_size}")
             cluster.get_logs(iteration_directory)
-    cluster.shutdown()
+    # cluster.shutdown()
 
 def closed_loop_experiment_sleep(cluster_size: int, total_messages: int, number_of_clients: int):
     experiment_log_dir = Path(f"./logs/closed-loop-experiments-sleep-Individual/{cluster_size}-node-cluster-{number_of_clients}-clients")
@@ -122,7 +124,9 @@ def closed_loop_experiment_sleep(cluster_size: int, total_messages: int, number_
 
 
 def main():
-    closed_loop_experiment(5, 1000, 20)
+    persist_config = MetronomeCluster.PersistConfig.Every(30)
+    closed_loop_experiment(5, 9990, 100, persist_config=persist_config)
+    # closed_loop_experiment(5, 10000, 100)
     # closed_loop_experiment_sleep(5, 1000, 10)
     # metronome_size_experiment(7, 1000, 1, persist_config)
     pass

@@ -27,6 +27,7 @@ class MetronomeCluster:
         instance_config: InstanceConfig
         persist_config: 'MetronomeCluster.PersistConfig'
         delay_config: 'MetronomeCluster.DelayConfig'
+        instrumentation: bool
         rust_log: str="warn"
 
     @dataclass
@@ -71,7 +72,7 @@ class MetronomeCluster:
 
         def to_label(self) -> str:
             if self.persist_type == "Every":
-                return f"Every({self.persist_value})"
+                return f"Every{self.persist_value}"
             else:
                 return f"{self.persist_type}"
 
@@ -218,6 +219,7 @@ class MetronomeClusterBuilder:
         machine_type: str = "e2-standard-8",
         persist_config: MetronomeCluster.PersistConfig = MetronomeCluster.PersistConfig.NoPersist(),
         delay_config: MetronomeCluster.DelayConfig = MetronomeCluster.DelayConfig.Sleep(0),
+        instrumentation: bool=False,
         rust_log: str="warn"
     ):
         assert server_id > 0
@@ -239,6 +241,7 @@ class MetronomeClusterBuilder:
             instance_config,
             persist_config=persist_config,
             delay_config=delay_config,
+            instrumentation=instrumentation,
             rust_log=rust_log,
         )
         self._server_configs[server_id] = server_config
@@ -386,6 +389,7 @@ def _generate_server_config(
     toml = f"""
 cluster_name = \\"{cluster_config.name}\\"
 location = \\"{config.instance_config.zone}\\"
+instrumentation = {str(config.instrumentation).lower()}
 {init_leader_toml}
 
 [persist_config]
