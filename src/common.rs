@@ -48,12 +48,12 @@ pub mod messages {
         pub metronome_quorum_size: Option<usize>,
         pub persist_info: PersistInfo,
         pub delay_info: DelayInfo,
+        pub instrumented: bool,
     }
 
     impl From<OmniPaxosServerConfig> for MetronomeConfigInfo {
         fn from(value: OmniPaxosServerConfig) -> Self {
             let persist_info = match value.persist_config {
-                PersistConfig::NoPersist => PersistInfo::NoPersist,
                 PersistConfig::Individual => PersistInfo::Individual,
                 PersistConfig::Every(n) => PersistInfo::Every(n),
                 PersistConfig::Opportunistic => PersistInfo::Opportunistic,
@@ -68,13 +68,13 @@ pub mod messages {
                 metronome_quorum_size: value.cluster_config.metronome_quorum_size,
                 persist_info,
                 delay_info,
+                instrumented: value.instrumentation,
             }
         }
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
     pub enum PersistInfo {
-        NoPersist,
         Individual,
         Every(usize),
         Opportunistic,
@@ -99,6 +99,7 @@ pub mod configs {
         pub local_deployment: Option<bool>,
         pub persist_config: PersistConfig,
         pub delay_config: DelayConfig,
+        pub instrumentation: bool,
         pub server_config: ServerConfig,
         pub cluster_config: ClusterConfig,
     }
@@ -113,7 +114,6 @@ pub mod configs {
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
     #[serde(tag = "persist_type", content = "persist_value")]
     pub enum PersistConfig {
-        NoPersist,
         Individual,
         Every(usize),
         Opportunistic,
