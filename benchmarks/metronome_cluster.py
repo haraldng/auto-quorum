@@ -1,4 +1,5 @@
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -8,9 +9,11 @@ from gcp_cluster import GcpCluster, InstanceConfig
 def create_directories(directory: Path):
     subprocess.run(["mkdir", "-p", directory])
 
+
 class MetronomeCluster:
     _server_processes: dict[int, subprocess.Popen]
     _client_processes: dict[int, subprocess.Popen]
+    STDERR_INSTANCE_LOOKUP_FAILURE: str = "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4047: 'Failed to lookup instance'].\n"
 
     @dataclass
     class ClusterConfig:
@@ -28,17 +31,29 @@ class MetronomeCluster:
         persist_config: 'MetronomeCluster.PersistConfig'
         delay_config: 'MetronomeCluster.DelayConfig'
         instrumentation: bool
-        rust_log: str="warn"
+        rust_log: str="info"
 
     @dataclass
     class ClientConfig:
         client_id: int
         instance_config: InstanceConfig
-        total_requests: int
+        end_condition: 'MetronomeCluster.EndConditionConfig'
         num_parallel_requests: int
         summary_filepath: str
         debug_filepath: str
-        rust_log: str="warn"
+        rust_log: str="info"
+
+    @dataclass
+    class EndConditionConfig:
+        end_condition_type: str
+        end_condition_value: int
+
+        @staticmethod
+        def ResponsesCollected(response_limit: int):
+            return MetronomeCluster.EndConditionConfig(end_condition_type="ResponsesCollected", end_condition_value=response_limit)
+        @staticmethod
+        def SecondsPassed(seconds: int):
+            return MetronomeCluster.EndConditionConfig(end_condition_type="SecondsPassed", end_condition_value=seconds)
 
     @dataclass
     class DelayConfig:
@@ -76,7 +91,7 @@ class MetronomeCluster:
             else:
                 return f"{self.persist_type}"
 
-    def __init__(self, project_id: str, credentials_file: str, cluster_config: ClusterConfig, server_configs: dict[int, ServerConfig], client_configs: dict[int, ClientConfig]):
+    def __init__(self, project_id: str, cluster_config: ClusterConfig, server_configs: dict[int, ServerConfig], client_configs: dict[int, ClientConfig]):
         self._server_configs = server_configs
         self._server_processes = {}
         self._client_processes = {}
@@ -84,7 +99,7 @@ class MetronomeCluster:
         self._cluster_config = cluster_config
         instance_configs = [c.instance_config for c in server_configs.values()]
         instance_configs.extend([c.instance_config for c in client_configs.values()])
-        self._gcp_cluster = GcpCluster(project_id, credentials_file, instance_configs)
+        self._gcp_cluster = GcpCluster(project_id, instance_configs)
 
     def start_servers(self):
         print("Starting servers")
@@ -111,7 +126,7 @@ class MetronomeCluster:
     def stop_servers(self):
         for server_id in self._server_configs.keys():
             self.stop_server(server_id)
-    
+
     def await_servers(self):
         print(f"Awaiting servers...")
         for server_process in self._server_processes.values():
@@ -127,11 +142,41 @@ class MetronomeCluster:
         client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command)
         self._client_processes[id] = client_process
 
-    def await_client(self, id: int):
-        print(f"Awaiting client {id}...")
-        client_process = self._client_processes.get(id)
-        assert client_process is not None, f"Client process {id} doesn't exist"
-        client_process.wait(timeout=600)
+    # Wait for cluster processes to finish. Retry mechanism if process failed due to SSH failure
+    def await_cluster(self):
+        print(f"Awaiting client...")
+        assert len(self._client_processes) > 0, "Need a client to exist to await on cluster"
+        tries = 0
+        while True:
+            client_id, client_process = self._client_processes.popitem()
+            assert client_process.stderr is not None, "Client processes should capture stderr"
+
+            # Capture and print client process stderr
+            ssh_err = False
+            for line in iter(client_process.stderr.readline, ""):
+                if line == self.STDERR_INSTANCE_LOOKUP_FAILURE:
+                    ssh_err = True
+                    print(line, end="")
+                    break
+                print(line, end="")
+            client_process.stderr.close()
+            client_process.wait()
+
+            # Retry cluster processes if client failed due to ssh instance lookup error
+            if ssh_err and tries < 3:
+                print(f"Retrying client and server SSH connections")
+                time.sleep(3)
+                tries += 1
+                self.start_servers()
+                self.start_client(client_id)
+            else:
+                break
+        if ssh_err:
+            print("Failed SSH 3 times")
+            self.stop_servers()
+        else:
+            self.await_servers()
+            print("Cluster finished")
 
     def shutdown(self):
         instance_names = [c.instance_config.name for c in self._server_configs.values()]
@@ -189,28 +234,29 @@ class MetronomeCluster:
     def change_client_config(
         self,
         client_id: int,
-        total_requests: Optional[int] = None,
+        end_condition: Optional[EndConditionConfig] = None,
         num_parallel_requests: Optional[int] = None,
         rust_log: Optional[str]=None,
     ):
-        if total_requests is not None:
-            self._client_configs[client_id].total_requests = total_requests
+        if end_condition is not None:
+            self._client_configs[client_id].end_condition = end_condition
         if num_parallel_requests is not None:
             self._client_configs[client_id].num_parallel_requests = num_parallel_requests
         if rust_log is not None:
             self._client_configs[client_id].rust_log = rust_log
 
 class MetronomeClusterBuilder:
-    def __init__(self, name:str, project_id: str = "my-project-1499979282244", credentials_file: str = "service-account-key.json") -> None:
+    def __init__(self, name:str, project_id: str = "my-project-1499979282244") -> None:
         self.name = name
         self._project_id = project_id
-        self._credentials_file = credentials_file
+        self._service_account = f"deployment@{project_id}.iam.gserviceaccount.com"
         self._server_configs: dict[int, MetronomeCluster.ServerConfig] = {}
         self._client_configs: dict[int, MetronomeCluster.ClientConfig] = {}
         self._use_metronome: Optional[int] = None
         self._metronome_quorum_size: Optional[int] = None
         self._flexible_quorum: Optional[tuple[int, int]] = None
         self._initial_leader: Optional[int] = None
+        self._gcloud_ssh_user = GcpCluster.get_oslogin_username()
 
     def add_server(
         self,
@@ -232,9 +278,10 @@ class MetronomeClusterBuilder:
             f"{self.name}-server-{server_id}",
             zone,
             machine_type,
-            server_startup_script(),
+            server_startup_script(self._gcloud_ssh_user),
             firewall_tag="omnipaxos-server",
             dns_name=f"{self.name}-server-{server_id}",
+            service_account=self._service_account,
         )
         server_config = MetronomeCluster.ServerConfig(
             server_id,
@@ -251,7 +298,7 @@ class MetronomeClusterBuilder:
         self,
         nearest_server: int,
         zone: str,
-        total_requests: int,
+        end_condition: MetronomeCluster.EndConditionConfig,
         num_parallel_requests: int,
         machine_type: str = "e2-standard-4",
         rust_log: str="warn"
@@ -263,12 +310,13 @@ class MetronomeClusterBuilder:
             f"{self.name}-client-{nearest_server}",
             zone,
             machine_type,
-            client_startup_script(),
+            client_startup_script(self._gcloud_ssh_user),
+            service_account=self._service_account,
         )
         client_config = MetronomeCluster.ClientConfig(
             nearest_server,
             instance_config,
-            total_requests=total_requests,
+            end_condition=end_condition,
             num_parallel_requests=num_parallel_requests,
             summary_filepath=f"client-{nearest_server}.json",
             debug_filepath=f"client-{nearest_server}.csv",
@@ -298,8 +346,9 @@ class MetronomeClusterBuilder:
         return self
 
     def build(self) -> MetronomeCluster:
+        # TODO: Validate that config won't cause deadlock due to parallel requests not reaching server batch io size
         # Validate config
-        for (client_id, _config) in self._client_configs.items():
+        for (client_id, config) in self._client_configs.items():
             assert client_id in self._server_configs.keys(), f"Client {client_id} has no server to connect to"
         assert self._initial_leader in self._server_configs.keys()
         if self._flexible_quorum is not None:
@@ -323,16 +372,16 @@ class MetronomeClusterBuilder:
             metronome_quorum_size=self._metronome_quorum_size,
             initial_leader=self._initial_leader,
         )
-        return MetronomeCluster(self._project_id, self._credentials_file, cluster_config, self._server_configs, self._client_configs)
+        return MetronomeCluster(self._project_id, cluster_config, self._server_configs, self._client_configs)
 
 
-# TODO: GCP creates the user for us (in my case as "kevin") unless we do something like this: https://cloud.google.com/compute/docs/instances/ssh#third-party-tools
-def server_startup_script() -> str:
-    user = "kevin"
+def server_startup_script(user: str) -> str:
     container_image_location = "my-project-1499979282244/metronome_server"
     return f"""#! /bin/bash
-# Create deployment user
-sudo useradd -m "{user}"
+# Ensure OS login user is setup
+useradd -m {user}
+mkdir -p /home/{user}
+chown {user}:{user} /home/{user}
 
 # Configure Docker credentials for the user
 sudo -u {user} docker-credential-gcr configure-docker --registries=gcr.io
@@ -348,11 +397,10 @@ def start_server_command(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ServerConfig,
 ) -> str:
-    user = "kevin"
     container_name = "server"
     container_image_location = "my-project-1499979282244/metronome_server"
     instance_config_location = "~/server-config.toml"
-    container_config_location = f"/home/{user}/server-config.toml"
+    container_config_location = f"/home/$(whoami)/server-config.toml"
     instance_output_dir = "./results"
     container_output_dir = "/app"
     instance_err_location = f"{instance_output_dir}/xerr-server-{config.server_id}.log"
@@ -360,6 +408,7 @@ def start_server_command(
     server_config = _generate_server_config(cluster_config, config)
 
 
+    pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
     kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
     gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
@@ -372,9 +421,8 @@ def start_server_command(
         --rm \\
         "gcr.io/{container_image_location}" \\
         1> {instance_logs_location} 2> {instance_err_location}"""
-    # NOTE: We sleep here to ensure we don't connect to currently shutting
-    # down servers.
-    return f"{kill_prev_container_command} ; sleep 1 ; {gen_config_command} && {docker_command}"
+    # NOTE: We sleep here to help avoid connecting to currently shutting down servers.
+    return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
 
 def _generate_server_config(
     cluster_config: MetronomeCluster.ClusterConfig,
@@ -387,17 +435,17 @@ def _generate_server_config(
     init_leader_toml = f"initial_leader = {cluster_config.initial_leader}" if cluster_config.initial_leader is not None else ""
 
     toml = f"""
-cluster_name = \\"{cluster_config.name}\\"
-location = \\"{config.instance_config.zone}\\"
+cluster_name = "{cluster_config.name}"
+location = "{config.instance_config.zone}"
 instrumentation = {str(config.instrumentation).lower()}
 {init_leader_toml}
 
 [persist_config]
-persist_type = \\"{config.persist_config.persist_type}\\"
+persist_type = "{config.persist_config.persist_type}"
 {persist_value_toml}
 
 [delay_config]
-delay_type = \\"{config.delay_config.delay_type}\\"
+delay_type = "{config.delay_config.delay_type}"
 delay_value = {config.delay_config.delay_value}
 
 [cluster_config]
@@ -414,16 +462,16 @@ resend_message_tick_timeout = 5
 flush_batch_tick_timeout = 200
 batch_size = 1
 """
-    return toml.strip().replace("\n", "\\n")
+    return toml
 
 
-# TODO: GCP creates the user for us (in my case as "kevin") unless we do something like this: https://cloud.google.com/compute/docs/instances/ssh#third-party-tools
-def client_startup_script() -> str:
-    user = "kevin"
+def client_startup_script(user: str) -> str:
     container_image_location = "my-project-1499979282244/metronome_client"
     return f"""#! /bin/bash
-# Create deployment user
-sudo useradd -m "{user}"
+# Ensure OS login user is setup
+useradd -m {user}
+mkdir -p /home/{user}
+chown {user}:{user} /home/{user}
 
 # Configure Docker credentials for the user
 sudo -u {user} docker-credential-gcr configure-docker --registries=gcr.io
@@ -439,15 +487,15 @@ def start_client_command(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
 ) -> str:
-    user = "kevin"
     container_name = "client"
     container_image_location = "my-project-1499979282244/metronome_client"
     instance_config_location = "~/client-config.toml"
-    container_config_location = f"/home/{user}/client-config.toml"
+    container_config_location = f"/home/$(whoami)/client-config.toml"
     instance_output_dir = "./results"
     container_output_dir = "/app"
     client_config = _generate_client_config(cluster_config, config)
 
+    pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
     kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
     gen_config_command = f"echo -e '{client_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
@@ -458,20 +506,23 @@ def start_client_command(
     -v {instance_config_location}:{container_config_location} \\
     -v {instance_output_dir}:{container_output_dir} \\
     gcr.io/{container_image_location}"""
-    # NOTE: We sleep here to ensure we don't connect to currently shutting down servers.
-    return f"{kill_prev_container_command} ; sleep 1 ; {gen_config_command} && {docker_command}"
+    # NOTE: We sleep here to help avoid connecting to currently shutting down servers.
+    return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
 
 def _generate_client_config(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
 ) -> str:
     toml = f"""
-cluster_name = \\"{cluster_config.name}\\"
-location = \\"{config.instance_config.zone}\\"
+cluster_name = "{cluster_config.name}"
+location = "{config.instance_config.zone}"
 server_id = {config.client_id}
-total_requests = {config.total_requests}
 num_parallel_requests = {config.num_parallel_requests}
-summary_filepath = \\"{config.summary_filepath}\\"
-debug_filepath = \\"{config.debug_filepath}\\"
+summary_filepath = "{config.summary_filepath}"
+debug_filepath = "{config.debug_filepath}"
+
+[end_condition]
+end_condition_type = "{config.end_condition.end_condition_type}"
+end_condition_value = {config.end_condition.end_condition_value}
 """
-    return toml.strip().replace("\n", "\\n")
+    return toml

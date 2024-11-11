@@ -2,21 +2,20 @@ from pathlib import Path
 from typing import Optional
 import subprocess
 
-from google.oauth2 import service_account
-# import google.auth.transport.requests
 from google.cloud import compute_v1
 from google.cloud import dns
 from google.cloud.compute_v1 import DeleteInstanceRequest, InsertInstanceRequest, types
 from google.api_core.extended_operation import ExtendedOperation
 
 class InstanceConfig:
-    def __init__(self, name: str, zone: str, machine_type: str, startup_script: str, firewall_tag: Optional[str]=None, dns_name: Optional[str]=None) -> None:
+    def __init__(self, name: str, zone: str, machine_type: str, startup_script: str, firewall_tag: Optional[str]=None, dns_name: Optional[str]=None, service_account: Optional[str]=None) -> None:
         self.name = name
         self.zone = zone
         self.machine_type = machine_type
         self.startup_script = startup_script
         self.firewall_tag = firewall_tag
         self.dns_name = dns_name
+        self.service_account = service_account
         self._recreate = False
 
     def matches_instance(self, instance: compute_v1.Instance) -> bool:
@@ -32,6 +31,10 @@ class InstanceConfig:
         # TODO: detect change in dns name?
         return True
 
+# NOTE: Relies on gcloud to handle GCP credentials. Application Default Credentials are used when creating instances and gcloud's credentials are used for ssh
+# To set gcloud credentials run `gcloud auth login`
+# To set Application Default Credentials run `gcloud auth application-default login`
+# Additionally make sure gcloud's project is set correctly with `gcloud config get-value project` and `$ gcloud config set project <project-id-here>`
 # The best resource I found for the GCP python client API are the samples here: https://github.com/GoogleCloudPlatform/python-docs-samples/tree/main/compute
 # Manages a cluster of GCP instances.
 # Assumes a VPC network internal.zone. is created
@@ -44,22 +47,13 @@ Run: gcloud dns managed-zones create internal-network \\
         --description="Private DNS zone for VPC" \\
         --networks=default"""
 
-    def __init__(self, project_id: str, credentials_file: str, instance_configs: list[InstanceConfig]) -> None:
+    def __init__(self, project_id: str, instance_configs: list[InstanceConfig]) -> None:
         new_instance_configs = {config.name: config for config in instance_configs}
         assert len(instance_configs) == len(new_instance_configs), "Instances must have unique names"
-
-        print("Authenticating...")
-        credentials = service_account.Credentials.from_service_account_file(
-                credentials_file,
-                scopes=['https://www.googleapis.com/auth/cloud-platform']
-                )
         self.project_id = project_id
-        self.service_account_key = credentials_file
-        self.service_account_mail = credentials.service_account_email
-        self.instances_client = compute_v1.InstancesClient(credentials=credentials)
-        self.dns_client = None # Only create DNS client when it need to be used
+        self.instances_client = compute_v1.InstancesClient()
+        self.dns_client = None # Only create DNS client when it needs to be used
 
-        # TODO: Possible for a running instance to not have been assigned a DNS address
         # Get already running instances
         self.instances = self._get_running_instances()
         print(f"Running instances: {list(self.instances.keys())}")
@@ -82,25 +76,41 @@ Run: gcloud dns managed-zones create internal-network \\
 
         self._create_instances(instances_to_create)
 
-    # TODO: Check if ssh without IAP tunnel (os login?) can be started faster
+    # TODO: Check if ssh without IAP tunnel can be started faster
     # NOTE: It can take a good 60sec before IAP registers newly started instance
+    # gcloud compute ssh will use the user returned by `get_os_username` since OS login in enabled for created instances. See: https://cloud.google.com/compute/docs/instances/ssh#gcloud
     def ssh_command(self, instance_name: str, command: str) -> subprocess.Popen:
         instance = self.instances[instance_name]
         name = instance.name
         zone = instance.zone
-        gcloud_command = f"gcloud compute ssh {name} --zone={zone} --tunnel-through-iap --project={self.project_id} --command=\"{command}\""
-        p = subprocess.Popen(gcloud_command, shell=True)
-        return p
+        gcloud_command = ["gcloud", "compute", "ssh", name, "--zone", zone, "--tunnel-through-iap", "--project", self.project_id, "--command", command]
+        return subprocess.Popen(gcloud_command, shell=False, stderr=subprocess.PIPE, text=True)
 
-    # TODO: Check if ssh without IAP tunnel (os login?) can be started faster
+    # TODO: Check if ssh without IAP tunnel can be started faster
     # NOTE: It can take a good 60sec before IAP registers newly started instance
+    # gcloud compute scp will use the user returned by `get_os_username` since OS login is enabled for created instances. See: https://cloud.google.com/compute/docs/instances/ssh#gcloud
     def scp_command(self, instance_name: str, src_dir: str, dest_dir: Path) -> subprocess.Popen:
         instance = self.instances[instance_name]
         name = instance.name
         zone = instance.zone
-        gcloud_command = f"gcloud compute scp --zone={zone} --tunnel-through-iap --project={self.project_id} --compress {name}:{src_dir}/* {dest_dir}"
-        p = subprocess.Popen(gcloud_command, shell=True)
+        gcloud_command = ["gcloud", "compute", "scp", "--zone", zone, "--tunnel-through-iap", "--project", self.project_id, "--compress",  f"{name}:{src_dir}/*", dest_dir]
+        p = subprocess.Popen(gcloud_command, shell=False)
         return p
+
+    @staticmethod
+    def get_oslogin_username() -> str:
+        get_username_process = subprocess.run(
+            ["gcloud", "compute", "os-login", "describe-profile", "--format=value(posixAccounts[0].username)"],
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        username = get_username_process.stdout.strip()
+        if get_username_process.returncode != 0 or not username:
+            raise ValueError(f"Couldn't find gcloud os-login username. Configure gcloud credentials with `gcloud auth login`\n{get_username_process.stderr}")
+        else:
+            return username
 
     # Shutdown all currently running instances
     def shutdown(self):
@@ -193,10 +203,16 @@ Run: gcloud dns managed-zones create internal-network \\
             )
         metadata = types.Metadata(
             # Create with startup script
-            items=[{
-                "key":"startup-script",
-                "value":instance_config.startup_script,
-                }]
+            items=[
+                {
+                    "key":"startup-script",
+                    "value":instance_config.startup_script,
+                },
+                {
+                    "key":"enable-oslogin",
+                    "value":"TRUE"
+                },
+            ]
             # # Create as a kubernetes cluster
             # items=[{
             #     "key":"gce-container-declaration",
@@ -210,10 +226,10 @@ Run: gcloud dns managed-zones create internal-network \\
         #         provisioning_model=compute_v1.Scheduling.ProvisioningModel.SPOT.name,
         #         instance_termination_action="STOP"
         #         )
-        os_service_account = types.ServiceAccount(
-            email=self.service_account_mail,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
+        os_service_accounts = [types.ServiceAccount(
+            email=instance_config.service_account,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )] if instance_config.service_account else None
         request = types.InsertInstanceRequest(
                 project=self.project_id,
                 zone=instance_config.zone,
@@ -225,7 +241,7 @@ Run: gcloud dns managed-zones create internal-network \\
                     disks=[os_disk],
                     network_interfaces=[network_interface],
                     metadata=metadata,
-                    service_accounts=[os_service_account],
+                    service_accounts=os_service_accounts,
                     ),
                 )
         return request
@@ -278,11 +294,7 @@ Run: gcloud dns managed-zones create internal-network \\
         changes.create(client=self.dns_client)
 
     def _create_dns_client(self) -> None:
-        credentials = service_account.Credentials.from_service_account_file(
-                self.service_account_key,
-                scopes=['https://www.googleapis.com/auth/cloud-platform']
-                )
-        self.dns_client = dns.Client(project=self.project_id, credentials=credentials)
+        self.dns_client = dns.Client(project=self.project_id)
         self.managed_zone = self.dns_client.zone(
             name="internal-network",
             dns_name="internal.zone.",
