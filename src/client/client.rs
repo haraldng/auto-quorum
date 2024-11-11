@@ -5,7 +5,7 @@ use csv::Writer;
 use futures::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
@@ -13,21 +13,46 @@ pub struct ClientConfig {
     pub location: String,
     pub server_id: NodeId,
     pub local_deployment: Option<bool>,
-    pub total_requests: Option<usize>,
-    pub num_parallel_requests: Option<usize>,
+    pub end_condition: EndConditionConfig,
+    pub num_parallel_requests: usize,
     pub summary_filepath: String,
     pub debug_filepath: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(tag = "end_condition_type", content = "end_condition_value")]
+pub enum EndConditionConfig {
+    ResponsesCollected(usize),
+    SecondsPassed(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EndCondition {
+    ResponsesCollected(usize),
+    TimePassed(Duration),
+}
+
+impl From<EndConditionConfig> for EndCondition {
+    fn from(config: EndConditionConfig) -> Self {
+        match config {
+            EndConditionConfig::ResponsesCollected(n) => EndCondition::ResponsesCollected(n),
+            EndConditionConfig::SecondsPassed(secs) => {
+                EndCondition::TimePassed(Duration::from_secs(secs))
+            }
+        }
+    }
+}
+
+type Timestamp = i64;
+
 pub struct Client {
-    total_requests: usize,
+    end_condition: EndCondition,
     num_parallel_requests: usize,
     network: Network,
-    request_data: Vec<(CommandId, i64)>,
-    response_data: Vec<(CommandId, i64)>,
+    response_data: Vec<ResponseData>,
     config: ClientConfig,
     leaders_config: Option<MetronomeConfigInfo>,
-    client_start_time: Option<i64>,
+    client_start_time: Option<Timestamp>,
 }
 
 impl Client {
@@ -39,18 +64,15 @@ impl Client {
             local_deployment,
         )
         .await;
-        let total_requests = config
-            .total_requests
-            .expect("Config field total_requests must be set");
-        let num_parallel_requests = config
-            .num_parallel_requests
-            .expect("Config field num_parallel_requests must be set");
+        let num_estimated_responses = match config.end_condition {
+            EndConditionConfig::ResponsesCollected(n) => n,
+            EndConditionConfig::SecondsPassed(_secs) => 10_000,
+        };
         Client {
-            total_requests,
-            num_parallel_requests,
+            end_condition: config.end_condition.into(),
+            num_parallel_requests: config.num_parallel_requests,
             network,
-            request_data: Vec::with_capacity(total_requests),
-            response_data: Vec::with_capacity(total_requests),
+            response_data: Vec::with_capacity(num_estimated_responses),
             config,
             leaders_config: None,
             client_start_time: None,
@@ -61,9 +83,11 @@ impl Client {
         // Wait until server is ready
         let first_msg = self.network.next().await;
         match first_msg {
-            Some(ServerMessage::Ready(server_config)) => self.leaders_config = Some(server_config),
+            Some(ServerMessage::Ready(server_config)) => {
+                self.leaders_config = Some(server_config);
+            }
             Some(m) => panic!("Recieved unexpected message during handshake: {m:?}"),
-            None => panic!("Lost connection to server"),
+            None => panic!("Lost connection to server during handshake"),
         }
 
         // Send initial requests
@@ -72,7 +96,21 @@ impl Client {
             self.send_request(request_id);
         }
 
-        // Send new requests on reponse until total requests reached
+        // Send requests and collect responses
+        match self.end_condition {
+            EndCondition::ResponsesCollected(n) => self.run_until_response_limit(n).await,
+            EndCondition::TimePassed(t) => self.run_until_duration_limit(t).await,
+        }
+        info!("Client finished collecting responses");
+
+        // Shutdown cluster and collect results
+        self.network.send(ClientMessage::Done);
+        self.print_results();
+    }
+
+    // Send new requests on reponse until response_limit responses are recheived
+    async fn run_until_response_limit(&mut self, response_limit: usize) {
+        let mut response_count = 0;
         loop {
             match self.network.next().await {
                 Some(message) => match message {
@@ -80,30 +118,47 @@ impl Client {
                     msg => {
                         debug!("Received {msg:?}");
                         let response_id = msg.command_id();
-                        self.response_data
-                            .push((response_id, Utc::now().timestamp_micros()));
-                        let next_request_id = response_id + self.num_parallel_requests;
-                        if next_request_id < self.total_requests {
-                            self.send_request(next_request_id);
-                        } else if self.response_data.len() >= self.total_requests {
-                            eprintln!("Client finished collecting responses");
+                        let response_time = Utc::now().timestamp_micros();
+                        self.response_data[response_id].response_time = Some(response_time);
+                        response_count += 1;
+                        if response_count >= response_limit {
                             break;
                         }
+                        let next_request_id = response_id + self.num_parallel_requests;
+                        self.send_request(next_request_id);
                     }
                 },
-                None => {
-                    error!("Server connection lost");
-                    break;
-                }
+                None => panic!("Connection to server lost before end condition"),
             }
         }
+    }
 
-        // Shutdown cluster and display latency data
-        self.network.send(ClientMessage::Done);
-        assert_eq!(self.request_data.len(), self.response_data.len());
-        self.request_data.sort_by(|a, b| a.0.cmp(&b.0));
-        self.response_data.sort_by(|a, b| a.0.cmp(&b.0));
-        self.print_results();
+    // Send new requests on reponse until duration_limit time has passed
+    async fn run_until_duration_limit(&mut self, duration_limit: Duration) {
+        let mut end_duration = tokio::time::interval(duration_limit);
+        end_duration.tick().await; // First tick resolves immediately
+        loop {
+            tokio::select! {
+                biased;
+                incoming_message = self.network.next() => {
+                    match incoming_message {
+                        Some(message) => match message {
+                            ServerMessage::Ready(_) => error!("Unexpected ready message"),
+                            msg => {
+                                debug!("Received {msg:?}");
+                                let response_id = msg.command_id();
+                                let response_time = Utc::now().timestamp_micros();
+                                self.response_data[response_id].response_time = Some(response_time);
+                                let next_request_id = response_id + self.num_parallel_requests;
+                                self.send_request(next_request_id);
+                            }
+                        },
+                        None => panic!("Connection to server lost before end condition"),
+                    }
+                },
+                _ = end_duration.tick() => break,
+            }
+        }
     }
 
     fn send_request(&mut self, request_id: usize) {
@@ -112,29 +167,31 @@ impl Client {
         let request = ClientMessage::Append(request_id, cmd);
         debug!("Sending request {request:?}");
         self.network.send(request);
-        self.request_data
-            .push((request_id, Utc::now().timestamp_micros()));
+        let request_time = Utc::now().timestamp_micros();
+        if request_id < self.response_data.len() {
+            self.response_data[request_id].request_time = Some(request_time);
+        } else {
+            for i in self.response_data.len()..request_id {
+                self.response_data.push(ResponseData::new_placeholder(i));
+            }
+            self.response_data
+                .push(ResponseData::new(request_id, request_time));
+        }
     }
 
     fn print_results(&self) {
-        let response_data =
-            ResponseData::from_collected_data(&self.request_data, &self.response_data);
-        let response_latencies: Vec<i64> = response_data
-            .iter()
-            .map(|data| data.response_time - data.request_time)
-            .collect();
+        // Persist summary
         let total_time = self.calc_total_time();
-        let throughput = self.calc_request_throughput();
-        let (request_latency_average, request_latency_std_dev) =
-            calc_avg_response_latency(&response_latencies);
-        // let (client_latencies_average, client_latencies_std_dev) =
-        //     calc_avg_client_latencies(&response_latencies, self.num_parallel_requests);
+        let (throughput, total_responses, unanswered_requests) =
+            self.calc_request_throughput_and_missed();
+        let (request_latency_average, request_latency_std_dev) = self.calc_avg_response_latency();
         let output = ClientOutput {
             client_config: self.config.clone(),
             server_info: self.leaders_config.unwrap(),
             client_start_time: self.client_start_time.unwrap(),
             throughput,
-            missed_responses: 0,
+            total_responses,
+            unanswered_requests,
             total_time,
             request_latency_average,
             request_latency_std_dev,
@@ -145,11 +202,11 @@ impl Client {
         summary_file.write_all(json_output.as_bytes()).unwrap();
         summary_file.flush().unwrap();
 
-        // Individual response times
+        // Persist individual response times
         if let Some(file_path) = self.config.debug_filepath.clone() {
             let file = File::create(file_path).unwrap();
             let mut writer = Writer::from_writer(file);
-            for data in response_data {
+            for data in &self.response_data {
                 writer.serialize(data).unwrap();
             }
             writer.flush().unwrap();
@@ -157,106 +214,105 @@ impl Client {
     }
 
     fn calc_total_time(&self) -> f64 {
-        let first_request_time = self.request_data[0].1;
-        let last_response_time = self.response_data[self.response_data.len() - 1].1;
+        let first_request_time = self.response_data[0]
+            .request_time
+            .expect("First request was a placeholder");
+        let last_response_time = self
+            .response_data
+            .iter()
+            .rev()
+            .filter_map(|d| d.response_time)
+            .next()
+            .expect("No responses exist");
         (last_response_time - first_request_time) as f64 / 1000.
     }
 
-    fn calc_request_throughput(&self) -> f64 {
-        let num_requests = self.request_data.len();
-        let first_request_time = self.request_data[0].1;
-        let last_request_time = self.request_data[num_requests - 1].1;
+    fn calc_request_throughput_and_missed(&self) -> (f64, usize, usize) {
+        let mut request_count = 0;
+        let mut response_count = 0;
+        for data in &self.response_data {
+            if data.request_time.is_some() {
+                request_count += 1;
+            }
+            if data.response_time.is_some() {
+                response_count += 1;
+            }
+        }
+        let first_request_time = self.response_data[0]
+            .request_time
+            .expect("First request was a placeholder");
+        let last_request_time = self.response_data[self.response_data.len() - 1]
+            .request_time
+            .expect("Last request was a placeholder");
         let messaging_duration = last_request_time - first_request_time;
-        (num_requests as f64 / messaging_duration as f64) * 1_000_000.
+        let throughput = (request_count as f64 / messaging_duration as f64) * 1_000_000.;
+        let unanswered_requests = request_count - response_count;
+        return (throughput, response_count, unanswered_requests);
     }
-}
 
-// The (average, std dev) response latency of all requests in milliseconds
-fn calc_avg_response_latency(latencies: &Vec<i64>) -> (f64, f64) {
-    let num_responses = latencies.len();
-    let avg_latency = latencies.iter().sum::<i64>() / num_responses as i64;
-    let variance = latencies
-        .iter()
-        .map(|&value| {
-            let diff = value - avg_latency;
-            diff * diff
-        })
-        .sum::<i64>() as f64
-        / num_responses as f64;
-    let std_dev = variance.sqrt();
-    (avg_latency as f64 / 1000., std_dev / 1000.)
+    // The (average, std dev) response latency of all requests in milliseconds
+    fn calc_avg_response_latency(&self) -> (f64, f64) {
+        let latencies: Vec<i64> = self
+            .response_data
+            .iter()
+            .filter_map(|d| {
+                d.response_time.map(|resp_time| {
+                    resp_time - d.request_time.expect("Got a response without a request")
+                })
+            })
+            .collect();
+        let num_responses = latencies.len();
+        let avg_latency = latencies.iter().sum::<Timestamp>() / num_responses as i64;
+        let variance = latencies
+            .iter()
+            .map(|&value| {
+                let diff = value - avg_latency;
+                diff * diff
+            })
+            .sum::<Timestamp>() as f64
+            / num_responses as f64;
+        let std_dev = variance.sqrt();
+        (avg_latency as f64 / 1000., std_dev / 1000.)
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct ClientOutput {
     client_config: ClientConfig,
     server_info: MetronomeConfigInfo,
-    client_start_time: i64,
+    client_start_time: Timestamp,
     throughput: f64,
-    missed_responses: usize,
+    total_responses: usize,
+    unanswered_requests: usize,
     total_time: f64,
     request_latency_average: f64,
     request_latency_std_dev: f64,
-    // client_latencies_average: Vec<f64>,
-    // client_latencies_std_dev: Vec<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ResponseData {
     command_id: CommandId,
-    request_time: i64,
-    response_time: i64,
+    request_time: Option<Timestamp>,
+    response_time: Option<Timestamp>,
 }
 
 impl ResponseData {
-    fn from_collected_data(
-        request_data: &Vec<(CommandId, i64)>,
-        response_data: &Vec<(CommandId, i64)>,
-    ) -> Vec<Self> {
-        request_data
-            .into_iter()
-            .zip(response_data.into_iter())
-            .map(
-                |(&(command_id, request_time), &(_, response_time))| ResponseData {
-                    command_id,
-                    request_time,
-                    response_time,
-                },
-            )
-            .collect()
+    fn new(command_id: CommandId, request_time: Timestamp) -> Self {
+        Self {
+            command_id,
+            request_time: Some(request_time),
+            response_time: None,
+        }
+    }
+
+    fn new_placeholder(command_id: CommandId) -> Self {
+        Self {
+            command_id,
+            request_time: None,
+            response_time: None,
+        }
     }
 }
-
-// // The (average, std dev) response latencies for each parallel pseudo-client in milliseconds
-// fn calc_avg_client_latencies(
-//     latencies: &Vec<u128>,
-//     parallel_requests: usize,
-// ) -> (Vec<f64>, Vec<f64>) {
-//     let requests_per_client = (latencies.len() / parallel_requests) as u128;
-//     let mut sums = vec![0u128; parallel_requests];
-//     for batch in latencies.chunks(parallel_requests) {
-//         for i in 0..batch.len() {
-//             sums[i] += batch[i];
-//         }
-//     }
-//     let avg_latencies: Vec<u128> = sums.iter().map(|&sum| sum / requests_per_client).collect();
-//     let mut variances = vec![0u128; parallel_requests];
-//     for batch in latencies.chunks(parallel_requests) {
-//         for i in 0..batch.len() {
-//             let diff = batch[i] - avg_latencies[i];
-//             variances[i] += diff * diff;
-//         }
-//     }
-//     let std_devs_ms: Vec<f64> = variances
-//         .into_iter()
-//         .map(|v| ((v / requests_per_client) as f64 / 1000.).sqrt())
-//         .collect();
-//     let avg_latencies_ms = avg_latencies
-//         .into_iter()
-//         .map(|l| l as f64 / 1000.)
-//         .collect();
-//     (avg_latencies_ms, std_devs_ms)
-// }
 
 // // Function to serialize client data to JSON and compress with gzip
 // fn compress_raw_output(data: &RawOutput) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

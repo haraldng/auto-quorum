@@ -2,7 +2,10 @@ cluster_name = "local-cluster"
 location = "local-1"
 server_id = 1
 local_deployment = true
-total_requests = 900
-num_parallel_requests = 50
+num_parallel_requests = 17
 summary_filepath = "../benchmarks/logs/local-experiments/client-1.json"
 debug_filepath = "../benchmarks/logs/local-experiments/client-1.csv"
+
+[end_condition]
+end_condition_type = "ResponsesCollected"
+end_condition_value = 57

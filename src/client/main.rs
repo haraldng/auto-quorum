@@ -33,7 +33,10 @@ pub async fn main() {
         Ok(string) => string,
         Err(e) => panic!("Couldn't read config file {config_file}: {e}"),
     };
-    let client_config: ClientConfig = toml::from_str(&config_string).unwrap();
+    let client_config: ClientConfig = match toml::from_str(&config_string) {
+        Ok(parsed_config) => parsed_config,
+        Err(e) => panic!("{e}"),
+    };
     // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
     let mut client = Client::new(client_config).await;
     client.run().await;
