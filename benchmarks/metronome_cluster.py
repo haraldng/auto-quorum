@@ -9,7 +9,14 @@ from gcp_cluster import GcpCluster, InstanceConfig
 def create_directories(directory: Path):
     subprocess.run(["mkdir", "-p", directory])
 
-
+# Orchestration class for a Metronome Cluster.
+# Deployment steps:
+# 1. Push Metronome server and client Docker images to gcr.io artifact registry. See ../build_scripts/push-server-image.sh and ../build_scripts/push-client-image.sh
+# 2. `__init__` Creates GCP instances for Metronome servers and clients which run passed startup scripts to setup Docker on the instances for your OS login user.
+# 3. `start_servers` and `start_client` to ssh in to instances, pass configuration files, and docker run the containers from the artifact registry.
+# 4. `await_cluster` to wait for ssh processes to finish.
+# 5. `get_logs` pull logs from the GCP instances
+# 6. `shutdown` shutdown GCP instances (or not it you want to reuse them)
 class MetronomeCluster:
     _server_processes: dict[int, subprocess.Popen]
     _client_processes: dict[int, subprocess.Popen]
@@ -139,10 +146,14 @@ class MetronomeCluster:
         if current_client_process is not None:
             current_client_process.terminate()
         start_command = start_client_command(self._cluster_config, client_config)
-        client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command)
+        client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command, capture_stderr=True)
         self._client_processes[id] = client_process
 
-    # Wait for cluster processes to finish. Retry mechanism if process failed due to SSH failure
+    # Wait for cluster processes to finish.
+    # Retries SSH connections if client fails due to instance lookup failure. This is necessary
+    # because we ssh with gcloud's tunnel-through-iap. There is a delay between when a GCP instance
+    # starts and when the GCP IAP proxy service can find it. To address this we retry the cluster's
+    # ssh processes if the client process receives the instance lookup failure error.
     def await_cluster(self):
         print(f"Awaiting client...")
         assert len(self._client_processes) > 0, "Need a client to exist to await on cluster"
@@ -245,6 +256,8 @@ class MetronomeCluster:
         if rust_log is not None:
             self._client_configs[client_id].rust_log = rust_log
 
+# Builder class for MetronomeCluster. Used to define and then validate the configs necessary to
+# start a MetronomeCluster
 class MetronomeClusterBuilder:
     def __init__(self, name:str, project_id: str = "my-project-1499979282244") -> None:
         self.name = name
@@ -266,7 +279,7 @@ class MetronomeClusterBuilder:
         persist_config: MetronomeCluster.PersistConfig = MetronomeCluster.PersistConfig.NoPersist(),
         delay_config: MetronomeCluster.DelayConfig = MetronomeCluster.DelayConfig.Sleep(0),
         instrumentation: bool=False,
-        rust_log: str="warn"
+        rust_log: str="info"
     ):
         assert server_id > 0
         assert server_id not in self._server_configs.keys(), f"Server {server_id} already exists"
@@ -301,7 +314,7 @@ class MetronomeClusterBuilder:
         end_condition: MetronomeCluster.EndConditionConfig,
         num_parallel_requests: int,
         machine_type: str = "e2-standard-4",
-        rust_log: str="warn"
+        rust_log: str="info"
     ):
         assert nearest_server > 0
         assert nearest_server not in self._client_configs.keys(), f"Client {nearest_server} already exists"
@@ -374,7 +387,9 @@ class MetronomeClusterBuilder:
         )
         return MetronomeCluster(self._project_id, cluster_config, self._server_configs, self._client_configs)
 
-
+# Startup script executed on creation of the GCP instance for a Metronome server.
+# ssh into instance and run `sudo journalctl -u google-startup-scripts.service`
+# to debug startup script
 def server_startup_script(user: str) -> str:
     container_image_location = "my-project-1499979282244/metronome_server"
     return f"""#! /bin/bash
@@ -407,7 +422,6 @@ def start_server_command(
     instance_logs_location = f"{instance_output_dir}/server-{config.server_id}.json"
     server_config = _generate_server_config(cluster_config, config)
 
-
     pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
     kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
     gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location}"
@@ -421,7 +435,7 @@ def start_server_command(
         --rm \\
         "gcr.io/{container_image_location}" \\
         1> {instance_logs_location} 2> {instance_err_location}"""
-    # NOTE: We sleep here to help avoid connecting to currently shutting down servers.
+    # We sleep here to help avoid connecting to currently shutting down servers.
     return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
 
 def _generate_server_config(
@@ -464,7 +478,9 @@ batch_size = 1
 """
     return toml
 
-
+# Startup script executed on creation of the GCP instance for a Metronome client.
+# ssh into instance and run `sudo journalctl -u google-startup-scripts.service`
+# to debug startup script
 def client_startup_script(user: str) -> str:
     container_image_location = "my-project-1499979282244/metronome_client"
     return f"""#! /bin/bash
@@ -506,7 +522,7 @@ def start_client_command(
     -v {instance_config_location}:{container_config_location} \\
     -v {instance_output_dir}:{container_output_dir} \\
     gcr.io/{container_image_location}"""
-    # NOTE: We sleep here to help avoid connecting to currently shutting down servers.
+    # We sleep here to help avoid connecting to currently shutting down servers.
     return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
 
 def _generate_client_config(

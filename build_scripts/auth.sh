@@ -19,4 +19,4 @@ gcloud auth application-default login
 # for Google’s container registries (gcr.io, us.gcr.io, eu.gcr.io, and asia.gcr.io).
 # This command enables Docker to authenticate with Google Container Registry using
 # gcloud-managed credentials, making it easier to push and pull images securely.
-gcloud auth configure-docker
+gcloud auth configure-docker gcr.io

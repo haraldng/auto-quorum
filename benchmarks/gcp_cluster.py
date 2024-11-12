@@ -31,16 +31,14 @@ class InstanceConfig:
         # TODO: detect change in dns name?
         return True
 
-# NOTE: Relies on gcloud to handle GCP credentials. Application Default Credentials are used when creating instances and gcloud's credentials are used for ssh
-# To set gcloud credentials run `gcloud auth login`
-# To set Application Default Credentials run `gcloud auth application-default login`
-# Additionally make sure gcloud's project is set correctly with `gcloud config get-value project` and `$ gcloud config set project <project-id-here>`
 # The best resource I found for the GCP python client API are the samples here: https://github.com/GoogleCloudPlatform/python-docs-samples/tree/main/compute
 # Manages a cluster of GCP instances.
 # Assumes a VPC network internal.zone. is created
 # Each instance is assigned a DNS name `{instance_dns_name}.internal.zone.` to be used in the internal VPC
+# NOTE: Relies on gcloud to handle GCP credentials. Application Default Credentials are used when creating instances and gcloud's credentials are used for ssh.
+# See ../build_scripts/auth.sh for commands to configure required credentials.
 class GcpCluster:
-    missing_dns_msg = """Managed zone has to be created first
+    MISSING_DNS_MSG = """Managed zone has to be created first
 Run: gcloud dns managed-zones create internal-network \\
         --dns-name=internal.zone. \\
         --visibility=private \\
@@ -76,19 +74,20 @@ Run: gcloud dns managed-zones create internal-network \\
 
         self._create_instances(instances_to_create)
 
-    # TODO: Check if ssh without IAP tunnel can be started faster
-    # NOTE: It can take a good 60sec before IAP registers newly started instance
+    # NOTE: It can take up to 60sec before IAP registers newly started instance
     # gcloud compute ssh will use the user returned by `get_os_username` since OS login in enabled for created instances. See: https://cloud.google.com/compute/docs/instances/ssh#gcloud
-    def ssh_command(self, instance_name: str, command: str) -> subprocess.Popen:
+    # TODO: Check if ssh without IAP tunnel can be started faster
+    def ssh_command(self, instance_name: str, command: str, capture_stderr: bool=False) -> subprocess.Popen:
         instance = self.instances[instance_name]
         name = instance.name
         zone = instance.zone
         gcloud_command = ["gcloud", "compute", "ssh", name, "--zone", zone, "--tunnel-through-iap", "--project", self.project_id, "--command", command]
-        return subprocess.Popen(gcloud_command, shell=False, stderr=subprocess.PIPE, text=True)
+        stderr = subprocess.PIPE if capture_stderr else None
+        return subprocess.Popen(gcloud_command, shell=False, stderr=stderr, text=True)
 
-    # TODO: Check if ssh without IAP tunnel can be started faster
-    # NOTE: It can take a good 60sec before IAP registers newly started instance
+    # NOTE: It can take up to 60sec before IAP registers newly started instance
     # gcloud compute scp will use the user returned by `get_os_username` since OS login is enabled for created instances. See: https://cloud.google.com/compute/docs/instances/ssh#gcloud
+    # TODO: Check if ssh without IAP tunnel can be started faster
     def scp_command(self, instance_name: str, src_dir: str, dest_dir: Path) -> subprocess.Popen:
         instance = self.instances[instance_name]
         name = instance.name
@@ -303,7 +302,7 @@ Run: gcloud dns managed-zones create internal-network \\
         if not self.managed_zone.exists(client=self.dns_client):
             # Its possible to create the zone with the python API, 
             # but not to link it to a network.
-            raise MissingDNSZoneError(self.missing_dns_msg)
+            raise MissingDNSZoneError(self.MISSING_DNS_MSG)
 
 def print_progress_bar(iteration, total, prefix='', suffix='', length=50, fill='█'):
     if total == 0:

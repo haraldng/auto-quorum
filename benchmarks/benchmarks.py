@@ -1,10 +1,9 @@
 from pathlib import Path
-import time
 from metronome_cluster import MetronomeCluster, MetronomeClusterBuilder
 
 
 def closed_loop_experiment(cluster_size: int, number_of_clients: int, end_condition: MetronomeCluster.EndConditionConfig, persist_config: MetronomeCluster.PersistConfig):
-    experiment_log_dir = Path(f"./logs/test-closed-loop-experiments-{persist_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
+    experiment_log_dir = Path(f"./logs/closed-loop-experiments-{persist_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
     print(f"RUNNING CLOSED LOOP EXPERIMENT: {cluster_size=}, {end_condition=}, {number_of_clients=}")
     print(experiment_log_dir)
 
@@ -27,7 +26,8 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, end_condit
     ).build()
 
     # Run experiments
-    for data_size in [256, 4096, 1048*500]:
+    # for data_size in [256, 1024*4, 1024*8, 1024*16, 1024*32, 1024*64, 1024*125, 1024*256]:
+    for data_size in [1024*128, 1024*256]:
         for server_id in range(1, cluster_size + 1):
             delay_config = MetronomeCluster.DelayConfig.File(data_size)
             cluster.change_server_config(server_id, delay_config=delay_config)
@@ -39,7 +39,7 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, end_condit
             cluster.await_cluster()
             iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{use_metronome}-datasize-{data_size}")
             cluster.get_logs(iteration_directory)
-    cluster.shutdown()
+    # cluster.shutdown()
 
 # def closed_loop_experiment_sleep(cluster_size: int, total_messages: int, number_of_clients: int):
 #     experiment_log_dir = Path(f"./logs/closed-loop-experiments-sleep-Individual/{cluster_size}-node-cluster-{number_of_clients}-clients")
@@ -122,9 +122,9 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, end_condit
 
 
 def main():
-    persist_config = MetronomeCluster.PersistConfig.Every(10)
-    end_condition = MetronomeCluster.EndConditionConfig.ResponsesCollected(100)
-    closed_loop_experiment(cluster_size=5, number_of_clients=30, end_condition=end_condition, persist_config=persist_config)
+    persist_config = MetronomeCluster.PersistConfig.Individual()
+    end_condition = MetronomeCluster.EndConditionConfig.ResponsesCollected(10000)
+    closed_loop_experiment(cluster_size=5, number_of_clients=1000, end_condition=end_condition, persist_config=persist_config)
     # closed_loop_experiment(5, 9990, 100, persist_config=persist_config)
     # closed_loop_experiment(5, 10000, 100)
     # closed_loop_experiment_sleep(5, 1000, 10)
