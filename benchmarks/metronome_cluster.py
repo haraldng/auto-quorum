@@ -47,7 +47,7 @@ class MetronomeCluster:
         end_condition: 'MetronomeCluster.EndConditionConfig'
         num_parallel_requests: int
         summary_filepath: str
-        debug_filepath: str
+        output_filepath: str
         rust_log: str="info"
 
     @dataclass
@@ -332,7 +332,7 @@ class MetronomeClusterBuilder:
             end_condition=end_condition,
             num_parallel_requests=num_parallel_requests,
             summary_filepath=f"client-{nearest_server}.json",
-            debug_filepath=f"client-{nearest_server}.csv",
+            output_filepath=f"client-{nearest_server}.csv",
             rust_log=rust_log,
         )
         self._client_configs[nearest_server] = client_config
@@ -535,7 +535,7 @@ location = "{config.instance_config.zone}"
 server_id = {config.client_id}
 num_parallel_requests = {config.num_parallel_requests}
 summary_filepath = "{config.summary_filepath}"
-debug_filepath = "{config.debug_filepath}"
+output_filepath = "{config.output_filepath}"
 
 [end_condition]
 end_condition_type = "{config.end_condition.end_condition_type}"

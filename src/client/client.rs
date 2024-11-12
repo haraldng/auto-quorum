@@ -16,7 +16,7 @@ pub struct ClientConfig {
     pub end_condition: EndConditionConfig,
     pub num_parallel_requests: usize,
     pub summary_filepath: String,
-    pub debug_filepath: Option<String>,
+    pub output_filepath: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -49,7 +49,7 @@ pub struct Client {
     end_condition: EndCondition,
     num_parallel_requests: usize,
     network: Network,
-    response_data: Vec<ResponseData>,
+    client_data: ClientData,
     config: ClientConfig,
     leaders_config: Option<MetronomeConfigInfo>,
     client_start_time: Option<Timestamp>,
@@ -72,7 +72,7 @@ impl Client {
             end_condition: config.end_condition.into(),
             num_parallel_requests: config.num_parallel_requests,
             network,
-            response_data: Vec::with_capacity(num_estimated_responses),
+            client_data: ClientData::new(num_estimated_responses),
             config,
             leaders_config: None,
             client_start_time: None,
@@ -101,14 +101,26 @@ impl Client {
             EndCondition::ResponsesCollected(n) => self.run_until_response_limit(n).await,
             EndCondition::TimePassed(t) => self.run_until_duration_limit(t).await,
         }
-        info!("Client finished collecting responses");
+        info!(
+            "Client finished collecting {} responses",
+            self.client_data.total_responses()
+        );
 
         // Shutdown cluster and collect results
         self.network.send(ClientMessage::Done);
-        self.print_results();
+        self.client_data
+            .save_summary(
+                self.config.clone(),
+                self.leaders_config.unwrap(),
+                self.client_start_time.unwrap(),
+            )
+            .expect("Failed to write summary file");
+        self.client_data
+            .to_csv(self.config.output_filepath.clone())
+            .expect("Failed to write output file");
     }
 
-    // Send new requests on reponse until response_limit responses are recheived
+    // Send new requests on reponse until response limit is reached
     async fn run_until_response_limit(&mut self, response_limit: usize) {
         let mut response_count = 0;
         loop {
@@ -118,8 +130,7 @@ impl Client {
                     msg => {
                         debug!("Received {msg:?}");
                         let response_id = msg.command_id();
-                        let response_time = Utc::now().timestamp_micros();
-                        self.response_data[response_id].response_time = Some(response_time);
+                        self.client_data.new_response(response_id);
                         response_count += 1;
                         if response_count >= response_limit {
                             break;
@@ -147,8 +158,7 @@ impl Client {
                             msg => {
                                 debug!("Received {msg:?}");
                                 let response_id = msg.command_id();
-                                let response_time = Utc::now().timestamp_micros();
-                                self.response_data[response_id].response_time = Some(response_time);
+                                self.client_data.new_response(response_id);
                                 let next_request_id = response_id + self.num_parallel_requests;
                                 self.send_request(next_request_id);
                             }
@@ -161,97 +171,123 @@ impl Client {
         }
     }
 
-    fn send_request(&mut self, request_id: usize) {
+    fn send_request(&mut self, request_id: CommandId) {
         let key = request_id.to_string();
         let cmd = KVCommand::Put(key.clone(), key);
         let request = ClientMessage::Append(request_id, cmd);
         debug!("Sending request {request:?}");
         self.network.send(request);
+        self.client_data.new_request(request_id);
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ClientSummary {
+    client_config: ClientConfig,
+    server_info: MetronomeConfigInfo,
+    client_start_time: Timestamp,
+    throughput: f64,
+    total_responses: usize,
+    unanswered_requests: usize,
+    total_time: f64,
+    request_latency_average: f64,
+    request_latency_std_dev: f64,
+}
+
+struct ClientData {
+    response_data: Vec<ResponseData>,
+    request_count: usize,
+    response_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseData {
+    command_id: CommandId,
+    request_time: Option<Timestamp>,
+    response_time: Option<Timestamp>,
+}
+
+impl ClientData {
+    fn new(num_estimated_responses: usize) -> Self {
+        Self {
+            response_data: Vec::with_capacity(num_estimated_responses),
+            request_count: 0,
+            response_count: 0,
+        }
+    }
+
+    // A Client can send requests with out-of-order command ids due to parallel requests.
+    // Use a vec with placeholder values to fill in the gaps.
+    #[inline]
+    fn new_request(&mut self, request_id: CommandId) {
         let request_time = Utc::now().timestamp_micros();
         if request_id < self.response_data.len() {
             self.response_data[request_id].request_time = Some(request_time);
         } else {
-            for i in self.response_data.len()..request_id {
-                self.response_data.push(ResponseData::new_placeholder(i));
+            for placeholder_id in self.response_data.len()..request_id {
+                let placeholder = ResponseData {
+                    command_id: placeholder_id,
+                    request_time: None,
+                    response_time: None,
+                };
+                self.response_data.push(placeholder);
             }
-            self.response_data
-                .push(ResponseData::new(request_id, request_time));
+            self.response_data.push(ResponseData {
+                command_id: request_id,
+                request_time: Some(request_time),
+                response_time: None,
+            });
         }
+        self.request_count += 1;
     }
 
-    fn print_results(&self) {
-        // Persist summary
-        let total_time = self.calc_total_time();
-        let (throughput, total_responses, unanswered_requests) =
-            self.calc_request_throughput_and_missed();
-        let (request_latency_average, request_latency_std_dev) = self.calc_avg_response_latency();
-        let output = ClientOutput {
-            client_config: self.config.clone(),
-            server_info: self.leaders_config.unwrap(),
-            client_start_time: self.client_start_time.unwrap(),
-            throughput,
-            total_responses,
-            unanswered_requests,
-            total_time,
+    #[inline]
+    fn new_response(&mut self, response_id: CommandId) {
+        let response_time = Utc::now().timestamp_micros();
+        // Placeholders will ensure indexing works
+        self.response_data[response_id].response_time = Some(response_time);
+        self.response_count += 1;
+    }
+
+    fn save_summary(
+        &self,
+        client_config: ClientConfig,
+        server_info: MetronomeConfigInfo,
+        client_start_time: Timestamp,
+    ) -> Result<(), std::io::Error> {
+        let summary_filepath = client_config.summary_filepath.clone();
+        let (request_latency_average, request_latency_std_dev) = self.avg_response_latency();
+        let summary = ClientSummary {
+            client_config,
+            server_info,
+            client_start_time,
+            throughput: self.throughput(),
+            total_responses: self.total_responses(),
+            unanswered_requests: self.unanswered_requests(),
+            total_time: self.total_time(),
             request_latency_average,
             request_latency_std_dev,
         };
-        let json_output = serde_json::to_string_pretty(&output).unwrap();
-        eprintln!("{json_output}");
-        let mut summary_file = File::create(self.config.summary_filepath.clone()).unwrap();
-        summary_file.write_all(json_output.as_bytes()).unwrap();
-        summary_file.flush().unwrap();
-
-        // Persist individual response times
-        if let Some(file_path) = self.config.debug_filepath.clone() {
-            let file = File::create(file_path).unwrap();
-            let mut writer = Writer::from_writer(file);
-            for data in &self.response_data {
-                writer.serialize(data).unwrap();
-            }
-            writer.flush().unwrap();
-        }
+        let json_summary = serde_json::to_string_pretty(&summary)?;
+        eprintln!("{json_summary}");
+        let mut summary_file = File::create(summary_filepath)?;
+        summary_file.write_all(json_summary.as_bytes())?;
+        summary_file.flush()?;
+        Ok(())
     }
 
-    fn calc_total_time(&self) -> f64 {
-        let first_request_time = self.response_data[0]
-            .request_time
-            .expect("First request was a placeholder");
-        let last_response_time = self
-            .response_data
-            .iter()
-            .rev()
-            .filter_map(|d| d.response_time)
-            .next()
-            .expect("No responses exist");
-        (last_response_time - first_request_time) as f64 / 1000.
-    }
-
-    fn calc_request_throughput_and_missed(&self) -> (f64, usize, usize) {
-        let mut request_count = 0;
-        let mut response_count = 0;
+    fn to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
+        let file = File::create(file_path)?;
+        let mut writer = Writer::from_writer(file);
         for data in &self.response_data {
-            if data.request_time.is_some() {
-                request_count += 1;
-            }
-            if data.response_time.is_some() {
-                response_count += 1;
-            }
+            writer.serialize(data)?;
         }
-        let first_request_time = self.response_data[0]
-            .request_time
-            .expect("First request was a placeholder");
-        let last_request_time = self.response_data[self.response_data.len() - 1]
-            .request_time
-            .expect("Last request was a placeholder");
-        let messaging_duration = last_request_time - first_request_time;
-        let throughput = (request_count as f64 / messaging_duration as f64) * 1_000_000.;
-        let unanswered_requests = request_count - response_count;
-        return (throughput, response_count, unanswered_requests);
+        writer.flush()?;
+        Ok(())
     }
 
     // The (average, std dev) response latency of all requests in milliseconds
-    fn calc_avg_response_latency(&self) -> (f64, f64) {
+    fn avg_response_latency(&self) -> (f64, f64) {
         let latencies: Vec<i64> = self
             .response_data
             .iter()
@@ -274,55 +310,40 @@ impl Client {
         let std_dev = variance.sqrt();
         (avg_latency as f64 / 1000., std_dev / 1000.)
     }
-}
 
-#[derive(Debug, Serialize)]
-struct ClientOutput {
-    client_config: ClientConfig,
-    server_info: MetronomeConfigInfo,
-    client_start_time: Timestamp,
-    throughput: f64,
-    total_responses: usize,
-    unanswered_requests: usize,
-    total_time: f64,
-    request_latency_average: f64,
-    request_latency_std_dev: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ResponseData {
-    command_id: CommandId,
-    request_time: Option<Timestamp>,
-    response_time: Option<Timestamp>,
-}
-
-impl ResponseData {
-    fn new(command_id: CommandId, request_time: Timestamp) -> Self {
-        Self {
-            command_id,
-            request_time: Some(request_time),
-            response_time: None,
-        }
+    // The request throughput in requests/sec
+    fn throughput(&self) -> f64 {
+        let first_request_time = self.response_data[0]
+            .request_time
+            .expect("First request shouldn't be placeholder");
+        let last_request_time = self.response_data[self.response_data.len() - 1]
+            .request_time
+            .expect("Last request shouldn't be placeholder");
+        let messaging_duration = last_request_time - first_request_time;
+        let throughput = (self.request_count as f64 / messaging_duration as f64) * 1_000_000.;
+        return throughput;
     }
 
-    fn new_placeholder(command_id: CommandId) -> Self {
-        Self {
-            command_id,
-            request_time: None,
-            response_time: None,
-        }
+    // The total duration of request time in milliseconds
+    fn total_time(&self) -> f64 {
+        let first_request_time = self.response_data[0]
+            .request_time
+            .expect("First request shouldn't be a placeholder");
+        let last_response_time = self
+            .response_data
+            .iter()
+            .rev()
+            .filter_map(|d| d.response_time)
+            .next()
+            .expect("There should be responses");
+        (last_response_time - first_request_time) as f64 / 1000.
+    }
+
+    fn total_responses(&self) -> usize {
+        self.response_count
+    }
+
+    fn unanswered_requests(&self) -> usize {
+        self.request_count - self.response_count
     }
 }
-
-// // Function to serialize client data to JSON and compress with gzip
-// fn compress_raw_output(data: &RawOutput) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-//     // Step 1: Serialize the entire struct to JSON
-//     let json_representation = serde_json::to_string(data)?;
-//
-//     // Step 2: Compress the JSON representation using Gzip
-//     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-//     encoder.write_all(json_representation.as_bytes())?;
-//     let compressed_data = encoder.finish()?;
-//
-//     Ok(compressed_data)
-// }
