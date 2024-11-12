@@ -149,7 +149,8 @@ impl OmniPaxosServer {
             self.emulate_storage_delay(1);
         }
 
-        let buffer_size = 100;
+        // NOTE: This will cap how many messages an Opportunistic flush strategy can batch
+        let buffer_size = 1000;
         let mut client_message_buffer = Vec::with_capacity(buffer_size);
         let mut cluster_message_buffer = Vec::with_capacity(buffer_size);
         if self.id == self.initial_leader {
@@ -179,6 +180,7 @@ impl OmniPaxosServer {
             }
         }
 
+        // Main event loop
         loop {
             let done_signal = tokio::select! {
                 _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
@@ -197,7 +199,7 @@ impl OmniPaxosServer {
     fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
         let (_leader, phase) = self.omnipaxos.get_current_leader_state();
         match phase {
-            Phase::Accept => {}
+            Phase::Accept => (),
             _ => {
                 let mut ballot = Ballot::default();
                 *leader_attempt += 1;
@@ -214,6 +216,68 @@ impl OmniPaxosServer {
         }
     }
 
+    fn handle_cluster_messages(&mut self, messages: &mut Vec<(ClusterMessage, i64)>) -> bool {
+        let mut server_done = false;
+        self.instrument_cluster_messages(&messages);
+        for (message, _net_recv_time) in messages.drain(..) {
+            match message {
+                ClusterMessage::OmniPaxosMessage(m) => self.omnipaxos.handle_incoming(m),
+                ClusterMessage::Done => {
+                    info!("{}: Received Done signal from leader", self.id);
+                    self.debug_acceptor_data();
+                    server_done = true
+                }
+            }
+        }
+        if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
+            self.handle_decided_entries();
+        }
+        // To minimize latency, rather than send outgoing messages on a timer, just check for any
+        // outgoing whenever we could update the state of Omnipaxos.
+        self.send_outgoing_msgs();
+        server_done
+    }
+
+    fn handle_client_messages(
+        &mut self,
+        messages: &mut Vec<(ClientId, ClientMessage, i64)>,
+    ) -> bool {
+        let mut client_done = false;
+        for message in messages.drain(..) {
+            match message {
+                (client_id, ClientMessage::Append(command_id, kv_command), net_recv_time) => {
+                    debug!("Server: Request from client {client_id}: {command_id} {kv_command:?}");
+                    if let Some(data) = &mut self.instrumentation_data {
+                        let req_data = RequestInstrumentation::with(
+                            command_id,
+                            net_recv_time,
+                            Utc::now().timestamp_micros(),
+                        );
+                        data.request_data.push(req_data);
+                    }
+                    self.commit_command_to_log(client_id, command_id, kv_command);
+                }
+                (_, ClientMessage::Done, _) => {
+                    info!("{}: Received Done signal from client", self.id);
+                    self.send_outgoing_msgs();
+                    let done_msg = ClusterMessage::Done;
+                    for peer in &self.peers {
+                        self.network.send_to_cluster(*peer, done_msg.clone());
+                    }
+                    // NOTE: If we exit the program before Done is sent it may be dropped
+                    // TODO: Allow for wait on network flushing all pending messages instead
+                    std::thread::sleep(Duration::from_secs(1));
+                    self.debug_request_data();
+                    client_done = true;
+                }
+            }
+        }
+        // To minimize latency, rather than send outgoing messages on a timer, just check for any
+        // outgoing whenever we could update the state of Omnipaxos.
+        self.send_outgoing_msgs();
+        client_done
+    }
+
     fn handle_decided_entries(&mut self) {
         let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
         for slot in decided_slots {
@@ -221,10 +285,13 @@ impl OmniPaxosServer {
                 let commit_time = Utc::now().timestamp_micros();
                 data.request_data[slot].commit = Some(commit_time);
             }
-            let decided_entry = self.omnipaxos.read(slot).unwrap();
+            let decided_entry = self
+                .omnipaxos
+                .read(slot)
+                .expect("Decided slots should be readable");
             match decided_entry {
                 LogEntry::Decided(cmd) => self.update_database_and_respond(cmd),
-                // TODO: fix slot indexing
+                // Metronome doesn't correctly mark decided entries in storage
                 LogEntry::Undecided(cmd) => self.update_database_and_respond(cmd),
                 LogEntry::Snapshotted(_) => unimplemented!(),
                 _ => unreachable!(),
@@ -232,8 +299,6 @@ impl OmniPaxosServer {
             if let Some(data) = &mut self.instrumentation_data {
                 let response_time = Utc::now().timestamp_micros();
                 data.request_data[slot].sending_response = Some(response_time);
-                let acceptor_lat = data.request_data[slot].get_accepted_latencies();
-                debug!("Acceptor latencies {:?}", acceptor_lat);
             }
         }
     }
@@ -250,9 +315,27 @@ impl OmniPaxosServer {
         }
     }
 
+    fn commit_command_to_log(
+        &mut self,
+        from: ClientId,
+        command_id: CommandId,
+        kv_command: KVCommand,
+    ) {
+        let command = Command {
+            client_id: from,
+            coordinator_id: self.id,
+            id: command_id,
+            kv_cmd: kv_command,
+        };
+        self.omnipaxos
+            .append(command)
+            .expect("Append should never fail since we never reconfig");
+    }
+
     fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
-        if self.id == 1 {
+        if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
+            // Metronome leader functions an in normal Omnipaxos
             self.instrument_accdec(&messages);
             for msg in messages {
                 let to = msg.get_receiver();
@@ -261,34 +344,11 @@ impl OmniPaxosServer {
             }
             return;
         }
+        // Metronome acceptors handle accepted messages differently
         match self.persist_mode {
             PersistMode::Individual => self.send_outgoing_individual_persist(messages),
             PersistMode::Every(n) => self.send_outgoing_batch_persist(messages, n),
             PersistMode::Opportunistic => self.send_outgoing_opportunistic_persist(messages),
-        }
-    }
-
-    fn instrument_accdec(&mut self, messages: &Vec<Message<Command>>) {
-        if let Some(data) = &mut self.instrumentation_data {
-            for m in messages {
-                if let Message::SequencePaxos(PaxosMessage {
-                    from: _,
-                    to,
-                    msg: PaxosMsg::AcceptDecide(accdec),
-                }) = m
-                {
-                    let accdec_time = Utc::now().timestamp_micros();
-                    for offset in 0..accdec.entries.len() {
-                        let node_ts = NodeTimestamp {
-                            node_id: *to,
-                            time: accdec_time,
-                        };
-                        data.request_data[accdec.start_idx + offset]
-                            .send_accdec
-                            .push(node_ts);
-                    }
-                }
-            }
         }
     }
 
@@ -387,26 +447,6 @@ impl OmniPaxosServer {
         }
     }
 
-    fn handle_cluster_messages(&mut self, messages: &mut Vec<(ClusterMessage, i64)>) -> bool {
-        let mut server_done = false;
-        self.instrument_cluster_messages(&messages);
-        for (message, _net_recv_time) in messages.drain(..) {
-            match message {
-                ClusterMessage::OmniPaxosMessage(m) => self.omnipaxos.handle_incoming(m),
-                ClusterMessage::Done => {
-                    info!("{}: Received Done signal from leader", self.id);
-                    self.debug_acceptor_data();
-                    server_done = true
-                }
-            }
-        }
-        if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
-            self.handle_decided_entries();
-        }
-        self.send_outgoing_msgs();
-        server_done
-    }
-
     fn instrument_cluster_messages(&mut self, messages: &Vec<(ClusterMessage, i64)>) {
         match (self.id, &mut self.instrumentation_data) {
             (_, None) => (),
@@ -453,64 +493,34 @@ impl OmniPaxosServer {
         }
     }
 
-    fn handle_client_messages(
-        &mut self,
-        messages: &mut Vec<(ClientId, ClientMessage, i64)>,
-    ) -> bool {
-        let mut client_done = false;
-        for message in messages.drain(..) {
-            match message {
-                (client_id, ClientMessage::Append(command_id, kv_command), net_recv_time) => {
-                    debug!("Server: Request from client {client_id}: {command_id} {kv_command:?}");
-                    if let Some(data) = &mut self.instrumentation_data {
-                        let req_data = RequestInstrumentation::with(
-                            command_id,
-                            net_recv_time,
-                            Utc::now().timestamp_micros(),
-                        );
-                        data.request_data.push(req_data);
+    fn instrument_accdec(&mut self, messages: &Vec<Message<Command>>) {
+        if let Some(data) = &mut self.instrumentation_data {
+            for m in messages {
+                if let Message::SequencePaxos(PaxosMessage {
+                    from: _,
+                    to,
+                    msg: PaxosMsg::AcceptDecide(accdec),
+                }) = m
+                {
+                    let accdec_time = Utc::now().timestamp_micros();
+                    for offset in 0..accdec.entries.len() {
+                        let node_ts = NodeTimestamp {
+                            node_id: *to,
+                            time: accdec_time,
+                        };
+                        data.request_data[accdec.start_idx + offset]
+                            .send_accdec
+                            .push(node_ts);
                     }
-                    self.commit_command_to_log(client_id, command_id, kv_command);
-                }
-                (_, ClientMessage::Done, _) => {
-                    info!("{}: Received Done signal from client", self.id);
-                    self.send_outgoing_msgs();
-                    let done_msg = ClusterMessage::Done;
-                    for peer in &self.peers {
-                        self.network.send_to_cluster(*peer, done_msg.clone());
-                    }
-                    // NOTE: If we exit the program before Done is sent it may be dropped
-                    // TODO: Allow for wait on network flushing all pending messages instead
-                    std::thread::sleep(Duration::from_secs(1));
-                    self.debug_request_data();
-                    client_done = true;
                 }
             }
         }
-        self.send_outgoing_msgs();
-        client_done
-    }
-
-    fn commit_command_to_log(
-        &mut self,
-        from: ClientId,
-        command_id: CommandId,
-        kv_command: KVCommand,
-    ) {
-        let command = Command {
-            client_id: from,
-            coordinator_id: self.id,
-            id: command_id,
-            kv_cmd: kv_command,
-        };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
     }
 
     fn debug_request_data(&mut self) {
         if let Some(data) = &self.instrumentation_data {
-            let request_json = serde_json::to_string_pretty(&data.request_data).unwrap();
+            // TODO: Switch to better format like parquet or hdf5
+            let request_json = serde_json::to_string(&data.request_data).unwrap();
             print!("{request_json}");
 
             let latencies: Vec<RequestInstrumentation> = data.request_data.clone();
@@ -559,14 +569,14 @@ impl OmniPaxosServer {
 
             let commit_latencies = latencies
                 .iter()
-                .map(|data| data.commit.unwrap() - data.send_accdec[0].time)
+                .filter_map(|data| data.commit.map(|t| t - data.send_accdec[0].time))
                 .collect();
             let avg_commit_latency = self.get_average(&commit_latencies);
             eprintln!("Start AccDec -> Commit      {avg_commit_latency:?}");
 
             let server_total_latencies = latencies
                 .iter()
-                .map(|data| data.sending_response.unwrap() - data.net_receive)
+                .filter_map(|data| data.sending_response.map(|t| t - data.send_accdec[0].time))
                 .collect();
             let avg_server_total_latency = self.get_average(&server_total_latencies);
             eprintln!("Server Total Latency        {avg_server_total_latency:?}");
@@ -691,7 +701,9 @@ struct RequestInstrumentation {
     command_id: CommandId,
     net_receive: i64,
     channel_receive: i64,
+    #[serde(skip_serializing)]
     send_accdec: Vec<NodeTimestamp>,
+    #[serde(skip_serializing)]
     receive_accepted: Vec<NodeTimestamp>,
     commit: Option<i64>,
     sending_response: Option<i64>,

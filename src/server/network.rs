@@ -239,6 +239,7 @@ enum NewConnection {
     ToClient(ClientConnection),
 }
 
+const SOCKET_BUFFER_SIZE: usize = 1000;
 struct PeerConnection {
     peer_id: NodeId,
     outgoing_messages: UnboundedSender<ClusterMessage>,
@@ -253,7 +254,7 @@ impl PeerConnection {
         let (reader, mut writer) = frame_cluster_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
-            let mut buf_reader = reader.ready_chunks(100);
+            let mut buf_reader = reader.ready_chunks(SOCKET_BUFFER_SIZE);
             while let Some(messages) = buf_reader.next().await {
                 let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
@@ -274,17 +275,17 @@ impl PeerConnection {
         // Writer Actor
         let (message_tx, mut message_rx) = mpsc::unbounded_channel();
         let _writer_task = tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(100);
-            while message_rx.recv_many(&mut buffer, 100).await != 0 {
+            let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
+            while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
                         warn!("Couldn't feed message to node {peer_id}: {err}");
-                        error!("Cant Remove connection to node {peer_id}");
+                        warn!("Cant Remove connection to node {peer_id}");
                     }
                 }
                 if let Err(err) = writer.flush().await {
                     warn!("Couldn't flush message to node {peer_id}: {err}");
-                    error!("Cant Remove connection to node {peer_id}");
+                    warn!("Cant Remove connection to node {peer_id}");
                 };
             }
         });
@@ -315,7 +316,7 @@ impl ClientConnection {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
-            let mut buf_reader = reader.ready_chunks(100);
+            let mut buf_reader = reader.ready_chunks(SOCKET_BUFFER_SIZE);
             while let Some(messages) = buf_reader.next().await {
                 let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
@@ -340,12 +341,12 @@ impl ClientConnection {
             UnboundedReceiver<ServerMessage>,
         ) = mpsc::unbounded_channel();
         let _writer_task = tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(100);
-            while message_rx.recv_many(&mut buffer, 100).await != 0 {
+            let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
+            while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
                         warn!("Couldn't send message to client {client_id}: {err}");
-                        error!("Cant Remove connection to client {client_id}");
+                        warn!("Cant Remove connection to client {client_id}");
                     }
                 }
                 writer.flush().await.unwrap();
