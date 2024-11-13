@@ -196,6 +196,7 @@ impl OmniPaxosServer {
         }
     }
 
+    // We don't use Omnipaxos leader election and instead force an initial leader
     fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
         let (_leader, phase) = self.omnipaxos.get_current_leader_state();
         match phase {
@@ -335,7 +336,7 @@ impl OmniPaxosServer {
     fn send_outgoing_msgs(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
-            // Metronome leader functions an in normal Omnipaxos
+            // Metronome leader functions as in normal Omnipaxos
             self.instrument_accdec(&messages);
             for msg in messages {
                 let to = msg.get_receiver();

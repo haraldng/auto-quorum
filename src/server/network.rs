@@ -206,12 +206,7 @@ impl Network {
             Some(idx) => match &mut self.peer_connections[idx] {
                 Some(ref mut connection) => {
                     // TODO: remove connection if it closes
-                    // let now = Instant::now();
                     connection.send(msg);
-                    // let send_time = now.elapsed();
-                    // if send_time > Duration::from_micros(100) {
-                    //     eprintln!("Send cluster message {send_time:?}");
-                    // }
                 }
                 None => warn!("Not connected to node {to}: couldn't send {msg:?}"),
             },
@@ -222,6 +217,7 @@ impl Network {
     pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         if let Some(connection) = self.client_connections.get_mut(&to) {
             // debug!("Responding to client {to}: {msg:?}");
+            // TODO: remove connection if it closes
             connection.send(msg);
         } else {
             warn!("Not connected to client {to}");
