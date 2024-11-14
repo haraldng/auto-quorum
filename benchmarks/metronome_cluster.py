@@ -38,6 +38,7 @@ class MetronomeCluster:
         persist_config: 'MetronomeCluster.PersistConfig'
         delay_config: 'MetronomeCluster.DelayConfig'
         instrumentation: bool
+        debug_filepath: str
         rust_log: str="info"
 
     @dataclass
@@ -68,11 +69,14 @@ class MetronomeCluster:
         delay_value: int
 
         @staticmethod
-        def Sleep(duration: int):
-            return MetronomeCluster.DelayConfig(delay_type="Sleep", delay_value=duration)
+        def Sleep(microseconds: int):
+            return MetronomeCluster.DelayConfig(delay_type="Sleep", delay_value=microseconds)
         @staticmethod
-        def File(size: int):
-            return MetronomeCluster.DelayConfig(delay_type="File", delay_value=size)
+        def File(data_size: int):
+            return MetronomeCluster.DelayConfig(delay_type="File", delay_value=data_size)
+
+        def to_label(self) -> str:
+            return f"{self.delay_type}{self.delay_value}"
 
     @dataclass
     class PersistConfig:
@@ -108,18 +112,18 @@ class MetronomeCluster:
         instance_configs.extend([c.instance_config for c in client_configs.values()])
         self._gcp_cluster = GcpCluster(project_id, instance_configs)
 
-    def start_servers(self):
+    def start_servers(self, pull_images: bool=False):
         print("Starting servers")
         for server_id in self._server_configs.keys():
-            self.start_server(server_id)
+            self.start_server(server_id, pull_images)
 
-    def start_server(self, server_id: int):
+    def start_server(self, server_id: int, pull_image: bool=False):
         server_config = self._server_configs.get(server_id)
         assert server_config is not None, f"Server {server_id} doesn't exist"
         current_server_process = self._server_processes.get(server_id)
         if current_server_process is not None:
             current_server_process.terminate()
-        start_command = start_server_command(self._cluster_config, server_config)
+        start_command = start_server_command(self._cluster_config, server_config, pull_image=pull_image)
         server_process = self._gcp_cluster.ssh_command(server_config.instance_config.name, start_command)
         self._server_processes[server_id] = server_process
 
@@ -139,13 +143,13 @@ class MetronomeCluster:
         for server_process in self._server_processes.values():
             server_process.wait(timeout=600)
 
-    def start_client(self, id: int):
+    def start_client(self, id: int, pull_image: bool=False):
         client_config = self._client_configs.get(id)
         assert client_config is not None, f"Client {id} doesn't exist"
         current_client_process = self._client_processes.get(id)
         if current_client_process is not None:
             current_client_process.terminate()
-        start_command = start_client_command(self._cluster_config, client_config)
+        start_command = start_client_command(self._cluster_config, client_config, pull_image=pull_image)
         client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command, capture_stderr=True)
         self._client_processes[id] = client_process
 
@@ -186,7 +190,8 @@ class MetronomeCluster:
             print("Failed SSH 3 times")
             self.stop_servers()
         else:
-            self.await_servers()
+            # TODO: should await servers here but when running for a long time it seems server docker containers end, but ssh sessions don't end
+            # self.await_servers()
             print("Cluster finished")
 
     def shutdown(self):
@@ -302,6 +307,7 @@ class MetronomeClusterBuilder:
             persist_config=persist_config,
             delay_config=delay_config,
             instrumentation=instrumentation,
+            debug_filepath=f"server-{server_id}.csv",
             rust_log=rust_log,
         )
         self._server_configs[server_id] = server_config
@@ -411,6 +417,7 @@ sudo -u {user} docker pull "gcr.io/{container_image_location}"
 def start_server_command(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ServerConfig,
+    pull_image: bool=False,
 ) -> str:
     container_name = "server"
     container_image_location = "my-project-1499979282244/metronome_server"
@@ -419,11 +426,12 @@ def start_server_command(
     instance_output_dir = "./results"
     container_output_dir = "/app"
     instance_err_location = f"{instance_output_dir}/xerr-server-{config.server_id}.log"
-    instance_logs_location = f"{instance_output_dir}/server-{config.server_id}.json"
     server_config = _generate_server_config(cluster_config, config)
 
-    pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
-    kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
+    # pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
+    # kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
+    pull_command = f"docker pull gcr.io/{container_image_location}"
+    kill_prev_container_command = f"docker kill {container_name}"
     gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
         --name {container_name} \\
@@ -434,9 +442,13 @@ def start_server_command(
         -v {instance_output_dir}:{container_output_dir} \\
         --rm \\
         "gcr.io/{container_image_location}" \\
-        1> {instance_logs_location} 2> {instance_err_location}"""
-    # We sleep here to help avoid connecting to currently shutting down servers.
-    return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
+        2> {instance_err_location}"""
+    if pull_image:
+        full_command = f"{kill_prev_container_command}; {pull_command}; {gen_config_command} && {docker_command}"
+    else:
+        # Add a sleep to help avoid connecting to any currently shutting down servers.
+        full_command = f"{kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
+    return full_command
 
 def _generate_server_config(
     cluster_config: MetronomeCluster.ClusterConfig,
@@ -452,6 +464,7 @@ def _generate_server_config(
 cluster_name = "{cluster_config.name}"
 location = "{config.instance_config.zone}"
 instrumentation = {str(config.instrumentation).lower()}
+debug_filepath = "{config.debug_filepath}"
 {init_leader_toml}
 
 [persist_config]
@@ -502,6 +515,7 @@ sudo -u {user} docker pull "gcr.io/{container_image_location}"
 def start_client_command(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
+    pull_image: bool=False,
 ) -> str:
     container_name = "client"
     container_image_location = "my-project-1499979282244/metronome_client"
@@ -511,8 +525,10 @@ def start_client_command(
     container_output_dir = "/app"
     client_config = _generate_client_config(cluster_config, config)
 
-    pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
-    kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
+    # pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
+    # kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
+    pull_command = f"docker pull gcr.io/{container_image_location}"
+    kill_prev_container_command = f"docker kill {container_name}"
     gen_config_command = f"echo -e '{client_config}' > {instance_config_location}"
     docker_command = f"""docker run \\
     --name={container_name} \\
@@ -522,8 +538,13 @@ def start_client_command(
     -v {instance_config_location}:{container_config_location} \\
     -v {instance_output_dir}:{container_output_dir} \\
     gcr.io/{container_image_location}"""
-    # We sleep here to help avoid connecting to currently shutting down servers.
-    return f"{pull_command}; {kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
+    full_command = f"{kill_prev_container_command}; sleep 2; {gen_config_command} && {docker_command}"
+    if pull_image:
+        full_command = f"{kill_prev_container_command}; {pull_command}; {gen_config_command} && {docker_command}"
+    else:
+        # Add a sleep to help avoid connecting to any currently shutting down servers.
+        full_command = f"{kill_prev_container_command}; sleep 1; {gen_config_command} && {docker_command}"
+    return full_command
 
 def _generate_client_config(
     cluster_config: MetronomeCluster.ClusterConfig,

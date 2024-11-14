@@ -22,7 +22,6 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
             categories=[format_bytes(2**i) for i in range(0, 32)],
             ordered=True
         )
-    # print(df[['file', 'delay_info.value', 'delay_info.value_cat']])
     return df
 
 def parse_client_summary(file_path: Path) -> pd.DataFrame:
@@ -61,11 +60,11 @@ def format_bytes(num_bytes):
             return f'{num_bytes:.0f} {units[i]}'
         num_bytes /= 1024  # Divide by 1024 for each step to move to the next unit
 
-def parse_client_log(client_summary: pd.Series) -> pd.DataFrame:
+def parse_client_log(client_summary: pd.Series, nrows: int) -> pd.DataFrame:
     experiment_start = client_summary.client_start_time
     client_filepath = str(client_summary.file)
     client_log_filepath = client_filepath.replace(".json", ".csv")
-    df = pd.read_csv(client_log_filepath)
+    df = pd.read_csv(client_log_filepath, usecols=['request_time', 'response_time'], nrows=nrows)
     df['request_time'] = df['request_time'] - experiment_start
     df['response_time'] = df['response_time'] - experiment_start
     return df
@@ -75,17 +74,17 @@ def parse_server_logs(client_summary: pd.Series) -> pd.DataFrame | None:
         return None
     experiment_start = client_summary.client_start_time
     client_file = str(client_summary.file)
-    leader_file = client_file.replace("client-1", f"server-1")
+    leader_file = client_file.replace("client-1", f"server-1").replace(".json", ".csv")
     follower_files = []
     for server_id in range(2, client_summary.cluster_size+1):
-        follower_file = client_file.replace("client-1", f"server-{server_id}")
+        follower_file = client_file.replace("client-1", f"server-{server_id}").replace(".json", ".csv")
         follower_files.append(follower_file)
 
     print(leader_file)
     df = parse_leader_log(leader_file, experiment_start)
     for i, follower_file in enumerate(follower_files):
         print(follower_file)
-        df_follower = pd.read_json(follower_file)
+        df_follower = pd.read_csv(follower_file)
         df_follower['net_receive'] = df_follower['net_receive'] - experiment_start
         df_follower['start_persist'] = df_follower['start_persist'] - experiment_start
         df_follower['send_accepted'] = df_follower['send_accepted'] - experiment_start
@@ -94,11 +93,10 @@ def parse_server_logs(client_summary: pd.Series) -> pd.DataFrame | None:
     return df
 
 def parse_leader_log(log_path: str, experiment_start: int):
-    df = pd.read_json(log_path)
+    df = pd.read_csv(log_path)
     df['net_receive'] = df['net_receive'] - experiment_start
     df['channel_receive'] = df['channel_receive'] - experiment_start
     df['commit'] = df['commit'] - experiment_start
-    df['sending_response'] = df['sending_response'] - experiment_start
     # def convert_time_in_list_of_dicts(list_of_dicts):
     #     for d in list_of_dicts:
     #         d['time'] = d['time'] - experiment_start
@@ -118,7 +116,7 @@ def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legen
         offset = width * multiplier
         rects = ax.bar(x + offset, avg, width, label=label, yerr=std_dev)
         # Adds value labels above bars
-        ax.bar_label(rects, fmt='%.2f', padding=3)
+        ax.bar_label(rects, fmt='%.2f', padding=3, rotation=90)
         multiplier += 1
     ax.set_ylabel('Latency (ms)', fontsize=24)
     ax.tick_params(axis='y', labelsize=20)
@@ -139,7 +137,6 @@ def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, 
         fig, ax = plt.subplots(layout="constrained", figsize=(12,6))
         ax.set_title(title)
         graph_request_latency_subplot(ax, client_summary, client_log)
-        plt.show()
         return fig
     else:
         # Only show subset of data
@@ -164,7 +161,6 @@ def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, 
         graph_acceptor_queue_subplot(axs[1], client_summary, server_df)
         # graph_persist_latency_subplot(axs[2], client_summary, server_df)
         graph_average_persist_latency_subplot(axs[2], client_summary, server_df)
-        # plt.show()
         return fig
 
 def graph_request_latency_subplot(fig, client_summary: pd.Series, client_log: pd.DataFrame):
@@ -257,15 +253,18 @@ def graph_local_experiment():
     # Get experiment data
     experiment_directory = "local-experiments"
     df = parse_clients_summaries(experiment_directory)
-    for (_, client_summary) in df.iterrows():
-        client_log = parse_client_log(client_summary)
+    for (i, (_, client_summary)) in enumerate(df.iterrows()):
+        client_log = parse_client_log(client_summary, 10_000)
         server_logs = parse_server_logs(client_summary)
-        graph_experiment_debug(client_summary, client_log, server_logs)
+        fig = graph_experiment_debug(client_summary, client_log, server_logs)
+        plt.show()
+        fig.savefig(f"./logs/{experiment_directory}/debug-{i}.svg", format="svg")
+
 
 
 def graph_closed_loop_experiment(save: bool=True):
     # Get experiment data
-    experiment_directory = "closed-loop-experiments-Individual"
+    experiment_directory = "closed-loop-experiments-sleep-Individual"
     run_directory = "5-node-cluster-1000-clients"
     # three_df = parse_client_logs(f"{experiment_directory}/3-node-cluster-10-clients")
     five_df = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
@@ -295,7 +294,7 @@ def graph_closed_loop_experiment(save: bool=True):
                 }
             fig, ax = create_base_barchart(latency_means, bar_group_labels, legend_args)
             ax.set_xlabel("Data Size (bytes)", fontsize=24)
-            plt.xticks(rotation=45)
+            # plt.xticks(rotation=45)
             fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients={client_summary.num_parallel_requests}, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})", fontsize=16)
             if save:
                 fig.savefig(f"./logs/{experiment_directory}/{run_directory}/{metric}.svg", format="svg")
@@ -303,10 +302,12 @@ def graph_closed_loop_experiment(save: bool=True):
 
     # Create violin plot
     client_logs = []
-    for _, client_summary in five_df.iterrows():
-        client_log = parse_client_log(client_summary)
+    for i, client_summary in five_df.iterrows():
+        # if client_summary['delay_info.value'] == "256 KiB":
+        #     continue
+        client_log = parse_client_log(client_summary, 100_000)
         client_log.dropna(subset=["response_time"], inplace=True)
-        # client_log = client_log.iloc[1000:].reset_index(drop=True)
+        # client_log = client_log.iloc[0:100_000].reset_index(drop=True)
         client_log['latency'] = (client_log['response_time'] - client_log['request_time']) / 1000
         client_log['data_size'] = client_summary['delay_info.value']
         client_log['use_metronome'] = client_summary.use_metronome == 2
@@ -314,7 +315,7 @@ def graph_closed_loop_experiment(save: bool=True):
     violin_data = pd.concat(client_logs, ignore_index=True)
     plt.figure(figsize=(10, 6))
     palette = {False: 'skyblue', True: 'orange'}
-    sns.violinplot(data=violin_data, x="data_size", y="latency", hue="use_metronome", split=True, inner='quart', palette=palette)
+    sns.violinplot(data=violin_data, x="data_size", y="latency", hue="use_metronome", split=True, inner='quart', palette=palette, density_norm="width")
     # Labels
     client_summary = five_df.iloc[0]
     title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients={client_summary.num_parallel_requests}, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})"
@@ -322,19 +323,34 @@ def graph_closed_loop_experiment(save: bool=True):
     plt.xticks(rotation=45)
     plt.xlabel("Datasize (bytes)")
     plt.ylabel("Response Latency (ms)")
-
     if save:
         plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
     plt.show()
 
     # Create debug plots
     for i, (_, client_summary) in enumerate(five_df.iterrows()):
-        client_log = parse_client_log(client_summary)
+        client_log = parse_client_log(client_summary, 100_000)
         server_logs = parse_server_logs(client_summary)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
-            fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.svg", format="svg")
+            fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
     return
+
+def graph_latency_throughput_experiment():
+    # Get experiment data
+    experiment_directory = "latency-throughput-experiment"
+    run_directory = "5-node-cluster-File0"
+    summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
+    print(summaries)
+
+    # Create debug plots
+    client_summary = summaries.iloc[2]
+    client_log = parse_client_log(client_summary, 100_000)
+    server_logs = parse_server_logs(client_summary)
+    fig = graph_experiment_debug(client_summary, client_log, server_logs)
+    plt.show()
+    return
+
 
 
 # def graph_metronome_size_experiment():
@@ -367,8 +383,8 @@ def graph_closed_loop_experiment(save: bool=True):
 
 def main():
     # graph_local_experiment()
-    graph_closed_loop_experiment()
-    # graph_closed_loop_sleep_experiment()
+    # graph_closed_loop_experiment()
+    graph_latency_throughput_experiment()
     # graph_metronome_size_experiment()
     pass
 
