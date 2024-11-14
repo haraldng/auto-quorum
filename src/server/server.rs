@@ -1,12 +1,13 @@
 use crate::{database::Database, network::Network};
-use auto_quorum::common::{
+use chrono::Utc;
+use core::panic;
+use csv::Writer;
+use log::*;
+use metronome::common::{
     configs::{OmniPaxosServerConfig, *},
     kv::*,
     messages::*,
 };
-use chrono::Utc;
-use core::panic;
-use log::*;
 use omnipaxos::{
     ballot_leader_election::Ballot,
     messages::{
@@ -64,6 +65,7 @@ impl From<PersistConfig> for PersistMode {
 }
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
+type TimeStamp = i64;
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -117,10 +119,7 @@ impl OmniPaxosServer {
         )
         .await;
         let instrumentation_data = match server_config.instrumentation {
-            true => Some(InstrumentationData {
-                request_data: Vec::with_capacity(1000),
-                acceptor_data: Vec::with_capacity(1000),
-            }),
+            true => Some(InstrumentationData::new(server_config.clone())),
             false => None,
         };
         let mut server = OmniPaxosServer {
@@ -165,6 +164,7 @@ impl OmniPaxosServer {
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
                             info!("{}: Leader fully initialized", self.id);
+                            debug!("Sending ready message to client {}", self.id);
                             self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into()));
                             break;
                         }
@@ -225,7 +225,11 @@ impl OmniPaxosServer {
                 ClusterMessage::OmniPaxosMessage(m) => self.omnipaxos.handle_incoming(m),
                 ClusterMessage::Done => {
                     info!("{}: Received Done signal from leader", self.id);
-                    self.debug_acceptor_data();
+                    if let Some(data) = &self.instrumentation_data {
+                        data.acceptor_data_to_csv(self.config.debug_filepath.clone())
+                            .expect("File write failed");
+                        data.debug_acceptor_data();
+                    }
                     server_done = true
                 }
             }
@@ -249,12 +253,7 @@ impl OmniPaxosServer {
                 (client_id, ClientMessage::Append(command_id, kv_command), net_recv_time) => {
                     debug!("Server: Request from client {client_id}: {command_id} {kv_command:?}");
                     if let Some(data) = &mut self.instrumentation_data {
-                        let req_data = RequestInstrumentation::with(
-                            command_id,
-                            net_recv_time,
-                            Utc::now().timestamp_micros(),
-                        );
-                        data.request_data.push(req_data);
+                        data.new_request(command_id, net_recv_time)
                     }
                     self.commit_command_to_log(client_id, command_id, kv_command);
                 }
@@ -268,7 +267,11 @@ impl OmniPaxosServer {
                     // NOTE: If we exit the program before Done is sent it may be dropped
                     // TODO: Allow for wait on network flushing all pending messages instead
                     std::thread::sleep(Duration::from_secs(1));
-                    self.debug_request_data();
+                    if let Some(data) = &self.instrumentation_data {
+                        data.request_data_to_csv(self.config.debug_filepath.clone())
+                            .expect("File write failed");
+                        data.debug_request_data();
+                    }
                     client_done = true;
                 }
             }
@@ -283,8 +286,7 @@ impl OmniPaxosServer {
         let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
         for slot in decided_slots {
             if let Some(data) = &mut self.instrumentation_data {
-                let commit_time = Utc::now().timestamp_micros();
-                data.request_data[slot].commit = Some(commit_time);
+                data.commited(slot);
             }
             let decided_entry = self
                 .omnipaxos
@@ -296,10 +298,6 @@ impl OmniPaxosServer {
                 LogEntry::Undecided(cmd) => self.update_database_and_respond(cmd),
                 LogEntry::Snapshotted(_) => unimplemented!(),
                 _ => unreachable!(),
-            }
-            if let Some(data) = &mut self.instrumentation_data {
-                let response_time = Utc::now().timestamp_micros();
-                data.request_data[slot].sending_response = Some(response_time);
             }
         }
     }
@@ -357,13 +355,11 @@ impl OmniPaxosServer {
         for msg in messages {
             if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
                 if let Some(data) = &mut self.instrumentation_data {
-                    let persist_time = Utc::now().timestamp_micros();
-                    data.acceptor_data[slot_idx].start_persist = Some(persist_time);
+                    data.new_persist_start(slot_idx);
                 }
                 self.emulate_storage_delay(1);
                 if let Some(data) = &mut self.instrumentation_data {
-                    let accepted_time = Utc::now().timestamp_micros();
-                    data.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+                    data.new_persist_end(slot_idx);
                 }
             }
             let to = msg.get_receiver();
@@ -384,10 +380,7 @@ impl OmniPaxosServer {
                         self.emulate_storage_delay(batch_size);
                         for (accepted_idx, to, accepted_msg) in self.accepted_buffer.drain(..) {
                             if let Some(data) = &mut self.instrumentation_data {
-                                let accepted_time = Utc::now().timestamp_micros();
-                                data.acceptor_data[accepted_idx].start_persist = Some(persist_time);
-                                data.acceptor_data[accepted_idx].send_accepted =
-                                    Some(accepted_time);
+                                data.new_persist_batch(accepted_idx, persist_time);
                             }
                             self.network.send_to_cluster(to, accepted_msg);
                         }
@@ -414,9 +407,7 @@ impl OmniPaxosServer {
         for msg in messages {
             if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
                 if let Some(data) = &mut self.instrumentation_data {
-                    let accepted_time = Utc::now().timestamp_micros();
-                    data.acceptor_data[slot_idx].start_persist = Some(persist_time);
-                    data.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+                    data.new_persist_batch(slot_idx, persist_time)
                 }
             }
             let to = msg.get_receiver();
@@ -462,14 +453,7 @@ impl OmniPaxosServer {
                     )) = message
                     {
                         if acc.slot_idx != usize::MAX {
-                            let accepted_time = Utc::now().timestamp_micros();
-                            let node_ts = NodeTimestamp {
-                                node_id: *from,
-                                time: accepted_time,
-                            };
-                            data.request_data[acc.slot_idx]
-                                .receive_accepted
-                                .push(node_ts);
+                            data.recv_accepted(acc.slot_idx, *from);
                         }
                     }
                 }
@@ -485,8 +469,7 @@ impl OmniPaxosServer {
                     )) = message
                     {
                         for command in &accdec.entries {
-                            data.acceptor_data
-                                .push(AcceptorInstrumentation::new(command.id, *net_recv_time));
+                            data.recv_accdec(command.id, *net_recv_time);
                         }
                     }
                 }
@@ -503,120 +486,219 @@ impl OmniPaxosServer {
                     msg: PaxosMsg::AcceptDecide(accdec),
                 }) = m
                 {
-                    let accdec_time = Utc::now().timestamp_micros();
-                    for offset in 0..accdec.entries.len() {
-                        let node_ts = NodeTimestamp {
-                            node_id: *to,
-                            time: accdec_time,
-                        };
-                        data.request_data[accdec.start_idx + offset]
-                            .send_accdec
-                            .push(node_ts);
-                    }
+                    data.send_accdec(accdec.start_idx, accdec.entries.len(), *to);
                 }
             }
         }
     }
+}
 
-    fn debug_request_data(&mut self) {
-        if let Some(data) = &self.instrumentation_data {
-            // TODO: Switch to better format like parquet or hdf5
-            let request_json = serde_json::to_string(&data.request_data).unwrap();
-            print!("{request_json}");
+struct InstrumentationData {
+    request_data: Vec<RequestInstrumentation>,
+    acceptor_data: Vec<AcceptorInstrumentation>,
+    metronome_batch_size: usize,
+    id: NodeId,
+}
 
-            let latencies: Vec<RequestInstrumentation> = data.request_data.clone();
-            let recv_latencies = latencies
-                .iter()
-                .map(|data| data.channel_receive - data.net_receive)
-                .collect();
-            let avg_recv_latency = self.get_average(&recv_latencies);
-            eprintln!("Net Recv -> Task Recv        {avg_recv_latency:?}");
-
-            let start_accdec_latencies = latencies
-                .iter()
-                .map(|data| data.send_accdec[0].time - data.channel_receive)
-                .collect();
-            let avg_start_accdec_latency = self.get_average(&start_accdec_latencies);
-            eprintln!("Request -> Start AccDec      {avg_start_accdec_latency:?}");
-
-            let accdec_latencies = latencies
-                .iter()
-                .map(|data| {
-                    data.send_accdec[data.send_accdec.len() - 1].time - data.send_accdec[0].time
-                })
-                .collect();
-            let avg_accdec_latency = self.get_average(&accdec_latencies);
-            eprintln!("Start AccDec -> Last AccDec  {avg_accdec_latency:?}");
-
-            let accepted_latencies: Vec<Vec<Option<i64>>> = latencies
-                .iter()
-                .map(|data| data.get_accepted_latencies())
-                .collect();
-            let avg_accepted_latency = self.get_average_per_acceptor(&accepted_latencies);
-            eprintln!("AccDec -> Accepted:");
-            for acceptor_latency in &avg_accepted_latency {
-                for latency in acceptor_latency {
-                    eprint!("{latency:<15?}");
-                }
-                eprintln!();
-            }
-
-            let avg_acceptor_delay = Self::get_average_acceptor_delay(&avg_accepted_latency);
-            eprintln!("Average Acceptor Delay:");
-            for delay in avg_acceptor_delay {
-                eprint!("{delay:<15?}");
-            }
-            eprintln!();
-
-            let commit_latencies = latencies
-                .iter()
-                .filter_map(|data| data.commit.map(|t| t - data.send_accdec[0].time))
-                .collect();
-            let avg_commit_latency = self.get_average(&commit_latencies);
-            eprintln!("Start AccDec -> Commit      {avg_commit_latency:?}");
-
-            let server_total_latencies = latencies
-                .iter()
-                .filter_map(|data| data.sending_response.map(|t| t - data.send_accdec[0].time))
-                .collect();
-            let avg_server_total_latency = self.get_average(&server_total_latencies);
-            eprintln!("Server Total Latency        {avg_server_total_latency:?}");
-        }
-    }
-
-    fn debug_acceptor_data(&self) {
-        if let Some(data) = &self.instrumentation_data {
-            let acceptor_json = serde_json::to_string_pretty(&data.acceptor_data).unwrap();
-            print!("{acceptor_json}");
-
-            let accepted_latencies = data
-                .acceptor_data
-                .iter()
-                .map(|data| match data.send_accepted {
-                    Some(time) => time - data.net_receive,
-                    None => 0,
-                })
-                .collect();
-            std::thread::sleep(Duration::from_millis(50 * self.id));
-            let avg_accepted_latency = self.get_average(&accepted_latencies);
-            eprintln!(
-                "Node {}: Accepted Latency {avg_accepted_latency:?}",
-                self.id
-            );
-        }
-    }
-
-    fn get_metronome_batch_size(&self) -> usize {
-        let num_nodes = self.config.cluster_config.nodes.len();
-        let metronome_quorum = match self.config.cluster_config.metronome_quorum_size {
+impl InstrumentationData {
+    fn new(config: OmniPaxosServerConfig) -> Self {
+        let num_nodes = config.cluster_config.nodes.len();
+        let metronome_quorum = match config.cluster_config.metronome_quorum_size {
             Some(quorum_size) => quorum_size,
             None => (num_nodes / 2) + 1,
         };
-        return n_choose_k(num_nodes, metronome_quorum);
+        InstrumentationData {
+            request_data: Vec::with_capacity(1000),
+            acceptor_data: Vec::with_capacity(1000),
+            metronome_batch_size: n_choose_k(num_nodes, metronome_quorum),
+            id: config.server_config.pid,
+        }
     }
 
-    fn get_average(&self, latencies: &Vec<i64>) -> Vec<i64> {
-        let batch_size = self.get_metronome_batch_size();
+    #[inline]
+    fn new_request(&mut self, command_id: CommandId, net_recv_time: TimeStamp) {
+        let recv_request_time = Utc::now().timestamp_micros();
+        let request_data = RequestInstrumentation {
+            command_id,
+            net_receive: net_recv_time,
+            channel_receive: recv_request_time,
+            send_accdec: Vec::with_capacity(5),
+            receive_accepted: Vec::with_capacity(4),
+            commit: None,
+        };
+        self.request_data.push(request_data);
+    }
+
+    #[inline]
+    fn send_accdec(&mut self, start_idx: usize, num_entries: usize, to: NodeId) {
+        let accdec_time = Utc::now().timestamp_micros();
+        for offset in 0..num_entries {
+            let node_ts = NodeTimestamp {
+                node_id: to,
+                time: accdec_time,
+            };
+            self.request_data[start_idx + offset]
+                .send_accdec
+                .push(node_ts);
+        }
+    }
+
+    #[inline]
+    fn recv_accepted(&mut self, slot_idx: usize, from: NodeId) {
+        let recv_accepted_time = Utc::now().timestamp_micros();
+        let node_ts = NodeTimestamp {
+            node_id: from,
+            time: recv_accepted_time,
+        };
+        self.request_data[slot_idx].receive_accepted.push(node_ts);
+    }
+
+    #[inline]
+    fn commited(&mut self, slot_idx: usize) {
+        let commit_time = Utc::now().timestamp_micros();
+        self.request_data[slot_idx].commit = Some(commit_time);
+    }
+
+    // ===== Acceptor data =====
+    #[inline]
+    fn recv_accdec(&mut self, command_id: CommandId, net_recv_time: TimeStamp) {
+        let accept_data = AcceptorInstrumentation {
+            command_id,
+            net_receive: net_recv_time,
+            start_persist: None,
+            send_accepted: None,
+        };
+        self.acceptor_data.push(accept_data);
+    }
+
+    #[inline]
+    fn new_persist_start(&mut self, slot_idx: usize) {
+        let persist_time = Utc::now().timestamp_micros();
+        self.acceptor_data[slot_idx].start_persist = Some(persist_time);
+    }
+
+    #[inline]
+    fn new_persist_end(&mut self, slot_idx: usize) {
+        let accepted_time = Utc::now().timestamp_micros();
+        self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+    }
+
+    #[inline]
+    fn new_persist_batch(&mut self, slot_idx: usize, batch_start: TimeStamp) {
+        let accepted_time = Utc::now().timestamp_micros();
+        self.acceptor_data[slot_idx].start_persist = Some(batch_start);
+        self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+    }
+
+    fn acceptor_data_to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
+        let file = File::create(file_path)?;
+        let mut writer = Writer::from_writer(file);
+        for accepted_data in &self.acceptor_data {
+            writer.serialize(accepted_data)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn request_data_to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
+        let file = File::create(file_path)?;
+        let mut writer = Writer::from_writer(file);
+        for request_data in &self.request_data {
+            writer.serialize(request_data)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn debug_request_data(&self) {
+        let recv_lat = self.avg_recv_latency();
+        let start_accdec_lat = self.avg_start_accdec_latency();
+        let send_accdec_lat = self.avg_accdec_latency();
+        let commit_lat = self.avg_commit_latency();
+        eprintln!("Net Recv -> Task Recv        {recv_lat:?}");
+        eprintln!("Request -> Start AccDec      {start_accdec_lat:?}");
+        eprintln!("Start AccDec -> Last AccDec  {send_accdec_lat:?}");
+        eprintln!("AccDec -> Accepted:");
+        let avg_accepted_latency = self.avg_accepted_latency();
+        for acceptor_latency in &avg_accepted_latency {
+            for latency in acceptor_latency {
+                eprint!("{latency:<15?}");
+            }
+            eprintln!();
+        }
+        let avg_acceptor_delay = Self::get_average_acceptor_delay(&avg_accepted_latency);
+        eprintln!("Average Acceptor Delay:");
+        for delay in avg_acceptor_delay {
+            eprint!("{delay:<15?}");
+        }
+        eprintln!();
+        eprintln!("Start AccDec -> Commit      {commit_lat:?}");
+    }
+
+    fn debug_acceptor_data(&self) {
+        let accepted_latencies = self
+            .acceptor_data
+            .iter()
+            .map(|data| match data.send_accepted {
+                Some(time) => time - data.net_receive,
+                None => 0,
+            })
+            .collect();
+        let avg_accepted_latency = self.get_batch_average(&accepted_latencies);
+        let id = self.id;
+        std::thread::sleep(Duration::from_secs(1 * id));
+        eprintln!("Node {id}: Accepted Latency {avg_accepted_latency:?}");
+    }
+
+    fn avg_recv_latency(&self) -> Vec<i64> {
+        let recv_latencies = self
+            .request_data
+            .iter()
+            .map(|data| data.channel_receive - data.net_receive)
+            .collect();
+        self.get_batch_average(&recv_latencies)
+    }
+
+    fn avg_start_accdec_latency(&self) -> Vec<i64> {
+        let start_accdec_latencies = self
+            .request_data
+            .iter()
+            .map(|data| data.send_accdec[0].time - data.channel_receive)
+            .collect();
+        self.get_batch_average(&start_accdec_latencies)
+    }
+
+    fn avg_accdec_latency(&self) -> Vec<i64> {
+        let accdec_latencies = self
+            .request_data
+            .iter()
+            .map(|data| {
+                data.send_accdec[data.send_accdec.len() - 1].time - data.send_accdec[0].time
+            })
+            .collect();
+        self.get_batch_average(&accdec_latencies)
+    }
+
+    fn avg_commit_latency(&self) -> Vec<i64> {
+        let commit_latencies = self
+            .request_data
+            .iter()
+            .filter_map(|data| data.commit.map(|t| t - data.send_accdec[0].time))
+            .collect();
+        self.get_batch_average(&commit_latencies)
+    }
+
+    fn avg_accepted_latency(&self) -> Vec<Vec<i64>> {
+        let accepted_latencies: Vec<Vec<Option<i64>>> = self
+            .request_data
+            .iter()
+            .map(|data| data.get_accepted_latencies())
+            .collect();
+        self.get_average_per_acceptor(&accepted_latencies)
+    }
+
+    fn get_batch_average(&self, latencies: &Vec<i64>) -> Vec<i64> {
+        let batch_size = self.metronome_batch_size;
         let batch_count = (latencies.len() / batch_size) as i64;
         let mut sums = vec![0; batch_size];
         for batch in latencies.chunks(batch_size) {
@@ -628,7 +710,7 @@ impl OmniPaxosServer {
     }
 
     fn get_average_per_acceptor(&self, latencies: &Vec<Vec<Option<i64>>>) -> Vec<Vec<i64>> {
-        let batch_size = self.get_metronome_batch_size();
+        let batch_size = self.metronome_batch_size;
         let batch_count = (latencies.len() / batch_size) as i64;
         let acceptor_count = latencies[0].len();
         let mut sums = vec![vec![0; acceptor_count]; batch_size];
@@ -686,9 +768,12 @@ impl OmniPaxosServer {
     }
 }
 
-struct InstrumentationData {
-    request_data: Vec<RequestInstrumentation>,
-    acceptor_data: Vec<AcceptorInstrumentation>,
+#[derive(Debug, Clone, Serialize)]
+struct AcceptorInstrumentation {
+    command_id: CommandId,
+    net_receive: i64,
+    start_persist: Option<i64>,
+    send_accepted: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -707,22 +792,9 @@ struct RequestInstrumentation {
     #[serde(skip_serializing)]
     receive_accepted: Vec<NodeTimestamp>,
     commit: Option<i64>,
-    sending_response: Option<i64>,
 }
 
 impl RequestInstrumentation {
-    fn with(command_id: CommandId, net_receive_time: i64, ch_receive_time: i64) -> Self {
-        Self {
-            command_id,
-            net_receive: net_receive_time,
-            channel_receive: ch_receive_time,
-            send_accdec: Vec::with_capacity(5),
-            receive_accepted: Vec::with_capacity(4),
-            commit: None,
-            sending_response: None,
-        }
-    }
-
     fn get_num_acceptors(&self) -> usize {
         self.send_accdec
             .iter()
@@ -746,25 +818,6 @@ impl RequestInstrumentation {
             latencies[acceptor_idx] = Some(latency);
         }
         latencies
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AcceptorInstrumentation {
-    command_id: CommandId,
-    net_receive: i64,
-    start_persist: Option<i64>,
-    send_accepted: Option<i64>,
-}
-
-impl AcceptorInstrumentation {
-    fn new(command_id: CommandId, net_receive: i64) -> Self {
-        AcceptorInstrumentation {
-            command_id,
-            net_receive,
-            start_persist: None,
-            send_accepted: None,
-        }
     }
 }
 

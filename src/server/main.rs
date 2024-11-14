@@ -1,8 +1,8 @@
 use crate::server::OmniPaxosServer;
-use auto_quorum::common::configs::OmniPaxosServerConfig;
 use chrono::Local;
 use env_logger::Builder;
 use log::LevelFilter;
+use metronome::common::configs::OmniPaxosServerConfig;
 use omnipaxos::{errors::ConfigError, OmniPaxosConfig};
 use std::{env, fs, io::Write};
 use toml;

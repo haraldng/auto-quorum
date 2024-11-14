@@ -3,19 +3,20 @@ location = "local-1"
 initial_leader = 1
 local_deployment = true
 instrumentation = true
+debug_filepath = "../benchmarks/logs/local-experiments/server-1.csv"
 
 [persist_config]
 persist_type = "Opportunistic"
-#persist_value = 5
+#persist_value = 10
 
 [delay_config]
 delay_type = "File"
-delay_value = 1000
+delay_value = 1024
 
 [cluster_config]
 configuration_id = 1
 nodes = [1, 2, 3, 4, 5]
-use_metronome = 2
+use_metronome = 0
 #metronome_quorum_size = 3
 #flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
 

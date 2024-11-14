@@ -1,9 +1,9 @@
 use crate::network::Network;
-use auto_quorum::common::{kv::*, messages::*};
 use chrono::Utc;
 use csv::Writer;
 use futures::StreamExt;
 use log::*;
+use metronome::common::{kv::*, messages::*};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
 
@@ -52,7 +52,6 @@ pub struct Client {
     client_data: ClientData,
     config: ClientConfig,
     leaders_config: Option<MetronomeConfigInfo>,
-    client_start_time: Option<Timestamp>,
 }
 
 impl Client {
@@ -75,12 +74,12 @@ impl Client {
             client_data: ClientData::new(num_estimated_responses),
             config,
             leaders_config: None,
-            client_start_time: None,
         }
     }
 
     pub async fn run(&mut self) {
         // Wait until server is ready
+        info!("Waiting for ready signal from server");
         let first_msg = self.network.next().await;
         match first_msg {
             Some(ServerMessage::Ready(server_config)) => {
@@ -91,7 +90,8 @@ impl Client {
         }
 
         // Send initial requests
-        self.client_start_time = Some(Utc::now().timestamp_micros());
+        info!("Starting requests");
+        self.client_data.experiment_start();
         for request_id in 0..self.num_parallel_requests {
             self.send_request(request_id);
         }
@@ -101,19 +101,16 @@ impl Client {
             EndCondition::ResponsesCollected(n) => self.run_until_response_limit(n).await,
             EndCondition::TimePassed(t) => self.run_until_duration_limit(t).await,
         }
+        self.client_data.experiment_end();
         info!(
-            "Client finished collecting {} responses",
+            "Client finished: collected {} responses",
             self.client_data.total_responses()
         );
 
         // Shutdown cluster and collect results
         self.network.send(ClientMessage::Done);
         self.client_data
-            .save_summary(
-                self.config.clone(),
-                self.leaders_config.unwrap(),
-                self.client_start_time.unwrap(),
-            )
+            .save_summary(self.config.clone(), self.leaders_config.unwrap())
             .expect("Failed to write summary file");
         self.client_data
             .to_csv(self.config.output_filepath.clone())
@@ -198,6 +195,8 @@ struct ClientData {
     response_data: Vec<ResponseData>,
     request_count: usize,
     response_count: usize,
+    client_start_time: Option<Timestamp>,
+    client_end_time: Option<Timestamp>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,7 +212,16 @@ impl ClientData {
             response_data: Vec::with_capacity(num_estimated_responses),
             request_count: 0,
             response_count: 0,
+            client_start_time: None,
+            client_end_time: None,
         }
+    }
+
+    fn experiment_start(&mut self) {
+        self.client_start_time = Some(Utc::now().timestamp_micros());
+    }
+    fn experiment_end(&mut self) {
+        self.client_end_time = Some(Utc::now().timestamp_micros());
     }
 
     // A Client can send requests with out-of-order command ids due to parallel requests.
@@ -253,14 +261,15 @@ impl ClientData {
         &self,
         client_config: ClientConfig,
         server_info: MetronomeConfigInfo,
-        client_start_time: Timestamp,
     ) -> Result<(), std::io::Error> {
         let summary_filepath = client_config.summary_filepath.clone();
         let (request_latency_average, request_latency_std_dev) = self.avg_response_latency();
         let summary = ClientSummary {
             client_config,
             server_info,
-            client_start_time,
+            client_start_time: self
+                .client_start_time
+                .expect("Should create summary after experiment start"),
             throughput: self.throughput(),
             total_responses: self.total_responses(),
             unanswered_requests: self.unanswered_requests(),
@@ -311,16 +320,15 @@ impl ClientData {
         (avg_latency as f64 / 1000., std_dev / 1000.)
     }
 
-    // The request throughput in requests/sec
+    // The request throughput in responses/sec
     fn throughput(&self) -> f64 {
-        let first_request_time = self.response_data[0]
-            .request_time
-            .expect("First request shouldn't be placeholder");
-        let last_request_time = self.response_data[self.response_data.len() - 1]
-            .request_time
-            .expect("Last request shouldn't be placeholder");
-        let messaging_duration = last_request_time - first_request_time;
-        let throughput = (self.request_count as f64 / messaging_duration as f64) * 1_000_000.;
+        let experiment_duration = self
+            .client_end_time
+            .expect("Should calculate throughput after experiment end")
+            - self
+                .client_start_time
+                .expect("Should calculate throughput after experiment start");
+        let throughput = (self.request_count as f64 / experiment_duration as f64) * 1_000_000.;
         return throughput;
     }
 

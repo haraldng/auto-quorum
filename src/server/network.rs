@@ -1,11 +1,11 @@
-use auto_quorum::common::{
+use chrono::Utc;
+use futures::{SinkExt, StreamExt};
+use log::*;
+use metronome::common::{
     kv::{ClientId, NodeId},
     messages::*,
     utils::*,
 };
-use chrono::Utc;
-use futures::{SinkExt, StreamExt};
-use log::*;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -134,7 +134,7 @@ impl Network {
                     *max_client_id += 1;
                     *max_client_id
                 };
-                debug!("Identified connection from client {next_client_id}");
+                info!("Identified connection from client {next_client_id}");
                 let underlying_stream = registration_connection.into_inner().into_inner();
                 NewConnection::ToClient(ClientConnection::new(
                     next_client_id,

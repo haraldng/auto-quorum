@@ -1,39 +1,54 @@
 
 x-common-variables: &common-variables
-  RUST_LOG: "debug"
-  CONFIG_FILE: "~/server-config.toml"
-  # LOCAL: "false"
-  # TCP_CC: "false"
-  # OPTIMIZE: "true"
+  RUST_LOG: "info"
+  CONFIG_FILE: "${HOME}/server-config.toml"
 
 services:
   s1:
-    image: omnipaxos-server
+    image: metronome-server
     build:
       context: ./..
-      dockerfile: omnipaxos_server/Dockerfile
+      dockerfile: server.dockerfile
     container_name: s1
     environment:
       <<: *common-variables
     volumes:
-      - ./server-1-config.toml:~/server-config.toml
+      - ./server-1-config.toml:${HOME}/server-config.toml
     ports:
       - "8001:8001"
   s2:
-    image: omnipaxos-server
+    image: metronome-server
     container_name: s2
     environment:
       <<: *common-variables
     volumes:
-      - ./server-2-config.toml:~/server-config.toml
+      - ./server-2-config.toml:${HOME}/server-config.toml
     ports:
       - "8002:8002"
   s3:
-    image: omnipaxos-server
+    image: metronome-server
     container_name: s3
     environment:
       <<: *common-variables
     volumes:
-      - ./server-3-config.toml:~/server-config.toml
+      - ./server-3-config.toml:${HOME}/server-config.toml
     ports:
       - "8003:8003"
+  s4:
+    image: metronome-server
+    container_name: s4
+    environment:
+      <<: *common-variables
+    volumes:
+      - ./server-4-config.toml:${HOME}/server-config.toml
+    ports:
+      - "8004:8004"
+  s5:
+    image: metronome-server
+    container_name: s5
+    environment:
+      <<: *common-variables
+    volumes:
+      - ./server-5-config.toml:${HOME}/server-config.toml
+    ports:
+      - "8005:8005"

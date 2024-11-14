@@ -1,4 +1,4 @@
-FROM rust:1.76 as chef
+FROM rust:1.76 AS chef
 
 # Stop if a command fails
 RUN set -eux
@@ -8,7 +8,7 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 # cargo-chef will be cached from the second build onwards
 RUN cargo install cargo-chef
-WORKDIR app
+WORKDIR /app
 
 FROM chef AS planner
 COPY . .
@@ -24,7 +24,7 @@ COPY . .
 RUN cargo build --release --bin server
 
 FROM debian:bookworm-slim AS runtime
-WORKDIR app
+WORKDIR /app
 COPY --from=builder /app/target/release/server /usr/local/bin
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/server"]

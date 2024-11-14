@@ -1,4 +1,4 @@
-use auto_quorum::common::kv::KVCommand;
+use metronome::common::kv::KVCommand;
 use std::collections::HashMap;
 
 pub struct Database {

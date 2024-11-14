@@ -100,6 +100,7 @@ pub mod configs {
         pub persist_config: PersistConfig,
         pub delay_config: DelayConfig,
         pub instrumentation: bool,
+        pub debug_filepath: String,
         pub server_config: ServerConfig,
         pub cluster_config: ClusterConfig,
     }
