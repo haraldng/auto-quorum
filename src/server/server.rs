@@ -1,73 +1,32 @@
-use crate::{database::Database, network::Network};
+use crate::{configs::*, database::Database, network::Network};
 use chrono::Utc;
 use core::panic;
 use csv::Writer;
 use log::*;
-use metronome::common::{
-    configs::{OmniPaxosServerConfig, *},
-    kv::*,
-    messages::*,
-};
+use metronome::common::{kv::*, messages::*};
 use omnipaxos::{
     ballot_leader_election::Ballot,
     messages::{
         sequence_paxos::{PaxosMessage, PaxosMsg},
         Message,
     },
-    sequence_paxos::Phase,
-    util::{LogEntry, NodeId},
+    sequence_paxos::{leader::ACCEPTSYNC_MAGIC_SLOT, Phase},
+    util::NodeId,
     OmniPaxos, OmniPaxosConfig,
 };
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use serde::Serialize;
 use std::{fs::File, io::Write, time::Duration};
-use tempfile::tempfile;
 use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-
-#[derive(Debug)]
-pub(crate) enum DelayStrategy {
-    NoDelay,
-    Sleep(Duration),
-    FileWrite(File, usize),
-}
-
-impl From<DelayConfig> for DelayStrategy {
-    fn from(value: DelayConfig) -> Self {
-        match value {
-            DelayConfig::Sleep(0) => DelayStrategy::NoDelay,
-            DelayConfig::Sleep(μs) => DelayStrategy::Sleep(Duration::from_micros(μs)),
-            DelayConfig::File(0) => DelayStrategy::NoDelay,
-            DelayConfig::File(data_size) => {
-                let file = tempfile().expect("Failed to open temp file");
-                DelayStrategy::FileWrite(file, data_size)
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PersistMode {
-    Individual,
-    Every(usize),
-    Opportunistic,
-}
-
-impl From<PersistConfig> for PersistMode {
-    fn from(value: PersistConfig) -> Self {
-        match value {
-            PersistConfig::Individual => PersistMode::Individual,
-            PersistConfig::Every(n) => PersistMode::Every(n),
-            PersistConfig::Opportunistic => PersistMode::Opportunistic,
-        }
-    }
-}
+const INITIAL_LOG_CAPACITY: usize = 1_000_000;
+const PULL_FROM_NETWORK_SIZE: usize = 10_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 type TimeStamp = i64;
 
-pub struct OmniPaxosServer {
+pub struct MetronomeServer {
     id: NodeId,
     peers: Vec<NodeId>,
     database: Database,
@@ -76,40 +35,41 @@ pub struct OmniPaxosServer {
     client_messages: Receiver<(ClientId, ClientMessage, i64)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
-    persist_mode: PersistMode,
+    // persist_mode: PersistMode,
     delay_strat: DelayStrategy,
-    accepted_buffer: Vec<(usize, u64, ClusterMessage)>,
+    // accepted_buffer: Vec<(usize, u64, ClusterMessage)>,
+    decided_slots_buffer: Vec<usize>,
     instrumentation_data: Option<InstrumentationData>,
-    config: OmniPaxosServerConfig,
+    config: MetronomeServerConfig,
 }
 
-impl OmniPaxosServer {
-    pub async fn new(
-        server_config: OmniPaxosServerConfig,
-        omnipaxos_config: OmniPaxosConfig,
-        initial_leader: NodeId,
-    ) -> Self {
-        let server_id = omnipaxos_config.server_config.pid;
-        let nodes = omnipaxos_config.cluster_config.nodes.clone();
+impl MetronomeServer {
+    pub async fn new(config: MetronomeServerConfig) -> Self {
+        let server_id = config.server_id;
+        let nodes = config.nodes.clone();
         let peers: Vec<u64> = nodes
             .into_iter()
             .filter(|node| *node != server_id)
             .collect();
-        let local_deployment = server_config.local_deployment.unwrap_or(false);
+        let local_deployment = config.local_deployment.unwrap_or(false);
         info!(
-            "Node: {:?}: using metronome: {}, persist_config: {:?}",
-            server_id, omnipaxos_config.cluster_config.use_metronome, server_config.persist_config
+            "Node: {:?}: using metronome: {:?}, persist_config: {:?}",
+            server_id, config.metronome_config, config.persist_config
         );
-        let storage = MemoryStorage::default();
+        let storage = MemoryStorage::with_capacity(INITIAL_LOG_CAPACITY);
+        let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
+        let initial_leader = config.initial_leader.unwrap_or(1);
         let initial_clients = match server_id == initial_leader {
             true => 1,
             false => 0,
         };
-        let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(1000);
-        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(1000);
+        let (cluster_message_sender, cluster_messages) =
+            tokio::sync::mpsc::channel(PULL_FROM_NETWORK_SIZE);
+        let (client_message_sender, client_messages) =
+            tokio::sync::mpsc::channel(PULL_FROM_NETWORK_SIZE);
         let network = Network::new(
-            server_config.cluster_name.clone(),
+            config.cluster_name.clone(),
             server_id,
             peers.clone(),
             initial_clients,
@@ -118,11 +78,11 @@ impl OmniPaxosServer {
             cluster_message_sender,
         )
         .await;
-        let instrumentation_data = match server_config.instrumentation {
-            true => Some(InstrumentationData::new(server_config.clone())),
+        let instrumentation_data = match config.instrumentation {
+            true => Some(InstrumentationData::new(config.clone())),
             false => None,
         };
-        let mut server = OmniPaxosServer {
+        let mut server = MetronomeServer {
             id: server_id,
             peers,
             database: Database::new(),
@@ -131,11 +91,12 @@ impl OmniPaxosServer {
             client_messages,
             omnipaxos,
             initial_leader,
-            persist_mode: server_config.persist_config.into(),
-            delay_strat: server_config.delay_config.into(),
-            accepted_buffer: vec![],
+            // persist_mode: config.persist_config.into(),
+            delay_strat: config.delay_config.into(),
+            // accepted_buffer: vec![],
+            decided_slots_buffer: Vec::with_capacity(1000),
             instrumentation_data,
-            config: server_config,
+            config,
         };
         // Clears outgoing_messages of initial BLE messages
         let _ = server.omnipaxos.outgoing_messages();
@@ -144,12 +105,14 @@ impl OmniPaxosServer {
 
     pub async fn run(&mut self) {
         // Hack to avoid slow first disk write
-        if let DelayStrategy::FileWrite(_, _) = &self.delay_strat {
-            self.emulate_storage_delay(1);
+        if let DelayStrategy::FileWrite(ref mut file, entry_size) = self.delay_strat {
+            let buffer = vec![b'A'; entry_size];
+            file.write_all(&buffer).expect("Failed to write file");
+            file.sync_all().expect("Failed to flush file");
         }
 
         // NOTE: This will cap how many messages an Opportunistic flush strategy can batch
-        let buffer_size = 1000;
+        let buffer_size = PULL_FROM_NETWORK_SIZE;
         let mut client_message_buffer = Vec::with_capacity(buffer_size);
         let mut cluster_message_buffer = Vec::with_capacity(buffer_size);
         if self.id == self.initial_leader {
@@ -169,10 +132,10 @@ impl OmniPaxosServer {
                             break;
                         }
                     },
-                    // Still necessary for sending handshakes
+                    // Still necessary for network handshakes
                     _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
-                            self.handle_cluster_messages(&mut cluster_message_buffer);
-                        },
+                        self.handle_cluster_messages(&mut cluster_message_buffer);
+                    },
                     _ = self.client_messages.recv_many(&mut client_message_buffer, buffer_size) => {
                         self.handle_client_messages(&mut client_message_buffer);
                     },
@@ -218,19 +181,20 @@ impl OmniPaxosServer {
     }
 
     fn handle_cluster_messages(&mut self, messages: &mut Vec<(ClusterMessage, i64)>) -> bool {
-        let mut server_done = false;
-        self.instrument_cluster_messages(&messages);
-        for (message, _net_recv_time) in messages.drain(..) {
+        for (message, net_recv_time) in messages.drain(..) {
             match message {
-                ClusterMessage::OmniPaxosMessage(m) => self.omnipaxos.handle_incoming(m),
+                ClusterMessage::OmniPaxosMessage(m) => {
+                    self.instrument_incoming_paxos_message(&m, net_recv_time);
+                    self.omnipaxos.handle_incoming(m);
+                }
                 ClusterMessage::Done => {
                     info!("{}: Received Done signal from leader", self.id);
                     if let Some(data) = &self.instrumentation_data {
-                        data.acceptor_data_to_csv(self.config.debug_filepath.clone())
+                        data.acceptor_data_to_csv(self.config.debug_filename.clone())
                             .expect("File write failed");
                         data.debug_acceptor_data();
                     }
-                    server_done = true
+                    return true;
                 }
             }
         }
@@ -238,16 +202,15 @@ impl OmniPaxosServer {
             self.handle_decided_entries();
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
-        // outgoing whenever we could update the state of Omnipaxos.
+        // outgoing whenever we could have updated the state of Omnipaxos.
         self.send_outgoing_msgs();
-        server_done
+        return false;
     }
 
     fn handle_client_messages(
         &mut self,
         messages: &mut Vec<(ClientId, ClientMessage, i64)>,
     ) -> bool {
-        let mut client_done = false;
         for message in messages.drain(..) {
             match message {
                 (client_id, ClientMessage::Append(command_id, kv_command), net_recv_time) => {
@@ -259,7 +222,6 @@ impl OmniPaxosServer {
                 }
                 (_, ClientMessage::Done, _) => {
                     info!("{}: Received Done signal from client", self.id);
-                    self.send_outgoing_msgs();
                     let done_msg = ClusterMessage::Done;
                     for peer in &self.peers {
                         self.network.send_to_cluster(*peer, done_msg.clone());
@@ -268,49 +230,39 @@ impl OmniPaxosServer {
                     // TODO: Allow for wait on network flushing all pending messages instead
                     std::thread::sleep(Duration::from_secs(1));
                     if let Some(data) = &self.instrumentation_data {
-                        data.request_data_to_csv(self.config.debug_filepath.clone())
+                        data.request_data_to_csv(self.config.debug_filename.clone())
                             .expect("File write failed");
                         data.debug_request_data();
                     }
-                    client_done = true;
+                    return true;
                 }
             }
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
-        // outgoing whenever we could update the state of Omnipaxos.
+        // outgoing whenever we could have updated the state of Omnipaxos.
         self.send_outgoing_msgs();
-        client_done
+        return false;
     }
 
     fn handle_decided_entries(&mut self) {
-        let decided_slots = self.omnipaxos.take_decided_slots_since_last_call();
-        for slot in decided_slots {
-            if let Some(data) = &mut self.instrumentation_data {
-                data.commited(slot);
-            }
-            let decided_entry = self
-                .omnipaxos
-                .read(slot)
-                .expect("Decided slots should be readable");
-            match decided_entry {
-                LogEntry::Decided(cmd) => self.update_database_and_respond(cmd),
-                // Metronome doesn't correctly mark decided entries in storage
-                LogEntry::Undecided(cmd) => self.update_database_and_respond(cmd),
-                LogEntry::Snapshotted(_) => unimplemented!(),
-                _ => unreachable!(),
+        self.omnipaxos
+            .take_decided_slots_since_last_call(&mut self.decided_slots_buffer);
+        if let Some(data) = &mut self.instrumentation_data {
+            for slot in &self.decided_slots_buffer {
+                data.commited(*slot);
             }
         }
-    }
-
-    fn update_database_and_respond(&mut self, command: Command) {
-        let read = self.database.handle_command(command.kv_cmd);
-        if command.coordinator_id == self.id {
-            let response = match read {
-                Some(read_result) => ServerMessage::Read(command.id, read_result),
-                None => ServerMessage::Write(command.id),
-            };
-            self.network.send_to_client(command.client_id, response);
-            debug!("Sending response {}", command.id);
+        for slot in self.decided_slots_buffer.drain(..) {
+            let command = self.omnipaxos.read_raw(slot);
+            let read = self.database.handle_command(command.kv_cmd);
+            if command.coordinator_id == self.id {
+                let response = match read {
+                    Some(read_result) => ServerMessage::Read(command.id, read_result),
+                    None => ServerMessage::Write(command.id),
+                };
+                self.network.send_to_client(command.client_id, response);
+                debug!("Sending response {}", command.id);
+            }
         }
     }
 
@@ -332,61 +284,67 @@ impl OmniPaxosServer {
     }
 
     fn send_outgoing_msgs(&mut self) {
-        let messages = self.omnipaxos.outgoing_messages();
-        if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
-            // Metronome leader functions as in normal Omnipaxos
-            self.instrument_accdec(&messages);
-            for msg in messages {
-                let to = msg.get_receiver();
-                let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-                self.network.send_to_cluster(to, cluster_msg);
-            }
-            return;
-        }
-        // Metronome acceptors handle accepted messages differently
-        match self.persist_mode {
-            PersistMode::Individual => self.send_outgoing_individual_persist(messages),
-            PersistMode::Every(n) => self.send_outgoing_batch_persist(messages, n),
-            PersistMode::Opportunistic => self.send_outgoing_opportunistic_persist(messages),
+        if self.id == self.initial_leader {
+            self.send_outgoing_msgs_leader();
+        } else {
+            self.send_outgoing_msgs_follower();
         }
     }
 
-    fn send_outgoing_individual_persist(&mut self, messages: Vec<Message<Command>>) {
+    // Metronome leader functions as in normal Omnipaxos
+    fn send_outgoing_msgs_leader(&mut self) {
+        let messages = self.omnipaxos.outgoing_messages();
+        self.instrument_accdec(&messages);
         for msg in messages {
-            if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
-                if let Some(data) = &mut self.instrumentation_data {
-                    data.new_persist_start(slot_idx);
-                }
-                self.emulate_storage_delay(1);
-                if let Some(data) = &mut self.instrumentation_data {
-                    data.new_persist_end(slot_idx);
-                }
-            }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network.send_to_cluster(to, cluster_msg);
         }
     }
 
-    fn send_outgoing_batch_persist(&mut self, messages: Vec<Message<Command>>, batch_size: usize) {
-        for msg in messages {
-            match Self::is_accepted_msg(&msg) {
-                Some(slot_idx) => {
-                    let to_node = msg.get_receiver();
-                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-                    self.accepted_buffer.push((slot_idx, to_node, cluster_msg));
-                    if self.accepted_buffer.len() >= batch_size {
-                        let persist_time = Utc::now().timestamp_micros();
-                        self.emulate_storage_delay(batch_size);
-                        for (accepted_idx, to, accepted_msg) in self.accepted_buffer.drain(..) {
-                            if let Some(data) = &mut self.instrumentation_data {
-                                data.new_persist_batch(accepted_idx, persist_time);
-                            }
-                            self.network.send_to_cluster(to, accepted_msg);
-                        }
+    // Metronome acceptors handle accepted messages differently
+    fn send_outgoing_msgs_follower(&mut self) {
+        let messages = self.omnipaxos.outgoing_messages();
+        match self.delay_strat {
+            DelayStrategy::NoDelay => {
+                for msg in messages {
+                    if let Some(data) = &mut self.instrumentation_data {
+                        let to_flush = msg.get_accepted_slots().unwrap();
+                        data.persist_start(to_flush);
+                        data.persist_end(to_flush);
                     }
+                    let to = msg.get_receiver();
+                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+                    self.network.send_to_cluster(to, cluster_msg);
                 }
-                None => {
+            }
+            DelayStrategy::FileWrite(ref mut file, entry_size) => {
+                for msg in messages {
+                    let to_flush = msg.get_accepted_slots().unwrap();
+                    if let Some(data) = &mut self.instrumentation_data {
+                        data.persist_start(to_flush);
+                    }
+                    let buffer = vec![b'A'; entry_size * to_flush.len()];
+                    file.write_all(&buffer).expect("Failed to write file");
+                    file.sync_all().expect("Failed to flush file");
+                    if let Some(data) = &mut self.instrumentation_data {
+                        data.persist_end(to_flush);
+                    }
+                    let to = msg.get_receiver();
+                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+                    self.network.send_to_cluster(to, cluster_msg);
+                }
+            }
+            DelayStrategy::Sleep(delay) => {
+                for msg in messages {
+                    let to_flush = msg.get_accepted_slots().unwrap();
+                    if let Some(data) = &mut self.instrumentation_data {
+                        data.persist_start(to_flush);
+                    }
+                    std::thread::sleep(delay * to_flush.len() as u32);
+                    if let Some(data) = &mut self.instrumentation_data {
+                        data.persist_end(to_flush);
+                    }
                     let to = msg.get_receiver();
                     let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
                     self.network.send_to_cluster(to, cluster_msg);
@@ -395,83 +353,27 @@ impl OmniPaxosServer {
         }
     }
 
-    fn send_outgoing_opportunistic_persist(&mut self, messages: Vec<Message<Command>>) {
-        let num_accepted_msgs = messages
-            .iter()
-            .filter_map(|m| Self::is_accepted_msg(m))
-            .count();
-        let persist_time = Utc::now().timestamp_micros();
-        if num_accepted_msgs > 0 {
-            self.emulate_storage_delay(num_accepted_msgs);
-        }
-        for msg in messages {
-            if let Some(slot_idx) = Self::is_accepted_msg(&msg) {
-                if let Some(data) = &mut self.instrumentation_data {
-                    data.new_persist_batch(slot_idx, persist_time)
+    fn instrument_incoming_paxos_message(
+        &mut self,
+        message: &Message<Command>,
+        net_recv_time: TimeStamp,
+    ) {
+        if let Some(data) = &mut self.instrumentation_data {
+            if self.id == self.initial_leader {
+                // Leader instruments Accepted messages
+                if let Some(accepted_slots) = message.get_accepted_slots() {
+                    let from = message.get_sender();
+                    data.recv_accepted(accepted_slots, from);
                 }
-            }
-            let to = msg.get_receiver();
-            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network.send_to_cluster(to, cluster_msg);
-        }
-    }
-
-    fn is_accepted_msg(message: &Message<Command>) -> Option<usize> {
-        match message {
-            Message::SequencePaxos(PaxosMessage {
-                from: _,
-                to: _,
-                msg: PaxosMsg::Accepted(a),
-            }) if a.slot_idx != usize::MAX => Some(a.slot_idx),
-            _ => None,
-        }
-    }
-
-    fn emulate_storage_delay(&mut self, multiplier: usize) {
-        match self.delay_strat {
-            DelayStrategy::Sleep(delay) => std::thread::sleep(delay * multiplier as u32),
-            DelayStrategy::FileWrite(ref mut file, data_size) => {
-                let buffer = vec![b'A'; data_size * multiplier];
-                file.write_all(&buffer).expect("Failed to write file");
-                file.sync_all().expect("Failed to flush file");
-            }
-            DelayStrategy::NoDelay => (),
-        }
-    }
-
-    fn instrument_cluster_messages(&mut self, messages: &Vec<(ClusterMessage, i64)>) {
-        match (self.id, &mut self.instrumentation_data) {
-            (_, None) => (),
-            (1, Some(data)) => {
-                for (message, _) in messages {
-                    if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-                        PaxosMessage {
-                            from,
-                            to: _,
-                            msg: PaxosMsg::Accepted(acc),
-                        },
-                    )) = message
-                    {
-                        if acc.slot_idx != usize::MAX {
-                            data.recv_accepted(acc.slot_idx, *from);
-                        }
-                    }
-                }
-            }
-            (_, Some(data)) => {
-                for (message, net_recv_time) in messages {
-                    if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-                        PaxosMessage {
-                            from: _,
-                            to: _,
-                            msg: PaxosMsg::AcceptDecide(accdec),
-                        },
-                    )) = message
-                    {
-                        for command in &accdec.entries {
-                            data.recv_accdec(command.id, *net_recv_time);
-                        }
-                    }
+            } else {
+                // Followers instrument AcceptDecide Messages
+                if let Message::SequencePaxos(PaxosMessage {
+                    from: _,
+                    to: _,
+                    msg: PaxosMsg::AcceptDecide(accdec),
+                }) = message
+                {
+                    data.recv_accdec(&accdec.entries, net_recv_time)
                 }
             }
         }
@@ -501,9 +403,9 @@ struct InstrumentationData {
 }
 
 impl InstrumentationData {
-    fn new(config: OmniPaxosServerConfig) -> Self {
-        let num_nodes = config.cluster_config.nodes.len();
-        let metronome_quorum = match config.cluster_config.metronome_quorum_size {
+    fn new(config: MetronomeServerConfig) -> Self {
+        let num_nodes = config.nodes.len();
+        let metronome_quorum = match config.metronome_quorum_size {
             Some(quorum_size) => quorum_size,
             None => (num_nodes / 2) + 1,
         };
@@ -511,7 +413,7 @@ impl InstrumentationData {
             request_data: Vec::with_capacity(1000),
             acceptor_data: Vec::with_capacity(1000),
             metronome_batch_size: n_choose_k(num_nodes, metronome_quorum),
-            id: config.server_config.pid,
+            id: config.server_id,
         }
     }
 
@@ -544,13 +446,18 @@ impl InstrumentationData {
     }
 
     #[inline]
-    fn recv_accepted(&mut self, slot_idx: usize, from: NodeId) {
+    fn recv_accepted(&mut self, accepted_slots: &Vec<usize>, from: NodeId) {
         let recv_accepted_time = Utc::now().timestamp_micros();
         let node_ts = NodeTimestamp {
             node_id: from,
             time: recv_accepted_time,
         };
-        self.request_data[slot_idx].receive_accepted.push(node_ts);
+        if accepted_slots[0] == ACCEPTSYNC_MAGIC_SLOT {
+            return;
+        }
+        for slot_idx in accepted_slots {
+            self.request_data[*slot_idx].receive_accepted.push(node_ts);
+        }
     }
 
     #[inline]
@@ -561,33 +468,38 @@ impl InstrumentationData {
 
     // ===== Acceptor data =====
     #[inline]
-    fn recv_accdec(&mut self, command_id: CommandId, net_recv_time: TimeStamp) {
-        let accept_data = AcceptorInstrumentation {
-            command_id,
-            net_receive: net_recv_time,
-            start_persist: None,
-            send_accepted: None,
-        };
-        self.acceptor_data.push(accept_data);
+    fn recv_accdec(&mut self, entries: &Vec<Command>, net_recv_time: TimeStamp) {
+        for command in entries {
+            let accept_data = AcceptorInstrumentation {
+                command_id: command.id,
+                net_receive: net_recv_time,
+                start_persist: None,
+                send_accepted: None,
+            };
+            self.acceptor_data.push(accept_data);
+        }
     }
 
     #[inline]
-    fn new_persist_start(&mut self, slot_idx: usize) {
+    fn persist_start(&mut self, slots: &Vec<usize>) {
         let persist_time = Utc::now().timestamp_micros();
-        self.acceptor_data[slot_idx].start_persist = Some(persist_time);
+        if slots[0] == ACCEPTSYNC_MAGIC_SLOT {
+            return;
+        }
+        for slot_idx in slots {
+            self.acceptor_data[*slot_idx].start_persist = Some(persist_time);
+        }
     }
 
     #[inline]
-    fn new_persist_end(&mut self, slot_idx: usize) {
+    fn persist_end(&mut self, slots: &Vec<usize>) {
         let accepted_time = Utc::now().timestamp_micros();
-        self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
-    }
-
-    #[inline]
-    fn new_persist_batch(&mut self, slot_idx: usize, batch_start: TimeStamp) {
-        let accepted_time = Utc::now().timestamp_micros();
-        self.acceptor_data[slot_idx].start_persist = Some(batch_start);
-        self.acceptor_data[slot_idx].send_accepted = Some(accepted_time);
+        if slots[0] == ACCEPTSYNC_MAGIC_SLOT {
+            return;
+        }
+        for slot_idx in slots {
+            self.acceptor_data[*slot_idx].send_accepted = Some(accepted_time);
+        }
     }
 
     fn acceptor_data_to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
@@ -776,7 +688,7 @@ struct AcceptorInstrumentation {
     send_accepted: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct NodeTimestamp {
     node_id: u64,
     time: i64,

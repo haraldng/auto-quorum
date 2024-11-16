@@ -1,12 +1,11 @@
-use crate::server::OmniPaxosServer;
+use crate::{configs::MetronomeServerConfig, server::MetronomeServer};
 use chrono::Local;
 use env_logger::Builder;
 use log::LevelFilter;
-use metronome::common::configs::OmniPaxosServerConfig;
-use omnipaxos::{errors::ConfigError, OmniPaxosConfig};
 use std::{env, fs, io::Write};
 use toml;
 
+mod configs;
 mod database;
 mod network;
 mod server;
@@ -45,19 +44,11 @@ pub async fn main() {
         Ok(file_path) => file_path,
         Err(_) => panic!("Requires CONFIG_FILE environment variable"),
     };
-    let omnipaxos_config = match OmniPaxosConfig::with_toml(&config_file) {
-        Ok(parsed_config) => parsed_config,
-        Err(ConfigError::Parse(e)) => panic!("{e}",),
-        Err(e) => panic!("{e}"),
-    };
     let config_string = fs::read_to_string(config_file).unwrap();
-    let server_config: OmniPaxosServerConfig = match toml::from_str(&config_string) {
+    let metronome_config: MetronomeServerConfig = match toml::from_str(&config_string) {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
-    let max_node_pid = omnipaxos_config.cluster_config.nodes.iter().max().unwrap();
-    let initial_leader = server_config.initial_leader.unwrap_or(*max_node_pid);
-    // println!("{}", serde_json::to_string(&server_config).unwrap());
-    let mut server = OmniPaxosServer::new(server_config, omnipaxos_config, initial_leader).await;
+    let mut server = MetronomeServer::new(metronome_config).await;
     server.run().await;
 }

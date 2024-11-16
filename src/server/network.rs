@@ -234,8 +234,8 @@ enum NewConnection {
     ToPeer(PeerConnection),
     ToClient(ClientConnection),
 }
+const SOCKET_BUFFER_SIZE: usize = 10_000;
 
-const SOCKET_BUFFER_SIZE: usize = 1000;
 struct PeerConnection {
     peer_id: NodeId,
     outgoing_messages: UnboundedSender<ClusterMessage>,

@@ -1,28 +1,18 @@
 cluster_name = "local-cluster"
 location = "local-5"
-initial_leader = 1
 local_deployment = true
-instrumentation = true
-debug_filepath = "../benchmarks/logs/local-experiments/server-5.csv"
+server_id = 5
+nodes = [1, 2, 3, 4, 5]
+initial_leader = 1
+metronome_config = "RoundRobin"
+#metronome_quorum_size = 3
+instrumentation = false
+debug_filename = "../benchmarks/logs/local-experiments/server-5.csv"
 
 [persist_config]
-persist_type = "Opportunistic"
-#persist_value = 10
+persist_type = "Individual"
+#persist_value = 100
 
 [delay_config]
 delay_type = "File"
-delay_value = 1024
-
-[cluster_config]
-configuration_id = 1
-nodes = [1, 2, 3, 4, 5]
-use_metronome = 0
-#metronome_quorum_size = 3
-#flexible_quorum = { read_quorum_size = 3, write_quorum_size = 3}
-
-[server_config]
-pid = 5
-election_tick_timeout = 1
-resend_message_tick_timeout = 5
-flush_batch_tick_timeout = 200
-
+delay_value = 0

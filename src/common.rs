@@ -1,9 +1,6 @@
 pub mod messages {
-    use super::{
-        configs::{DelayConfig, OmniPaxosServerConfig, PersistConfig},
-        kv::*,
-    };
-    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
+    use super::kv::*;
+    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId, MetronomeSetting};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,7 +19,7 @@ pub mod messages {
     pub enum ServerMessage {
         Ready(MetronomeConfigInfo),
         Write(CommandId),
-        Read(CommandId, Option<String>),
+        Read(CommandId, Option<usize>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,33 +41,11 @@ pub mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
     pub struct MetronomeConfigInfo {
         pub cluster_size: usize,
-        pub use_metronome: usize,
+        pub metronome_info: MetronomeSetting,
         pub metronome_quorum_size: Option<usize>,
         pub persist_info: PersistInfo,
         pub delay_info: DelayInfo,
         pub instrumented: bool,
-    }
-
-    impl From<OmniPaxosServerConfig> for MetronomeConfigInfo {
-        fn from(value: OmniPaxosServerConfig) -> Self {
-            let persist_info = match value.persist_config {
-                PersistConfig::Individual => PersistInfo::Individual,
-                PersistConfig::Every(n) => PersistInfo::Every(n),
-                PersistConfig::Opportunistic => PersistInfo::Opportunistic,
-            };
-            let delay_info = match value.delay_config {
-                DelayConfig::Sleep(μs) => DelayInfo::Sleep(μs),
-                DelayConfig::File(d) => DelayInfo::File(d),
-            };
-            MetronomeConfigInfo {
-                cluster_size: value.cluster_config.nodes.len(),
-                use_metronome: value.cluster_config.use_metronome,
-                metronome_quorum_size: value.cluster_config.metronome_quorum_size,
-                persist_info,
-                delay_info,
-                instrumented: value.instrumentation,
-            }
-        }
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -84,40 +59,6 @@ pub mod messages {
     pub enum DelayInfo {
         Sleep(u64),
         File(usize),
-    }
-}
-
-pub mod configs {
-    use omnipaxos::{util::NodeId, ClusterConfig, ServerConfig};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct OmniPaxosServerConfig {
-        pub cluster_name: String,
-        pub location: String,
-        pub initial_leader: Option<NodeId>,
-        pub local_deployment: Option<bool>,
-        pub persist_config: PersistConfig,
-        pub delay_config: DelayConfig,
-        pub instrumentation: bool,
-        pub debug_filepath: String,
-        pub server_config: ServerConfig,
-        pub cluster_config: ClusterConfig,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-    #[serde(tag = "delay_type", content = "delay_value")]
-    pub enum DelayConfig {
-        Sleep(u64),
-        File(usize),
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-    #[serde(tag = "persist_type", content = "persist_value")]
-    pub enum PersistConfig {
-        Individual,
-        Every(usize),
-        Opportunistic,
     }
 }
 
@@ -258,32 +199,32 @@ pub mod kv {
         pub kv_cmd: KVCommand,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
     pub enum KVCommand {
-        Put(String, String),
-        Delete(String),
-        Get(String),
+        Put(usize, usize),
+        Delete(usize),
+        Get(usize),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct KVSnapshot {
-        snapshotted: HashMap<String, String>,
-        deleted_keys: Vec<String>,
+        snapshotted: HashMap<usize, usize>,
+        deleted_keys: Vec<usize>,
     }
 
     impl Snapshot<Command> for KVSnapshot {
         fn create(entries: &[Command]) -> Self {
             let mut snapshotted = HashMap::new();
-            let mut deleted_keys: Vec<String> = Vec::new();
+            let mut deleted_keys: Vec<usize> = Vec::new();
             for e in entries {
-                match &e.kv_cmd {
+                match e.kv_cmd {
                     KVCommand::Put(key, value) => {
-                        snapshotted.insert(key.clone(), value.clone());
+                        snapshotted.insert(key, value);
                     }
                     KVCommand::Delete(key) => {
-                        if snapshotted.remove(key).is_none() {
+                        if snapshotted.remove(&key).is_none() {
                             // key was not in the snapshot
-                            deleted_keys.push(key.clone());
+                            deleted_keys.push(key);
                         }
                     }
                     KVCommand::Get(_) => (),

@@ -19,7 +19,7 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
         df['delay_info.value'] = df['delay_info.value'].apply(format_bytes)
         df['delay_info.value'] = pd.Categorical(
             df['delay_info.value'],
-            categories=[format_bytes(2**i) for i in range(0, 32)],
+            categories=[format_bytes(0)] + [format_bytes(2**i) for i in range(0, 32)],
             ordered=True
         )
     return df
@@ -382,9 +382,9 @@ def graph_latency_throughput_experiment():
 
 
 def main():
-    # graph_local_experiment()
+    graph_local_experiment()
     # graph_closed_loop_experiment()
-    graph_latency_throughput_experiment()
+    # graph_latency_throughput_experiment()
     # graph_metronome_size_experiment()
     pass
 

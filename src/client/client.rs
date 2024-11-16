@@ -15,8 +15,8 @@ pub struct ClientConfig {
     pub local_deployment: Option<bool>,
     pub end_condition: EndConditionConfig,
     pub num_parallel_requests: usize,
-    pub summary_filepath: String,
-    pub output_filepath: String,
+    pub summary_filename: String,
+    pub output_filename: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -113,7 +113,7 @@ impl Client {
             .save_summary(self.config.clone(), self.leaders_config.unwrap())
             .expect("Failed to write summary file");
         self.client_data
-            .to_csv(self.config.output_filepath.clone())
+            .to_csv(self.config.output_filename.clone())
             .expect("Failed to write output file");
     }
 
@@ -169,8 +169,8 @@ impl Client {
     }
 
     fn send_request(&mut self, request_id: CommandId) {
-        let key = request_id.to_string();
-        let cmd = KVCommand::Put(key.clone(), key);
+        let key = request_id % self.num_parallel_requests;
+        let cmd = KVCommand::Put(key, request_id);
         let request = ClientMessage::Append(request_id, cmd);
         debug!("Sending request {request:?}");
         self.network.send(request);
@@ -262,7 +262,7 @@ impl ClientData {
         client_config: ClientConfig,
         server_info: MetronomeConfigInfo,
     ) -> Result<(), std::io::Error> {
-        let summary_filepath = client_config.summary_filepath.clone();
+        let summary_filepath = client_config.summary_filename.clone();
         let (request_latency_average, request_latency_std_dev) = self.avg_response_latency();
         let summary = ClientSummary {
             client_config,
