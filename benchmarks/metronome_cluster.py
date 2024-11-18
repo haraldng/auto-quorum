@@ -1,5 +1,6 @@
 import subprocess
 import time
+import toml
 from dataclasses import dataclass, asdict
 from typing import Optional
 from pathlib import Path
@@ -358,7 +359,7 @@ class MetronomeClusterBuilder:
         return self
 
     def metronome_config(self, metronome_config: str):
-        assert metronome_config in ["Off", "RoundRobin", "FastestFollower"]
+        assert metronome_config in ["Off", "RoundRobin", "RoundRobin2", "FastestFollower"]
         self._metronome_config = metronome_config
         return self
 

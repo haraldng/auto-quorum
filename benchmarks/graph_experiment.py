@@ -13,7 +13,8 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
     experiment_directory = Path(f"logs/{experiment_name}")
     experiment_data = [parse_client_summary(f) for f in experiment_directory.rglob("*client-1.json")]
     df = pd.concat(experiment_data)
-    df = df.sort_values(by=['delay_info.value', 'use_metronome']).reset_index()
+    df['metronome_info'] = pd.Categorical(df['metronome_info'], categories=["Off", "RoundRobin", "RoundRobin2", "FastestFollower"], ordered=True)
+    df = df.sort_values(by=['delay_info.value', 'metronome_info']).reset_index()
     # Ensure the file data_size column is treated as a Categorical variable, ordered by size
     if df['delay_info.type'][0] == "File":
         df['delay_info.value'] = df['delay_info.value'].apply(format_bytes)
@@ -60,16 +61,18 @@ def format_bytes(num_bytes):
             return f'{num_bytes:.0f} {units[i]}'
         num_bytes /= 1024  # Divide by 1024 for each step to move to the next unit
 
-def parse_client_log(client_summary: pd.Series, nrows: int) -> pd.DataFrame:
+def parse_client_log(client_summary: pd.Series, nrows: int | None=None, skiprows: int | None=None) -> pd.DataFrame:
     experiment_start = client_summary.client_start_time
     client_filepath = str(client_summary.file)
     client_log_filepath = client_filepath.replace(".json", ".csv")
-    df = pd.read_csv(client_log_filepath, usecols=['request_time', 'response_time'], nrows=nrows)
+    print(client_log_filepath)
+    skip_csv_rows = range(1, skiprows+1) if skiprows else None
+    df = pd.read_csv(client_log_filepath, header=0, usecols=['request_time', 'response_time'], nrows=nrows, skiprows=skip_csv_rows)
     df['request_time'] = df['request_time'] - experiment_start
     df['response_time'] = df['response_time'] - experiment_start
     return df
 
-def parse_server_logs(client_summary: pd.Series) -> pd.DataFrame | None:
+def parse_server_logs(client_summary: pd.Series, nrows: int | None=None, skiprows: int | None=None) -> pd.DataFrame | None:
     if client_summary.instrumented is False:
         return None
     experiment_start = client_summary.client_start_time
@@ -82,9 +85,10 @@ def parse_server_logs(client_summary: pd.Series) -> pd.DataFrame | None:
 
     print(leader_file)
     df = parse_leader_log(leader_file, experiment_start)
+    skip_csv_rows = range(1, skiprows+1) if skiprows else None
     for i, follower_file in enumerate(follower_files):
         print(follower_file)
-        df_follower = pd.read_csv(follower_file)
+        df_follower = pd.read_csv(follower_file, header=0, nrows=nrows, skiprows=skip_csv_rows)
         df_follower['net_receive'] = df_follower['net_receive'] - experiment_start
         df_follower['start_persist'] = df_follower['start_persist'] - experiment_start
         df_follower['send_accepted'] = df_follower['send_accepted'] - experiment_start
@@ -92,8 +96,9 @@ def parse_server_logs(client_summary: pd.Series) -> pd.DataFrame | None:
         df = pd.merge(df, df_follower, on="command_id", how="inner")
     return df
 
-def parse_leader_log(log_path: str, experiment_start: int):
-    df = pd.read_csv(log_path)
+def parse_leader_log(log_path: str, experiment_start: int, nrows: int | None=None, skiprows: int | None=None) -> pd.DataFrame:
+    skip_csv_rows = range(1, skiprows+1) if skiprows else None
+    df = pd.read_csv(log_path, header=0, nrows=nrows, skiprows=skip_csv_rows)
     df['net_receive'] = df['net_receive'] - experiment_start
     df['channel_receive'] = df['channel_receive'] - experiment_start
     df['commit'] = df['commit'] - experiment_start
@@ -106,7 +111,7 @@ def parse_leader_log(log_path: str, experiment_start: int):
     return df
 
 def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legend_args: dict = {"loc": "upper right", "ncols": 1, "fontsize": 16}):
-    x = np.arange(len(bar_group_labels))  # the label locations
+    x = np.arange(len(bar_group_labels)) * 1.2  # the label locations
     bar_group_size = len(latency_means)
     width = 0.25  # the width of the bars
     multiplier = 0.5
@@ -114,24 +119,18 @@ def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legen
     for label, (avg, std_dev) in latency_means.items():
         avg = tuple(0 if v is None else v for v in avg)
         offset = width * multiplier
-        rects = ax.bar(x + offset, avg, width, label=label, yerr=std_dev)
+        rects = ax.bar(x + offset, avg, width, label=label, yerr=std_dev, edgecolor="black", linewidth=1.5)
         # Adds value labels above bars
         ax.bar_label(rects, fmt='%.2f', padding=3, rotation=90)
         multiplier += 1
     ax.set_ylabel('Latency (ms)', fontsize=24)
     ax.tick_params(axis='y', labelsize=20)
-    if bar_group_size == 2:
-        ax.set_xticks(x + width, bar_group_labels, fontsize=20)
-    elif bar_group_size == 3:
-        ax.set_xticks(x + width * 1.5, bar_group_labels, fontsize=20)
-    else:
-        raise ValueError(f"Haven't implemented {bar_group_size} sized bar groups")
+    ax.set_xticks(x + width * bar_group_size/2, bar_group_labels, fontsize=20)
     ax.legend(**legend_args)
     return fig, ax
 
 def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, server_logs: pd.DataFrame| None):
-    use_metronome = client_summary.use_metronome == 2
-    title = f"metronome={use_metronome}, clients={client_summary.num_parallel_requests}, persist=({client_summary['persist_info.type']},{client_summary['persist_info.value']}), storage=({client_summary['delay_info.type']}, {client_summary['delay_info.value']}), metronome_quorum_size={client_summary.metronome_quorum_size}"
+    title = f"metronome={client_summary.metronome_info}, clients={client_summary.num_parallel_requests}, persist=({client_summary['persist_info.type']},{client_summary['persist_info.value']}), storage=({client_summary['delay_info.type']}, {client_summary['delay_info.value']}), metronome_quorum_size={client_summary.metronome_quorum_size}"
     if server_logs is None:
         assert client_summary.instrumented is False, "No server logs despite instrumented = True"
         fig, ax = plt.subplots(layout="constrained", figsize=(12,6))
@@ -139,10 +138,6 @@ def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, 
         graph_request_latency_subplot(ax, client_summary, client_log)
         return fig
     else:
-        # Only show subset of data
-        server_df = server_logs.iloc[0:10000]
-        client_df = client_log.iloc[0:10000]
-
         # Setup shared figure
         fig, axs = plt.subplots(3, 1, sharex=True, gridspec_kw={'height_ratios': [1, 1, 1]}, layout="constrained")
         fig.suptitle(title, y=-0.05)
@@ -153,14 +148,14 @@ def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, 
         def scale_x_tick_labels(value, _):
             return f'{value / 1000:.1f}'
         axs[2].xaxis.set_major_formatter(ticker.FuncFormatter(scale_x_tick_labels))
-        axs[2].set_xlim(client_df['request_time'].min(), client_df['response_time'].max())
+        axs[2].set_xlim(client_log['request_time'].min(), client_log['response_time'].max())
         plt.xticks(rotation=45)
 
         # Plot data
-        graph_request_latency_subplot(axs[0], client_summary, client_df)
-        graph_acceptor_queue_subplot(axs[1], client_summary, server_df)
+        graph_request_latency_subplot(axs[0], client_summary, client_log)
+        graph_acceptor_queue_subplot(axs[1], client_summary, server_logs)
         # graph_persist_latency_subplot(axs[2], client_summary, server_df)
-        graph_average_persist_latency_subplot(axs[2], client_summary, server_df)
+        graph_average_persist_latency_subplot(axs[2], client_summary, server_logs)
         return fig
 
 def graph_request_latency_subplot(fig, client_summary: pd.Series, client_log: pd.DataFrame):
@@ -264,12 +259,14 @@ def graph_local_experiment():
 
 def graph_closed_loop_experiment(save: bool=True):
     # Get experiment data
-    experiment_directory = "closed-loop-experiments-sleep-Individual"
+    experiment_directory = "instrumented/closed-loop-experiments-Opportunistic"
     run_directory = "5-node-cluster-1000-clients"
     # three_df = parse_client_logs(f"{experiment_directory}/3-node-cluster-10-clients")
     five_df = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
     # five_df = parse_experiment_logs(f"{experiment_directory}/5-node-cluster")
     # seven_df = parse_experiment_logs(f"{experiment_directory}/7-node-cluster")
+    # print(five_df.columns)
+    # print(five_df)
 
     # Create bar chart
     bar_labels = ("baseline", "metronome")
@@ -279,19 +276,19 @@ def graph_closed_loop_experiment(save: bool=True):
         client_summary = df.iloc[0]
         for (metric, err) in [("request_latency_average", "request_latency_std_dev"), ("total_time", None)]:
             if err is not None:
-                pivot_df = df.pivot_table(index='delay_info.value', columns='use_metronome', values=[metric, err])
+                pivot_df = df.pivot_table(index='delay_info.value', columns='metronome_info', values=[metric, err])
                 bar_group_labels = list(pivot_df.index)
-                latency_means = {
-                    bar_labels[0]: (pivot_df[metric][0], pivot_df[err][0]),
-                    bar_labels[1]: (pivot_df[metric][2], pivot_df[err][2]),
-                }
+                bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
+                latency_means = {}
+                for label in bar_labels:
+                    latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
             else:
-                pivot_df = df.pivot_table(index='delay_info.value', columns='use_metronome', values=[metric])
+                pivot_df = df.pivot_table(index='delay_info.value', columns='metronome_info', values=[metric])
                 bar_group_labels = list(pivot_df.index)
-                latency_means = {
-                    bar_labels[0]: (pivot_df[metric][0], None),
-                    bar_labels[1]: (pivot_df[metric][2], None),
-                }
+                bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
+                latency_means = {}
+                for label in bar_labels:
+                    latency_means[label] = (pivot_df[metric][label], None)
             fig, ax = create_base_barchart(latency_means, bar_group_labels, legend_args)
             ax.set_xlabel("Data Size (bytes)", fontsize=24)
             # plt.xticks(rotation=45)
@@ -303,19 +300,21 @@ def graph_closed_loop_experiment(save: bool=True):
     # Create violin plot
     client_logs = []
     for i, client_summary in five_df.iterrows():
-        # if client_summary['delay_info.value'] == "256 KiB":
-        #     continue
-        client_log = parse_client_log(client_summary, 100_000)
+        if client_summary['delay_info.value'] == "64 KiB":
+            continue
+        client_log = parse_client_log(client_summary, nrows=500_000, skiprows=10_000)
         client_log.dropna(subset=["response_time"], inplace=True)
-        # client_log = client_log.iloc[0:100_000].reset_index(drop=True)
+        # client_log = client_log.iloc[-10_000:].reset_index(drop=True)
         client_log['latency'] = (client_log['response_time'] - client_log['request_time']) / 1000
         client_log['data_size'] = client_summary['delay_info.value']
-        client_log['use_metronome'] = client_summary.use_metronome == 2
+        client_log['metronome_info'] = client_summary.metronome_info
         client_logs.append(client_log)
     violin_data = pd.concat(client_logs, ignore_index=True)
     plt.figure(figsize=(10, 6))
-    palette = {False: 'skyblue', True: 'orange'}
-    sns.violinplot(data=violin_data, x="data_size", y="latency", hue="use_metronome", split=True, inner='quart', palette=palette, density_norm="width")
+    sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", inner='quart', density_norm="width")
+    # plt.yscale("log")
+    # palette = {False: 'skyblue', True: 'orange'}
+    # sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", split=True, inner='quart', palette=palette, density_norm="width")
     # Labels
     client_summary = five_df.iloc[0]
     title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients={client_summary.num_parallel_requests}, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})"
@@ -329,26 +328,58 @@ def graph_closed_loop_experiment(save: bool=True):
 
     # Create debug plots
     for i, (_, client_summary) in enumerate(five_df.iterrows()):
-        client_log = parse_client_log(client_summary, 100_000)
-        server_logs = parse_server_logs(client_summary)
+        client_log = parse_client_log(client_summary, nrows=200_000)
+        server_logs = parse_server_logs(client_summary, nrows=200_000)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
             fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
     return
 
-def graph_latency_throughput_experiment():
+def graph_latency_throughput_experiment(save: bool=True):
     # Get experiment data
-    experiment_directory = "latency-throughput-experiment"
-    run_directory = "5-node-cluster-File0"
+    experiment_directory = "instrumented/latency-throughput-experiment"
+    run_directory = "5-node-cluster-File256"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
-    print(summaries)
+    throughput_data = summaries[['num_parallel_requests', 'metronome_info','throughput', 'request_latency_average', 'request_latency_std_dev']].sort_values(by=['throughput', 'metronome_info'])
+    # throughput_data.to_csv(f"./logs/{experiment_directory}/{run_directory}/data.csv")
 
-    # Create debug plots
-    client_summary = summaries.iloc[2]
-    client_log = parse_client_log(client_summary, 100_000)
-    server_logs = parse_server_logs(client_summary)
-    fig = graph_experiment_debug(client_summary, client_log, server_logs)
+    # Separate data by 'metronome_info' for different lines
+    grouped = throughput_data.groupby("metronome_info")
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for metronome, group in grouped:
+        # Sort by throughput to ensure lines are continuous
+        group = group.sort_values("throughput")
+        x = group["throughput"]
+        y = group["request_latency_average"]
+        std_dev = group["request_latency_std_dev"]
+        ax.plot(x, y, label=f"Metronome: {metronome}", marker='o')
+        ax.fill_between(x, y - std_dev, y + std_dev, alpha=0.2)
+    # Labels and legend
+    ax.grid(which="both", linestyle="--", linewidth=0.5, axis="x")
+    ax.set_xscale("log")  # Log scale for throughput if needed
+    ax.set_xlabel("Throughput", fontsize=14)
+    ax.set_ylabel("Request Latency Average", fontsize=14)
+    ax.set_title("Throughput vs. Request Latency Average", fontsize=16)
+    ax.legend()
+    ax.grid(True)
+
     plt.show()
+    if save:
+        fig.savefig(f"./logs/{experiment_directory}/{run_directory}/throughput-latency.svg", format="svg")
+
+
+    
+
+    # # Create debug plots
+    # for i, (_, client_summary) in enumerate(summaries.iterrows()):
+    #     client_log = parse_client_log(client_summary, 100_000)
+    #     server_logs = parse_server_logs(client_summary)
+    #     # client_log = client_log.iloc[-10_000:].reset_index(drop=True)
+    #     fig = graph_experiment_debug(client_summary, client_log, server_logs)
+    #     if save:
+    #         fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
     return
 
 
@@ -367,7 +398,7 @@ def graph_latency_throughput_experiment():
 #     for df in [five_df, seven_df]:
 #         cluster_size = df["cluster_size"][0]
 #         for (metric, err) in [("request_latency_average", "request_latency_std_dev"), ("batch_latency_average", "batch_latency_std_dev")]:
-#             pivot_df = df.pivot_table(index='metronome_quorum_size', columns='use_metronome', values=[metric, err])
+#             pivot_df = df.pivot_table(index='metronome_quorum_size', columns='metronome_info', values=[metric, err])
 #             print(pivot_df)
 #             bar_group_labels = list(pivot_df.index)
 #             latency_means = {
@@ -382,9 +413,9 @@ def graph_latency_throughput_experiment():
 
 
 def main():
-    graph_local_experiment()
+    # graph_local_experiment()
     # graph_closed_loop_experiment()
-    # graph_latency_throughput_experiment()
+    graph_latency_throughput_experiment()
     # graph_metronome_size_experiment()
     pass
 

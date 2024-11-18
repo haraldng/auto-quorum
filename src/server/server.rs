@@ -21,6 +21,8 @@ use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const INITIAL_LOG_CAPACITY: usize = 1_000_000;
+const COMPACT_LIMIT: usize = 700_000;
+const COMPACT_RETAIN_SIZE: usize = 100_000;
 const PULL_FROM_NETWORK_SIZE: usize = 10_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -35,9 +37,7 @@ pub struct MetronomeServer {
     client_messages: Receiver<(ClientId, ClientMessage, i64)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
-    // persist_mode: PersistMode,
     delay_strat: DelayStrategy,
-    // accepted_buffer: Vec<(usize, u64, ClusterMessage)>,
     decided_slots_buffer: Vec<usize>,
     instrumentation_data: Option<InstrumentationData>,
     config: MetronomeServerConfig,
@@ -91,9 +91,7 @@ impl MetronomeServer {
             client_messages,
             omnipaxos,
             initial_leader,
-            // persist_mode: config.persist_config.into(),
             delay_strat: config.delay_config.into(),
-            // accepted_buffer: vec![],
             decided_slots_buffer: Vec::with_capacity(1000),
             instrumentation_data,
             config,
@@ -108,7 +106,7 @@ impl MetronomeServer {
         if let DelayStrategy::FileWrite(ref mut file, entry_size) = self.delay_strat {
             let buffer = vec![b'A'; entry_size];
             file.write_all(&buffer).expect("Failed to write file");
-            file.sync_all().expect("Failed to flush file");
+            file.sync_data().expect("Failed to flush file");
         }
 
         // NOTE: This will cap how many messages an Opportunistic flush strategy can batch
@@ -232,7 +230,7 @@ impl MetronomeServer {
                     if let Some(data) = &self.instrumentation_data {
                         data.request_data_to_csv(self.config.debug_filename.clone())
                             .expect("File write failed");
-                        data.debug_request_data();
+                        //data.debug_request_data();
                     }
                     return true;
                 }
@@ -250,6 +248,17 @@ impl MetronomeServer {
         if let Some(data) = &mut self.instrumentation_data {
             for slot in &self.decided_slots_buffer {
                 data.commited(*slot);
+            }
+        }
+        if !self.decided_slots_buffer.is_empty() {
+            let last_dec_slot = self.decided_slots_buffer[self.decided_slots_buffer.len() - 1];
+            let in_mem_log_length = last_dec_slot - self.omnipaxos.get_compacted_idx();
+            if in_mem_log_length > COMPACT_LIMIT {
+                let compact_idx = last_dec_slot - COMPACT_RETAIN_SIZE;
+                match self.omnipaxos.trim(Some(compact_idx)) {
+                    Ok(_) => info!("Compacted in-memory log at idx {compact_idx}"),
+                    Err(e) => panic!("Failed compaction at idx {compact_idx}: {e:?}"),
+                }
             }
         }
         for slot in self.decided_slots_buffer.drain(..) {
@@ -305,49 +314,42 @@ impl MetronomeServer {
     // Metronome acceptors handle accepted messages differently
     fn send_outgoing_msgs_follower(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
+        for msg in messages {
+            if let Some(to_flush) = msg.get_accepted_slots() {
+                self.emulate_disk_flush(to_flush);
+            }
+            let to = msg.get_receiver();
+            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+            self.network.send_to_cluster(to, cluster_msg);
+        }
+    }
+
+    fn emulate_disk_flush(&mut self, to_flush: &Vec<usize>) {
         match self.delay_strat {
             DelayStrategy::NoDelay => {
-                for msg in messages {
-                    if let Some(data) = &mut self.instrumentation_data {
-                        let to_flush = msg.get_accepted_slots().unwrap();
-                        data.persist_start(to_flush);
-                        data.persist_end(to_flush);
-                    }
-                    let to = msg.get_receiver();
-                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-                    self.network.send_to_cluster(to, cluster_msg);
+                if let Some(data) = &mut self.instrumentation_data {
+                    data.persist_start(to_flush);
+                    data.persist_end(to_flush);
                 }
             }
             DelayStrategy::FileWrite(ref mut file, entry_size) => {
-                for msg in messages {
-                    let to_flush = msg.get_accepted_slots().unwrap();
-                    if let Some(data) = &mut self.instrumentation_data {
-                        data.persist_start(to_flush);
-                    }
-                    let buffer = vec![b'A'; entry_size * to_flush.len()];
-                    file.write_all(&buffer).expect("Failed to write file");
-                    file.sync_all().expect("Failed to flush file");
-                    if let Some(data) = &mut self.instrumentation_data {
-                        data.persist_end(to_flush);
-                    }
-                    let to = msg.get_receiver();
-                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-                    self.network.send_to_cluster(to, cluster_msg);
+                if let Some(data) = &mut self.instrumentation_data {
+                    data.persist_start(to_flush);
+                }
+                let buffer = vec![b'A'; entry_size * to_flush.len()];
+                file.write_all(&buffer).expect("Failed to write file");
+                file.sync_data().expect("Failed to flush file");
+                if let Some(data) = &mut self.instrumentation_data {
+                    data.persist_end(to_flush);
                 }
             }
             DelayStrategy::Sleep(delay) => {
-                for msg in messages {
-                    let to_flush = msg.get_accepted_slots().unwrap();
-                    if let Some(data) = &mut self.instrumentation_data {
-                        data.persist_start(to_flush);
-                    }
-                    std::thread::sleep(delay * to_flush.len() as u32);
-                    if let Some(data) = &mut self.instrumentation_data {
-                        data.persist_end(to_flush);
-                    }
-                    let to = msg.get_receiver();
-                    let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-                    self.network.send_to_cluster(to, cluster_msg);
+                if let Some(data) = &mut self.instrumentation_data {
+                    data.persist_start(to_flush);
+                }
+                std::thread::sleep(delay * to_flush.len() as u32);
+                if let Some(data) = &mut self.instrumentation_data {
+                    data.persist_end(to_flush);
                 }
             }
         }
@@ -575,7 +577,13 @@ impl InstrumentationData {
         let start_accdec_latencies = self
             .request_data
             .iter()
-            .map(|data| data.send_accdec[0].time - data.channel_receive)
+            .filter_map(|data| {
+                if let Some(first_accdec) = data.send_accdec.get(0) {
+                    Some(first_accdec.time - data.channel_receive)
+                } else {
+                    None
+                }
+            })
             .collect();
         self.get_batch_average(&start_accdec_latencies)
     }
