@@ -20,17 +20,18 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, persist_co
         )
     cluster = cluster.add_client(1,
         "us-central1-a",
+        request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(number_of_clients),
         end_condition=end_condition,
-        num_parallel_requests=number_of_clients,
         rust_log="info",
     ).build()
 
     # Run experiments
-    # for data_size in [256, 1024*4, 1024*8, 1024*16, 1024*32, 1024*64, 1024*128]:
-    for data_size in [256, 1024, 1024*4, 1024*16]:
+    # for data_size in [256, 1024, 1024*4, 1024*16]:
+    for data_size in [1024]:
         delay_config = MetronomeCluster.DelayConfig.File(data_size)
         cluster.change_cluster_config(delay_config=delay_config)
-        for metronome_config in ["Off", "RoundRobin2", "FastestFollower"]:
+        # for metronome_config in ["Off", "RoundRobin2", "FastestFollower"]:
+        for metronome_config in ["FastestFollower"]:
             print(f"{metronome_config=}, {data_size=}")
             cluster.change_cluster_config(metronome_config=metronome_config)
             cluster.start_servers()
@@ -39,12 +40,12 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, persist_co
             cluster.stop_servers()
             iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-datasize-{data_size}")
             cluster.get_logs(iteration_directory)
-            time.sleep(10)
+            # time.sleep(10)
     # cluster.shutdown()
 
-def closed_loop_experiment_sleep(cluster_size: int, number_of_clients: int, end_condition: MetronomeCluster.EndConditionConfig, persist_config: MetronomeCluster.PersistConfig):
-    experiment_log_dir = Path(f"./logs/closed-loop-experiments-sleep-{persist_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
-    print(f"RUNNING CLOSED LOOP EXPERIMENT: {cluster_size=}, {end_condition=}, {number_of_clients=}")
+def num_clients_latency_experiment(cluster_size: int, persist_config: MetronomeCluster.PersistConfig, end_condition: MetronomeCluster.EndConditionConfig):
+    experiment_log_dir = Path(f"./logs/closed-loop-latency-experiments/{persist_config.to_label()}/{cluster_size}-node-cluster")
+    print(f"RUNNING NUM CLIENTS-LATENCY EXPERIMENT: {cluster_size=}, {end_condition=}, {persist_config=}")
     print(experiment_log_dir)
 
     # Create cluster instances
@@ -59,29 +60,34 @@ def closed_loop_experiment_sleep(cluster_size: int, number_of_clients: int, end_
         )
     cluster = cluster.add_client(1,
         "us-central1-a",
+        request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(1),
         end_condition=end_condition,
-        num_parallel_requests=number_of_clients,
         rust_log="info",
     ).build()
 
     # Run experiments
-    # for data_size in [256, 1024*4, 1024*8, 1024*16, 1024*32, 1024*64, 1024*128]:
-    for storage_delay in [1600]:
-        delay_config = MetronomeCluster.DelayConfig.Sleep(storage_delay)
+    # for data_size in [256, 512, 1024]:
+    for data_size in [512]:
+        delay_config = MetronomeCluster.DelayConfig.File(data_size)
         cluster.change_cluster_config(delay_config=delay_config)
-        for metronome_config in ["Off", "RoundRobin2"]:
-            print(f"{metronome_config=}, {storage_delay=}")
-            cluster.change_cluster_config(metronome_config=metronome_config)
-            cluster.start_servers()
-            cluster.start_client(1)
-            cluster.await_cluster()
-            cluster.stop_servers()
-            iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-delay-{storage_delay}")
-            cluster.get_logs(iteration_directory)
+        for number_of_clients in [1, 10, 100, 1000]:
+        # for number_of_clients in [10000]:
+            request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(number_of_clients)
+            cluster.change_client_config(1, request_mode_config=request_mode_config)
+            for metronome_config in ["Off", "RoundRobin2"]:
+                print(f"{metronome_config=}, {data_size=}, {number_of_clients=}")
+                cluster.change_cluster_config(metronome_config=metronome_config)
+                cluster.start_servers()
+                cluster.start_client(1)
+                cluster.await_cluster()
+                cluster.stop_servers()
+                iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-datasize-{data_size}-clients-{number_of_clients}")
+                time.sleep(2)
+                cluster.get_logs(iteration_directory)
     # cluster.shutdown()
 
 def latency_throughput_experiment(cluster_size: int, end_condition: MetronomeCluster.EndConditionConfig, delay_config: MetronomeCluster.DelayConfig):
-    experiment_log_dir = Path(f"./logs/instrumented/latency-throughput-experiment/{cluster_size}-node-cluster-{delay_config.to_label()}")
+    experiment_log_dir = Path(f"./logs/latency-throughput-experiment/{cluster_size}-node-cluster-{delay_config.to_label()}")
     print(f"RUNNING LATENCY-THROUGHPUT EXPERIMENT: {cluster_size=}, {end_condition=}")
     print(experiment_log_dir)
 
@@ -93,27 +99,30 @@ def latency_throughput_experiment(cluster_size: int, end_condition: MetronomeClu
         cluster = cluster.add_server(
             i,
             "us-central1-a",
-            instrumentation=True,
-            rust_log="info",
+            instrumentation=False,
+            rust_log="error",
         )
     cluster = cluster.add_client(1,
         "us-central1-a",
+        request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(1),
         end_condition=end_condition,
-        num_parallel_requests=1,
         rust_log="info",
     ).build()
 
     # Run experiments
-    for num_clients in [1, 10, 100, 1000, 2000, 3000]:
-        cluster.change_client_config(1, num_parallel_requests=num_clients)
+    request_interval_ms = 10
+    # for request_batch_size in [1, 10, 100, 1000, 2000, 5000]:
+    for request_batch_size in [15000]:
+        request_mode_config = MetronomeCluster.RequestModeConfig.OpenLoop(request_interval_ms, request_batch_size)
+        cluster.change_client_config(1, request_mode_config=request_mode_config)
         for metronome_config in ["Off", "RoundRobin2"]:
-            print(f"{metronome_config=}, {num_clients=}")
+            print(f"{metronome_config=}, {request_mode_config=}")
             cluster.change_cluster_config(metronome_config=metronome_config)
-            cluster.start_servers()
-            cluster.start_client(1)
+            cluster.start_servers(pull_images=True)
+            cluster.start_client(1, pull_image=True)
             cluster.await_cluster()
             cluster.stop_servers()
-            iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-clients-{num_clients}")
+            iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-{request_mode_config.to_label()}")
             cluster.get_logs(iteration_directory)
 
 # def metronome_size_experiment(cluster_size: int, total_messages: int, number_of_clients: int):
@@ -159,13 +168,27 @@ def latency_throughput_experiment(cluster_size: int, end_condition: MetronomeClu
 
 
 def main():
+    # persist_config = MetronomeCluster.PersistConfig.Every(100)
+    # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(2*60)
+    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, persist_config=persist_config, end_condition=end_condition)
+
+    # persist_config = MetronomeCluster.PersistConfig.Opportunistic()
+    # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(1*60)
+    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, persist_config=persist_config, end_condition=end_condition)
+
     persist_config = MetronomeCluster.PersistConfig.Individual()
-    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(5*60)
-    closed_loop_experiment(cluster_size=5, number_of_clients=1000, persist_config=persist_config, end_condition=end_condition)
+    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(30)
+    num_clients_latency_experiment(cluster_size=5, persist_config=persist_config, end_condition=end_condition)
+
+    # delay_config = MetronomeCluster.DelayConfig.File(0)
+    # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(2)
+    # latency_throughput_experiment(cluster_size=5, delay_config=delay_config, end_condition=end_condition)
 
     # delay_config = MetronomeCluster.DelayConfig.File(256)
     # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(2)
     # latency_throughput_experiment(cluster_size=5, delay_config=delay_config, end_condition=end_condition)
+
+
 
     # metronome_size_experiment(7, 1000, 1, persist_config)
     pass

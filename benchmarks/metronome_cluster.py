@@ -45,8 +45,8 @@ class MetronomeCluster:
     class ClientConfig:
         instance_config: InstanceConfig
         server_id: int
+        request_mode_config: 'MetronomeCluster.RequestModeConfig'
         end_condition: 'MetronomeCluster.EndConditionConfig'
-        num_parallel_requests: int
         summary_filename: str
         output_filename: str
         rust_log: str="info"
@@ -103,6 +103,24 @@ class MetronomeCluster:
                 return f"{self.persist_type}"
 
     @dataclass
+    class RequestModeConfig:
+        request_mode_config_type: str
+        request_mode_config_value: int | list[int]
+
+        @staticmethod
+        def ClosedLoop(num_parallel_requests: int):
+            return MetronomeCluster.RequestModeConfig("ClosedLoop", num_parallel_requests)
+        @staticmethod
+        def OpenLoop(request_interval_ms: int, requests_per_interval: int):
+            return MetronomeCluster.RequestModeConfig("OpenLoop", [request_interval_ms, requests_per_interval])
+
+        def to_label(self) -> str:
+            if self.request_mode_config_value == "ClosedLoop":
+                return f"ClosedLoop{self.request_mode_config_value}"
+            else:
+                return f"OpenLoop{self.request_mode_config_value[0]}-{self.request_mode_config_value[1]}"
+
+    @dataclass
     class MetronomeServerToml:
         location: str
         server_id: int
@@ -122,8 +140,8 @@ class MetronomeCluster:
         cluster_name: str
         location: str
         server_id: int
+        request_mode_config: 'MetronomeCluster.RequestModeConfig'
         end_condition: 'MetronomeCluster.EndConditionConfig'
-        num_parallel_requests: int
         summary_filename: str
         output_filename: str
 
@@ -268,14 +286,14 @@ class MetronomeCluster:
     def change_client_config(
         self,
         client_id: int,
+        request_mode_config: Optional[RequestModeConfig] = None,
         end_condition: Optional[EndConditionConfig] = None,
-        num_parallel_requests: Optional[int] = None,
         rust_log: Optional[str]=None,
     ):
+        if request_mode_config is not None:
+            self._client_configs[client_id].request_mode_config = request_mode_config
         if end_condition is not None:
             self._client_configs[client_id].end_condition = end_condition
-        if num_parallel_requests is not None:
-            self._client_configs[client_id].num_parallel_requests = num_parallel_requests
         if rust_log is not None:
             self._client_configs[client_id].rust_log = rust_log
 
@@ -331,8 +349,8 @@ class MetronomeClusterBuilder:
         self,
         server_id: int,
         zone: str,
+        request_mode_config: MetronomeCluster.RequestModeConfig,
         end_condition: MetronomeCluster.EndConditionConfig,
-        num_parallel_requests: int,
         machine_type: str = "e2-standard-4",
         rust_log: str="info"
     ):
@@ -349,8 +367,8 @@ class MetronomeClusterBuilder:
         client_config = MetronomeCluster.ClientConfig(
             instance_config=instance_config,
             server_id=server_id,
+            request_mode_config=request_mode_config,
             end_condition=end_condition,
-            num_parallel_requests=num_parallel_requests,
             summary_filename=f"client-{server_id}.json",
             output_filename=f"client-{server_id}.csv",
             rust_log=rust_log,
@@ -479,42 +497,6 @@ def _generate_server_config(
     )
     server_toml_str = toml.dumps(asdict(server_toml))
     return server_toml_str
-#     persist_value_toml = f"persist_value = {config.persist_config.persist_value}" if config.persist_config.persist_value is not None else ""
-#     use_metronome_toml = f"use_metronome = {cluster_config.metronome_config}" if cluster_config.metronome_config is not None else ""
-#     metronome_quorum_toml = f"metronome_quorum_size = {cluster_config.metronome_quorum_size}" if cluster_config.metronome_quorum_size is not None else ""
-#     flex_quorum_toml = f"flexible_quorum = {{ read_quorum_size = {cluster_config.flexible_quorum[0]}, write_quorum_size = {cluster_config.flexible_quorum[1]} }}" if cluster_config.flexible_quorum is not None else ""
-#     init_leader_toml = f"initial_leader = {cluster_config.initial_leader}" if cluster_config.initial_leader is not None else ""
-#
-#     toml = f"""
-# cluster_name = "{cluster_config.cluster_name}"
-# location = "{config.instance_config.zone}"
-# instrumentation = {str(config.instrumentation).lower()}
-# debug_filepath = "{config.debug_filename}"
-# {init_leader_toml}
-#
-# [persist_config]
-# persist_type = "{config.persist_config.persist_type}"
-# {persist_value_toml}
-#
-# [delay_config]
-# delay_type = "{config.delay_config.delay_type}"
-# delay_value = {config.delay_config.delay_value}
-#
-# [cluster_config]
-# configuration_id = 1
-# nodes = {cluster_config.nodes}
-# {use_metronome_toml}
-# {metronome_quorum_toml}
-# {flex_quorum_toml}
-#
-# [server_config]
-# pid = {config.server_id}
-# election_tick_timeout = 1
-# resend_message_tick_timeout = 5
-# flush_batch_tick_timeout = 200
-# batch_size = 1
-# """
-#     return toml
 
 # Startup script executed on creation of the GCP instance for a Metronome client.
 # ssh into instance and run `sudo journalctl -u google-startup-scripts.service`
@@ -579,23 +561,10 @@ def _generate_client_config(
         cluster_name=cluster_config.cluster_name,
         location=config.instance_config.zone,
         server_id=config.server_id,
+        request_mode_config=config.request_mode_config,
         end_condition=config.end_condition,
-        num_parallel_requests=config.num_parallel_requests,
         summary_filename=config.summary_filename,
         output_filename=config.output_filename,
     )
     client_toml_str = toml.dumps(asdict(client_toml))
     return client_toml_str
-#     toml = f"""
-# cluster_name = "{cluster_config.cluster_name}"
-# location = "{config.instance_config.zone}"
-# server_id = {config.client_id}
-# num_parallel_requests = {config.num_parallel_requests}
-# summary_filepath = "{config.summary_filename}"
-# output_filepath = "{config.output_filename}"
-#
-# [end_condition]
-# end_condition_type = "{config.end_condition.end_condition_type}"
-# end_condition_value = {config.end_condition.end_condition_value}
-# """
-#     return toml

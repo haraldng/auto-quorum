@@ -2,10 +2,13 @@ cluster_name = "local-cluster"
 location = "local-1"
 server_id = 1
 local_deployment = true
-num_parallel_requests = 200
 summary_filename = "../benchmarks/logs/local-experiments/client-1.json"
 output_filename = "../benchmarks/logs/local-experiments/client-1.csv"
 
+[request_mode_config]
+request_mode_config_type = "ClosedLoop"
+request_mode_config_value = 200
+
 [end_condition]
 end_condition_type = "ResponsesCollected"
-end_condition_value = 100000
+end_condition_value = 1000

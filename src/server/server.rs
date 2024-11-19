@@ -20,9 +20,9 @@ use std::{fs::File, io::Write, time::Duration};
 use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-const INITIAL_LOG_CAPACITY: usize = 1_000_000;
-const COMPACT_LIMIT: usize = 700_000;
-const COMPACT_RETAIN_SIZE: usize = 100_000;
+const INITIAL_LOG_CAPACITY: usize = 2_000_000;
+const COMPACT_LIMIT: usize = 2_000_000;
+const COMPACT_RETAIN_SIZE: usize = 500_000;
 const PULL_FROM_NETWORK_SIZE: usize = 10_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -217,6 +217,15 @@ impl MetronomeServer {
                         data.new_request(command_id, net_recv_time)
                     }
                     self.commit_command_to_log(client_id, command_id, kv_command);
+                }
+                (client_id, ClientMessage::BatchAppend(appends), net_recv_time) => {
+                    debug!("Server: BatchRequest from client {client_id}: {appends:?}");
+                    for (command_id, kv_command) in appends {
+                        if let Some(data) = &mut self.instrumentation_data {
+                            data.new_request(command_id, net_recv_time)
+                        }
+                        self.commit_command_to_log(client_id, command_id, kv_command);
+                    }
                 }
                 (_, ClientMessage::Done, _) => {
                     info!("{}: Received Done signal from client", self.id);

@@ -1,51 +1,16 @@
-use crate::network::Network;
+use crate::{
+    configs::{ClientConfig, EndCondition, EndConditionConfig},
+    network::Network,
+};
 use chrono::Utc;
 use csv::Writer;
 use futures::StreamExt;
 use log::*;
 use metronome::common::{kv::*, messages::*};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{fs::File, io::Write, time::Duration};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ClientConfig {
-    pub cluster_name: String,
-    pub location: String,
-    pub server_id: NodeId,
-    pub local_deployment: Option<bool>,
-    pub end_condition: EndConditionConfig,
-    pub num_parallel_requests: usize,
-    pub summary_filename: String,
-    pub output_filename: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-#[serde(tag = "end_condition_type", content = "end_condition_value")]
-pub enum EndConditionConfig {
-    ResponsesCollected(usize),
-    SecondsPassed(u64),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum EndCondition {
-    ResponsesCollected(usize),
-    TimePassed(Duration),
-}
-
-impl From<EndConditionConfig> for EndCondition {
-    fn from(config: EndConditionConfig) -> Self {
-        match config {
-            EndConditionConfig::ResponsesCollected(n) => EndCondition::ResponsesCollected(n),
-            EndConditionConfig::SecondsPassed(secs) => {
-                EndCondition::TimePassed(Duration::from_secs(secs))
-            }
-        }
-    }
-}
-
-type Timestamp = i64;
-
-pub struct Client {
+pub struct ClosedLoopClient {
     end_condition: EndCondition,
     num_parallel_requests: usize,
     network: Network,
@@ -54,7 +19,7 @@ pub struct Client {
     leaders_config: Option<MetronomeConfigInfo>,
 }
 
-impl Client {
+impl ClosedLoopClient {
     pub async fn new(config: ClientConfig) -> Self {
         let local_deployment = config.local_deployment.unwrap_or(false);
         let network = Network::new(
@@ -67,9 +32,10 @@ impl Client {
             EndConditionConfig::ResponsesCollected(n) => n,
             EndConditionConfig::SecondsPassed(_secs) => 10_000,
         };
-        Client {
+        let num_parallel_requests = config.request_mode_config.to_closed_loop_params().unwrap();
+        ClosedLoopClient {
             end_condition: config.end_condition.into(),
-            num_parallel_requests: config.num_parallel_requests,
+            num_parallel_requests,
             network,
             client_data: ClientData::new(num_estimated_responses),
             config,
@@ -178,8 +144,10 @@ impl Client {
     }
 }
 
+type Timestamp = i64;
+
 #[derive(Debug, Serialize)]
-struct ClientSummary {
+pub struct ClientSummary {
     client_config: ClientConfig,
     server_info: MetronomeConfigInfo,
     client_start_time: Timestamp,
@@ -191,7 +159,7 @@ struct ClientSummary {
     request_latency_std_dev: f64,
 }
 
-struct ClientData {
+pub struct ClientData {
     response_data: Vec<ResponseData>,
     request_count: usize,
     response_count: usize,
@@ -200,14 +168,14 @@ struct ClientData {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponseData {
+pub struct ResponseData {
     command_id: CommandId,
     request_time: Option<Timestamp>,
     response_time: Option<Timestamp>,
 }
 
 impl ClientData {
-    fn new(num_estimated_responses: usize) -> Self {
+    pub fn new(num_estimated_responses: usize) -> Self {
         Self {
             response_data: Vec::with_capacity(num_estimated_responses),
             request_count: 0,
@@ -217,17 +185,17 @@ impl ClientData {
         }
     }
 
-    fn experiment_start(&mut self) {
+    pub fn experiment_start(&mut self) {
         self.client_start_time = Some(Utc::now().timestamp_micros());
     }
-    fn experiment_end(&mut self) {
+    pub fn experiment_end(&mut self) {
         self.client_end_time = Some(Utc::now().timestamp_micros());
     }
 
     // A Client can send requests with out-of-order command ids due to parallel requests.
     // Use a vec with placeholder values to fill in the gaps.
     #[inline]
-    fn new_request(&mut self, request_id: CommandId) {
+    pub fn new_request(&mut self, request_id: CommandId) {
         let request_time = Utc::now().timestamp_micros();
         if request_id < self.response_data.len() {
             self.response_data[request_id].request_time = Some(request_time);
@@ -250,14 +218,39 @@ impl ClientData {
     }
 
     #[inline]
-    fn new_response(&mut self, response_id: CommandId) {
+    pub fn new_response(&mut self, response_id: CommandId) {
         let response_time = Utc::now().timestamp_micros();
         // Placeholders will ensure indexing works
         self.response_data[response_id].response_time = Some(response_time);
         self.response_count += 1;
     }
 
-    fn save_summary(
+    #[inline]
+    pub fn new_batch_request(&mut self, start_id: CommandId, num_requests: usize) {
+        let request_time = Utc::now().timestamp_micros();
+        for request_id in start_id..start_id + num_requests {
+            if request_id < self.response_data.len() {
+                self.response_data[request_id].request_time = Some(request_time);
+            } else {
+                for placeholder_id in self.response_data.len()..request_id {
+                    let placeholder = ResponseData {
+                        command_id: placeholder_id,
+                        request_time: None,
+                        response_time: None,
+                    };
+                    self.response_data.push(placeholder);
+                }
+                self.response_data.push(ResponseData {
+                    command_id: request_id,
+                    request_time: Some(request_time),
+                    response_time: None,
+                });
+            }
+            self.request_count += 1;
+        }
+    }
+
+    pub fn save_summary(
         &self,
         client_config: ClientConfig,
         server_info: MetronomeConfigInfo,
@@ -285,7 +278,7 @@ impl ClientData {
         Ok(())
     }
 
-    fn to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
+    pub fn to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
         let file = File::create(file_path)?;
         let mut writer = Writer::from_writer(file);
         for data in &self.response_data {
@@ -347,7 +340,7 @@ impl ClientData {
         (last_response_time - first_request_time) as f64 / 1000.
     }
 
-    fn total_responses(&self) -> usize {
+    pub fn total_responses(&self) -> usize {
         self.response_count
     }
 

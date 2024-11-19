@@ -25,6 +25,7 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
+        BatchAppend(Vec<(CommandId, KVCommand)>),
         Done,
     }
 

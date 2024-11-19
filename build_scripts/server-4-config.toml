@@ -4,14 +4,14 @@ local_deployment = true
 server_id = 4
 nodes = [1, 2, 3, 4, 5]
 initial_leader = 1
-metronome_config = "FastestFollower"
+metronome_config = "RoundRobin2"
 #metronome_quorum_size = 3
 instrumentation = true
 debug_filename = "../benchmarks/logs/local-experiments/server-4.csv"
 
 [persist_config]
-persist_type = "Every"
-persist_value = 60
+persist_type = "Individual"
+#persist_value = 60
 
 [delay_config]
 delay_type = "File"

@@ -1,11 +1,15 @@
 use chrono::Utc;
-use client::{Client, ClientConfig};
+use client::ClosedLoopClient;
+use configs::{ClientConfig, RequestModeConfig};
+use open_loop_client::OpenLoopClient;
 use std::{env, fs};
 use tokio::time::Duration;
 use toml;
 
 mod client;
+mod configs;
 mod network;
+mod open_loop_client;
 
 // Wait until the scheduled start time to synchronize client starts.
 // If start time has already passed, start immediately.
@@ -37,7 +41,14 @@ pub async fn main() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
-    // wait_until_sync_time(client_config.scheduled_start_utc_ms).await;
-    let mut client = Client::new(client_config).await;
-    client.run().await;
+    match &client_config.request_mode_config {
+        RequestModeConfig::ClosedLoop(_) => {
+            let mut client = ClosedLoopClient::new(client_config).await;
+            client.run().await;
+        }
+        RequestModeConfig::OpenLoop(_, _) => {
+            let mut client = OpenLoopClient::new(client_config).await;
+            client.run().await;
+        }
+    }
 }
