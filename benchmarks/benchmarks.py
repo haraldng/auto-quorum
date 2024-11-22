@@ -69,12 +69,13 @@ def num_clients_latency_experiment(cluster_size: int, batch_config: MetronomeClu
     ).build()
 
     # Run experiments
-    # for data_size in [256, 1024]:
-    for data_size in [0]:
-        persist_config = MetronomeCluster.PersistConfig.NoPersist()
+    for data_size in [256, 1024]:
+        if data_size == 0:
+            persist_config = MetronomeCluster.PersistConfig.NoPersist()
+        else:
+            persist_config = MetronomeCluster.PersistConfig.File(data_size)
         cluster.change_cluster_config(persist_config=persist_config)
-        # for number_of_clients in [1, 10, 100, 1000, 5000, 10_000]:
-        for number_of_clients in [10_000, 12_000]:
+        for number_of_clients in [1, 10, 100, 1000, 5000, 10_000, 12_000]:
             request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(number_of_clients)
             cluster.change_client_config(1, request_mode_config=request_mode_config)
             for metronome_config in ["Off", "RoundRobin2"]:
@@ -180,7 +181,7 @@ def main():
     # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
 
     batch_config = MetronomeCluster.BatchConfig.Opportunistic()
-    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(10)
+    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(5)
     num_clients_latency_experiment(cluster_size=3, batch_config=batch_config, end_condition=end_condition)
 
     # persist_config = MetronomeCluster.PersistConfig.File(0)

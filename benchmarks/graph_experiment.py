@@ -27,14 +27,12 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
     )
     df = df.sort_values(by=['persist_info.value', 'metronome_info']).reset_index()
     # Ensure the file data_size column is treated as a Categorical variable, ordered by size
-    print(df[['persist_info.type', 'persist_info.value']])
     df['persist_label'] = df['persist_info.value'].apply(format_bytes)
     df['persist_label'] = pd.Categorical(
         df['persist_label'],
         categories=[format_bytes(0)] + [format_bytes(2**i) for i in range(0, 32)],
         ordered=True
     )
-    print(df[['persist_info.type', 'persist_label', 'persist_info.value']])
     return df
 
 def parse_client_summary(file_path: Path) -> pd.DataFrame:
@@ -385,7 +383,7 @@ def graph_closed_loop_experiment(save: bool=True):
 
 def graph_num_clients_latency_experiment(relative=False, save: bool=True):
     # Get experiment data
-    experiment_directory = "closed-loop-latency-experiments"
+    experiment_directory = "/before-append-change/closed-loop-latency-experiments"
     run_directory = "Opportunistic/3-node-cluster"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
 
@@ -417,8 +415,6 @@ def graph_num_clients_latency_experiment(relative=False, save: bool=True):
     cluster_size = summaries.iloc[0].cluster_size
     majority = (cluster_size // 2) + 1
     critical_factor = majority / cluster_size
-
-    print(summaries)
 
     df_cols = ['persist_label', 'persist_info.value', 'num_clients', "throughput", "rel_throughput", 'metronome_info', 'request_latency_average', 'rel_latency', 'request_latency_std_dev', 'total_time']
     df = summaries[df_cols].sort_values(by=['persist_info.value', 'num_clients']).reset_index(drop=True)
