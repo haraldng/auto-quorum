@@ -40,7 +40,11 @@ impl From<PersistConfig> for PersistStrategy {
             PersistConfig::NoPersist => PersistStrategy::NoPersist,
             PersistConfig::File(0) => PersistStrategy::NoPersist,
             PersistConfig::File(data_size) => {
-                let file = tempfile::tempfile().expect("Failed to open temp file");
+                let file = tempfile::Builder::new()
+                    .append(true)
+                    .tempfile()
+                    .expect("Failed to open temp file")
+                    .into_file();
                 PersistStrategy::FileWrite(file, data_size)
             }
         }
