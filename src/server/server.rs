@@ -20,13 +20,32 @@ use std::{fs::File, io::Write, time::Duration};
 use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-const INITIAL_LOG_CAPACITY: usize = 2_000_000;
-const COMPACT_LIMIT: usize = 2_000_000;
+const INITIAL_LOG_CAPACITY: usize = 50_000_000;
+const COMPACT_LIMIT: usize = 200_000_000;
 const COMPACT_RETAIN_SIZE: usize = 500_000;
-const PULL_FROM_NETWORK_SIZE: usize = 10_000;
+const PULL_FROM_NETWORK_SIZE: usize = 100_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 type TimeStamp = i64;
+
+#[derive(Debug)]
+pub(crate) enum PersistStrategy {
+    NoPersist,
+    FileWrite(File, usize),
+}
+
+impl From<PersistConfig> for PersistStrategy {
+    fn from(value: PersistConfig) -> Self {
+        match value {
+            PersistConfig::NoPersist => PersistStrategy::NoPersist,
+            PersistConfig::File(0) => PersistStrategy::NoPersist,
+            PersistConfig::File(data_size) => {
+                let file = tempfile::tempfile().expect("Failed to open temp file");
+                PersistStrategy::FileWrite(file, data_size)
+            }
+        }
+    }
+}
 
 pub struct MetronomeServer {
     id: NodeId,
@@ -37,7 +56,7 @@ pub struct MetronomeServer {
     client_messages: Receiver<(ClientId, ClientMessage, i64)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
-    delay_strat: DelayStrategy,
+    persist_strat: PersistStrategy,
     decided_slots_buffer: Vec<usize>,
     instrumentation_data: Option<InstrumentationData>,
     config: MetronomeServerConfig,
@@ -53,8 +72,8 @@ impl MetronomeServer {
             .collect();
         let local_deployment = config.local_deployment.unwrap_or(false);
         info!(
-            "Node: {:?}: using metronome: {:?}, persist_config: {:?}",
-            server_id, config.metronome_config, config.persist_config
+            "Node: {:?}: using metronome: {:?}, batch_config: {:?}",
+            server_id, config.metronome_config, config.batch_config
         );
         let storage = MemoryStorage::with_capacity(INITIAL_LOG_CAPACITY);
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
@@ -91,7 +110,7 @@ impl MetronomeServer {
             client_messages,
             omnipaxos,
             initial_leader,
-            delay_strat: config.delay_config.into(),
+            persist_strat: config.persist_config.into(),
             decided_slots_buffer: Vec::with_capacity(1000),
             instrumentation_data,
             config,
@@ -103,7 +122,7 @@ impl MetronomeServer {
 
     pub async fn run(&mut self) {
         // Hack to avoid slow first disk write
-        if let DelayStrategy::FileWrite(ref mut file, entry_size) = self.delay_strat {
+        if let PersistStrategy::FileWrite(ref mut file, entry_size) = self.persist_strat {
             let buffer = vec![b'A'; entry_size];
             file.write_all(&buffer).expect("Failed to write file");
             file.sync_data().expect("Failed to flush file");
@@ -334,29 +353,20 @@ impl MetronomeServer {
     }
 
     fn emulate_disk_flush(&mut self, to_flush: &Vec<usize>) {
-        match self.delay_strat {
-            DelayStrategy::NoDelay => {
+        match self.persist_strat {
+            PersistStrategy::NoPersist => {
                 if let Some(data) = &mut self.instrumentation_data {
                     data.persist_start(to_flush);
                     data.persist_end(to_flush);
                 }
             }
-            DelayStrategy::FileWrite(ref mut file, entry_size) => {
+            PersistStrategy::FileWrite(ref mut file, entry_size) => {
                 if let Some(data) = &mut self.instrumentation_data {
                     data.persist_start(to_flush);
                 }
                 let buffer = vec![b'A'; entry_size * to_flush.len()];
                 file.write_all(&buffer).expect("Failed to write file");
                 file.sync_data().expect("Failed to flush file");
-                if let Some(data) = &mut self.instrumentation_data {
-                    data.persist_end(to_flush);
-                }
-            }
-            DelayStrategy::Sleep(delay) => {
-                if let Some(data) = &mut self.instrumentation_data {
-                    data.persist_start(to_flush);
-                }
-                std::thread::sleep(delay * to_flush.len() as u32);
                 if let Some(data) = &mut self.instrumentation_data {
                     data.persist_end(to_flush);
                 }

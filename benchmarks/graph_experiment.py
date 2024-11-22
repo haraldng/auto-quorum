@@ -13,22 +13,34 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
     experiment_directory = Path(f"logs/{experiment_name}")
     experiment_data = [parse_client_summary(f) for f in experiment_directory.rglob("*client-1.json")]
     df = pd.concat(experiment_data)
-    df['metronome_info'] = pd.Categorical(df['metronome_info'], categories=["Off", "RoundRobin", "RoundRobin2", "FastestFollower"], ordered=True)
-    df = df.sort_values(by=['delay_info.value', 'metronome_info']).reset_index()
+    # Ensure the metronome_info column is treated as an ordered Categorical variable
+    category_mapping = {
+        "Off": "Baseline",
+        "RoundRobin": "Metronome_old",
+        "RoundRobin2": "Metronome",
+        "FastestFollower": "Work Stealing"
+    }
+    df['metronome_info'] = pd.Categorical(
+        df['metronome_info'].map(category_mapping), 
+        categories=["Baseline", "Metronome_old", "Metronome", "Work Stealing"], 
+        ordered=True
+    )
+    df = df.sort_values(by=['persist_info.value', 'metronome_info']).reset_index()
     # Ensure the file data_size column is treated as a Categorical variable, ordered by size
-    if df['delay_info.type'][0] == "File":
-        df['delay_info.value'] = df['delay_info.value'].apply(format_bytes)
-        df['delay_info.value'] = pd.Categorical(
-            df['delay_info.value'],
-            categories=[format_bytes(0)] + [format_bytes(2**i) for i in range(0, 32)],
-            ordered=True
-        )
+    print(df[['persist_info.type', 'persist_info.value']])
+    df['persist_label'] = df['persist_info.value'].apply(format_bytes)
+    df['persist_label'] = pd.Categorical(
+        df['persist_label'],
+        categories=[format_bytes(0)] + [format_bytes(2**i) for i in range(0, 32)],
+        ordered=True
+    )
+    print(df[['persist_info.type', 'persist_label', 'persist_info.value']])
     return df
 
 def parse_client_summary(file_path: Path) -> pd.DataFrame:
     with open(file_path, 'r') as file:
         client_json = json.load(file)
-        normalize_persist_delay_info(client_json)
+        normalize_batch_persist_info(client_json)
     flattened_json = { "file": file_path, **client_json.pop('client_config'), **client_json.pop('server_info'), **client_json }
     flattened_json.pop('cluster_name')
     flattened_json.pop('location')
@@ -36,9 +48,17 @@ def parse_client_summary(file_path: Path) -> pd.DataFrame:
     df = pd.DataFrame([flattened_json])
     return df
 
-# Function to flatten persist_info and delay_info
-def normalize_persist_delay_info(client_json: dict):
+# Function to flatten batch_info and persist_info
+def normalize_batch_persist_info(client_json: dict):
     server_info = client_json['server_info']
+    batch_info = server_info.pop('batch_info')
+    if isinstance(batch_info, dict):
+        key, value = next(iter(batch_info.items()))
+        server_info['batch_info.type'] = key
+        server_info['batch_info.value'] = value
+    else:
+        server_info['batch_info.type'] = batch_info
+        server_info['batch_info.value'] = None
     persist_info = server_info.pop('persist_info')
     if isinstance(persist_info, dict):
         key, value = next(iter(persist_info.items()))
@@ -46,21 +66,13 @@ def normalize_persist_delay_info(client_json: dict):
         server_info['persist_info.value'] = value
     else:
         server_info['persist_info.type'] = persist_info
-        server_info['persist_info.value'] = None
-    delay_info = server_info.pop('delay_info')
-    if isinstance(delay_info, dict):
-        key, value = next(iter(delay_info.items()))
-        server_info['delay_info.type'] = key
-        server_info['delay_info.value'] = value
-    try:
-        request_mode = client_json['client_config'].pop('request_mode_config')
-        server_info['request_mode'] = request_mode['request_mode_config_type']
-        if request_mode['request_mode_config_type'] == "ClosedLoop":
-            server_info['num_clients'] = request_mode['request_mode_config_value']
-        else:
-            server_info['open_loop_params'] = request_mode['request_mode_config_value']
-    except:
-        print("WARNING: outdated data without request_mode")
+        server_info['persist_info.value'] = 0
+    request_mode = client_json['client_config'].pop('request_mode_config')
+    server_info['request_mode'] = request_mode['request_mode_config_type']
+    if request_mode['request_mode_config_type'] == "ClosedLoop":
+        server_info['num_clients'] = request_mode['request_mode_config_value']
+    else:
+        server_info['open_loop_params'] = request_mode['request_mode_config_value']
 
 # Find the appropriate unit based on the value of x bytes
 def format_bytes(num_bytes):
@@ -134,7 +146,7 @@ def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legen
     return fig, ax
 
 def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, server_logs: pd.DataFrame| None):
-    title = f"metronome={client_summary.metronome_info}, clients={client_summary.request_mode}, persist=({client_summary['persist_info.type']},{client_summary['persist_info.value']}), storage=({client_summary['delay_info.type']}, {client_summary['delay_info.value']}), metronome_quorum_size={client_summary.metronome_quorum_size}"
+    title = f"metronome={client_summary.metronome_info}, clients=({client_summary.request_mode},{client_summary['request_mode_config_value']}), batch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']}), persist_config=({client_summary['persist_info.type']}, {client_summary['persist_label']}), metronome_quorum_size={client_summary.metronome_quorum_size}"
     if server_logs is None:
         assert client_summary.instrumented is False, "No server logs despite instrumented = True"
         fig, ax = plt.subplots(layout="constrained", figsize=(12,6))
@@ -266,8 +278,10 @@ def graph_local_experiment():
 
 def graph_closed_loop_experiment(save: bool=True):
     # Get experiment data
-    experiment_directory = "5-min/closed-loop-experiments-Opportunistic"
-    run_directory = "5-node-cluster-1000-clients"
+    # experiment_directory = "5-min/closed-loop-experiments-Opportunistic"
+    # run_directory = "5-node-cluster-1000-clients"
+    experiment_directory = "closed-loop-latency-experiments"
+    run_directory = "Opportunistic/5-node-cluster"
     # three_df = parse_client_logs(f"{experiment_directory}/3-node-cluster-10-clients")
     five_df = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
     # five_df = parse_experiment_logs(f"{experiment_directory}/5-node-cluster")
@@ -282,13 +296,13 @@ def graph_closed_loop_experiment(save: bool=True):
         client_summary = df.iloc[0]
         for (metric, err) in [("request_latency_average", "request_latency_std_dev")]:#, ("total_time", None)]:
             if err is not None:
-                pivot_df = df.pivot_table(index='delay_info.value', columns='metronome_info', values=[metric, err])
+                pivot_df = df.pivot_table(index='persist_info.value', columns='metronome_info', values=[metric, err])
                 # print(pivot_df)
                 relative_latency_df = pivot_df['request_latency_average'].div(
-                    pivot_df['request_latency_average']['Off'], axis=0
+                    pivot_df['request_latency_average']['Baseline'], axis=0
                 )
                 relative_std_dev_df = pivot_df['request_latency_std_dev'].div(
-                    pivot_df['request_latency_std_dev']['Off'], axis=0
+                    pivot_df['request_latency_std_dev']['Baseline'], axis=0
                 )
 
                 bar_group_labels = list(pivot_df.index)
@@ -298,7 +312,7 @@ def graph_closed_loop_experiment(save: bool=True):
                     latency_means[label] = (relative_latency_df[label], None)
                     # latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
             else:
-                pivot_df = df.pivot_table(index='delay_info.value', columns='metronome_info', values=[metric])
+                pivot_df = df.pivot_table(index='persist_info.value', columns='metronome_info', values=[metric])
                 bar_group_labels = list(pivot_df.index)
                 bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
                 latency_means = {}
@@ -307,12 +321,12 @@ def graph_closed_loop_experiment(save: bool=True):
             fig, ax = create_base_barchart(latency_means, bar_group_labels, legend_args)
             ax.set_xlabel("Data Size (bytes)", fontsize=24)
             # plt.xticks(rotation=45)
-            # fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})", fontsize=16)
-            fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})", fontsize=16)
+            # fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})", fontsize=16)
+            fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})", fontsize=16)
             if save:
                 fig.savefig(f"./logs/{experiment_directory}/{run_directory}/{metric}_relative.svg", format="svg")
             plt.show()
-    return
+            plt.close()
 
     nrows = 500_000
     # skiprows = 1_000_000
@@ -321,12 +335,12 @@ def graph_closed_loop_experiment(save: bool=True):
     # # Create violin plot
     # client_logs = []
     # for i, client_summary in five_df.iterrows():
-    #     if client_summary['delay_info.value'] == "16 KiB":
+    #     if client_summary['persist_info.value'] == "16 KiB":
     #         skiprows = 10_000
     #     client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
     #     client_log.dropna(subset=["response_time"], inplace=True)
     #     client_log['latency'] = (client_log['response_time'] - client_log['request_time']) / 1000
-    #     client_log['data_size'] = client_summary['delay_info.value']
+    #     client_log['data_size'] = client_summary['persist_info.value']
     #     client_log['metronome_info'] = client_summary.metronome_info
     #     client_logs.append(client_log)
     # violin_data = pd.concat(client_logs, ignore_index=True)
@@ -336,8 +350,8 @@ def graph_closed_loop_experiment(save: bool=True):
     # # sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", split=True, inner='quart', palette=palette, density_norm="width")
     # # Labels
     # client_summary = five_df.iloc[0]
-    # # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})"
-    # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['persist_info.type']},{client_summary['persist_info.value']})"
+    # # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})"
+    # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})"
     # plt.title(title)
     # plt.xticks(rotation=45)
     # plt.xlabel("Datasize (bytes)")
@@ -345,10 +359,11 @@ def graph_closed_loop_experiment(save: bool=True):
     # if save:
     #     plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
     # plt.show()
+    # plt.close()
 
     # Create debug plots
     for i, (_, client_summary) in enumerate(five_df.iterrows()):
-        # if client_summary['delay_info.value'] == "1 KiB" and client_summary['metronome_info'] == "RoundRobin2":
+        # if client_summary['persist_info.value'] == "1 KiB" and client_summary['metronome_info'] == "RoundRobin2":
         #     pass
         # else:
         #     continue
@@ -361,60 +376,121 @@ def graph_closed_loop_experiment(save: bool=True):
         client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
-        # plt.show()
         if save:
             fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
+        plt.show()
+        plt.close()
     return
 
 
-def graph_num_clients_latency_experiment(save: bool=True):
+def graph_num_clients_latency_experiment(relative=False, save: bool=True):
     # Get experiment data
     experiment_directory = "closed-loop-latency-experiments"
-    run_directory = "Individual/5-node-cluster"
-    # three_df = parse_client_logs(f"{experiment_directory}/3-node-cluster-10-clients")
-    five_df = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
-    # five_df = parse_experiment_logs(f"{experiment_directory}/5-node-cluster")
-    # seven_df = parse_experiment_logs(f"{experiment_directory}/7-node-cluster")
-    print(five_df.columns)
+    run_directory = "Opportunistic/3-node-cluster"
+    summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
 
+    # Add relative latency column
+    baseline_latencies = summaries[summaries['metronome_info'] == 'Baseline'].set_index(['persist_info.value', 'num_clients'])['request_latency_average']
+    def calculate_relative_latency(row):
+        if row['metronome_info'] == 'Baseline':
+            return 1.0  # Baseline relative latency is 1.0
+        try:
+            baseline_latency = baseline_latencies.loc[(row['persist_info.value'], row['num_clients'])]
+            return row['request_latency_average'] / baseline_latency
+        except KeyError:
+            return float('nan')  # Handle missing Baseline entries
+    summaries['rel_latency'] = summaries.apply(calculate_relative_latency, axis=1)
 
-    df = five_df[['delay_info.value', 'num_clients', "throughput", 'metronome_info', 'request_latency_average', 'request_latency_std_dev']].sort_values(by=['delay_info.value', 'num_clients'])
-    print(df)
-    # Group data by 'delay_info.value' and 'metronome_info'
-    grouped = df.groupby(['delay_info.value', 'metronome_info'])
+    # Add relative throughput column
+    baseline_latencies = summaries[summaries['metronome_info'] == 'Baseline'].set_index(['persist_info.value', 'num_clients'])['throughput']
+    def calculate_relative_latency(row):
+        if row['metronome_info'] == 'Baseline':
+            return 1.0  # Baseline relative latency is 1.0
+        try:
+            baseline_latency = baseline_latencies.loc[(row['persist_info.value'], row['num_clients'])]
+            return row['throughput'] / baseline_latency
+        except KeyError:
+            return float('nan')  # Handle missing Baseline entries
+    summaries['rel_throughput'] = summaries.apply(calculate_relative_latency, axis=1)
+
+    # Calculate metronome improvement (critical factor)
+    cluster_size = summaries.iloc[0].cluster_size
+    majority = (cluster_size // 2) + 1
+    critical_factor = majority / cluster_size
+
+    print(summaries)
+
+    df_cols = ['persist_label', 'persist_info.value', 'num_clients', "throughput", "rel_throughput", 'metronome_info', 'request_latency_average', 'rel_latency', 'request_latency_std_dev', 'total_time']
+    df = summaries[df_cols].sort_values(by=['persist_info.value', 'num_clients']).reset_index(drop=True)
 
     # Plotting
-    fig, ax = plt.subplots(figsize=(16, 6))
-    for (delay, metronome), group in grouped:
-        if delay == "0 B":
-            continue
-        # Sort by 'num_clients' to ensure continuous lines
+    fig, axs = plt.subplots(3, 1, sharex=True, gridspec_kw={'height_ratios': [1, 1, 1]}, layout="constrained")
+    fig.set_size_inches((18,9))
+    axs[2].set_xlabel("Number of Clients", fontsize=14)
+    fig.suptitle("Closed Loop Clients vs. Average Request Latency", fontsize=16)
+    # axs[0].set_xscale("log")  # Log scale for x-axis (if needed)
+    
+    textures = {"Baseline": ("o", "-"), "Metronome": ("D", "--")}
+    colors = {"256 B": plt.cm.tab10(0), "1 KiB": plt.cm.tab10(1), "0 B": plt.cm.tab10(2)}
+    grouped = df.groupby(['persist_label', 'metronome_info'])
+    for (entry_size, metronome), group in grouped:
         group = group.sort_values("num_clients")
-        x = group["num_clients"]
-        y = group["request_latency_average"]
+        num_clients = group["num_clients"]
+        latency = group["request_latency_average"]
+        rel_latency = group["rel_latency"]
+        request_throughput = group["throughput"]
+        rel_thru = group["rel_throughput"]
+        std_dev = group["request_latency_std_dev"]
+        disk_throughput = (group["throughput"] * group["persist_info.value"]) / 1_000_000
+        if metronome != "Baseline":
+            disk_throughput = disk_throughput * critical_factor
+        group['disk_throughput'] = disk_throughput
+        print(group)
 
         # Plot line for this combination
-        label = f"Delay: {delay}, Metronome: {metronome}"
-        ax.plot(x, y, label=label, marker='o')
+        label = f"Entry size: {entry_size}, {metronome}"
+        color = colors[entry_size]
+        marker, linestyle = textures[metronome]
+        if relative:
+            axs[2].plot(num_clients, rel_latency, label=label, marker=marker, linestyle=linestyle, color=color)
+            axs[1].plot(num_clients, rel_thru,    label=label, marker=marker, linestyle=linestyle, color=color)
+        else:
+            axs[2].errorbar(num_clients, latency, std_dev, label=label, marker=marker, linestyle=linestyle, color=color, elinewidth=1, capsize=2, capthick=1)
+            axs[1].plot(num_clients, request_throughput,    label=label, marker=marker, linestyle=linestyle, color=color)
+        axs[0].plot(num_clients, disk_throughput,       label=label, marker=marker, linestyle=linestyle, color=color)
 
         # Optionally add shaded area for standard deviation
-        # std_dev = group["request_latency_std_dev"]
-        # ax.fill_between(x, y - std_dev, y + std_dev, alpha=0.2)
-
-    # Labels, legend, and grid
-    ax.set_xscale("log")  # Log scale for x-axis (if needed)
-    # ax.set_yscale("log")  # Log scale for x-axis (if needed)
-    ax.set_xlabel("Number of Clients", fontsize=14)
-    ax.set_ylabel("Average Request Latency (ms)", fontsize=14)
-    ax.set_title("Closed Loop Clients vs. Average Request Latency", fontsize=16)
-    ax.legend(title="Configurations", bbox_to_anchor=(1.01, 1), loc='upper left')  # Legend outside plot
-    ax.grid(which="both", linestyle="--", linewidth=0.5, axis="x")
-    plt.tight_layout()  # Adjust layout to fit legend
+        # axs[2].fill_between(num_clients, latency - std_dev, latency + std_dev, alpha=0.2, color=color)
+        # axs[2].errorbar(num_clients, latency, std_dev, marker='-o', mfc='red', mec='green', ms=20, mew=4)
+    # Create line for theoretical max disk throughput but ignore it in the legend
+    axs[0].axhline(y=150, color='black', linestyle='--', linewidth=2, label="Max disk throughput")
+    # handles, labels = plt.gca().get_legend_handles_labels()
+    axs[0].legend(
+        # handles=handles,
+        # labels=labels,
+        title="Configurations",
+        bbox_to_anchor=(0.5, 1.15),
+        loc='center',
+        ncol=len(df.persist_label.unique())+1,
+        fontsize=10,
+    )
+    def format_ticks(x, pos):
+        return f'{x/1000:.0f}k'  # Divide by 1000 and append 'k'
+    if not relative:
+        axs[1].yaxis.set_major_formatter(ticker.FuncFormatter(format_ticks))
+    # axs[0].legend(title="Configurations", bbox_to_anchor=(1.01, 1), loc='upper left')  # Legend outside plot to right
+    axs[2].set_ylabel("Latency (ms)", fontsize=14)
+    axs[1].set_ylabel("Requests per sec", fontsize=14)
+    axs[0].set_ylabel("Disk thru-put (MiB/sec)", fontsize=14)
+    axs[2].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
+    axs[1].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
+    axs[0].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
+    # fig.tight_layout()  # Adjust layout to fit legend
     plt.show()
     if save:
         fig.savefig(f"./logs/{experiment_directory}/{run_directory}/throughput-latency.svg", format="svg")
 
-def graph_latency_throughput_experiment(save: bool=True):
+def graph_open_loop_experiment(save: bool=True):
     # Get experiment data
     experiment_directory = "latency-throughput-experiment"
     run_directory = "5-node-cluster-File0"

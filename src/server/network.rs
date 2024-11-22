@@ -234,7 +234,7 @@ enum NewConnection {
     ToPeer(PeerConnection),
     ToClient(ClientConnection),
 }
-const SOCKET_BUFFER_SIZE: usize = 10_000;
+const SOCKET_BUFFER_SIZE: usize = 20_000;
 
 struct PeerConnection {
     peer_id: NodeId,

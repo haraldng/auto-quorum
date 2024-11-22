@@ -44,21 +44,21 @@ pub mod messages {
         pub cluster_size: usize,
         pub metronome_info: MetronomeSetting,
         pub metronome_quorum_size: Option<usize>,
+        pub batch_info: BatchInfo,
         pub persist_info: PersistInfo,
-        pub delay_info: DelayInfo,
         pub instrumented: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-    pub enum PersistInfo {
+    pub enum BatchInfo {
         Individual,
         Every(usize),
         Opportunistic,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-    pub enum DelayInfo {
-        Sleep(u64),
+    pub enum PersistInfo {
+        NoPersist,
         File(usize),
     }
 }

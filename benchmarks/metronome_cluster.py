@@ -2,7 +2,6 @@ import subprocess
 import time
 import toml
 from dataclasses import dataclass, asdict
-from typing import Optional
 from pathlib import Path
 
 from gcp_cluster import GcpCluster, InstanceConfig
@@ -21,17 +20,17 @@ def create_directories(directory: Path):
 class MetronomeCluster:
     _server_processes: dict[int, subprocess.Popen]
     _client_processes: dict[int, subprocess.Popen]
-    STDERR_INSTANCE_LOOKUP_FAILURE: str = "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4047: 'Failed to lookup instance'].\n"
+    GCLOUD_IAP_ERROR_TAG: str = "ERROR: (gcloud.compute.start-iap-tunnel)"
 
     @dataclass
     class ClusterConfig:
         cluster_name: str
         nodes: list[int]
         metronome_config: str
+        batch_config: 'MetronomeCluster.BatchConfig'
         persist_config: 'MetronomeCluster.PersistConfig'
-        delay_config: 'MetronomeCluster.DelayConfig'
-        initial_leader: Optional[int]=None
-        metronome_quorum_size: Optional[int]=None
+        initial_leader: int | None=None
+        metronome_quorum_size: int | None=None
 
     @dataclass
     class ServerConfig:
@@ -64,43 +63,40 @@ class MetronomeCluster:
             return MetronomeCluster.EndConditionConfig(end_condition_type="SecondsPassed", end_condition_value=seconds)
 
     @dataclass
-    class DelayConfig:
-        delay_type: str
-        delay_value: int
-
-        @staticmethod
-        def Sleep(microseconds: int):
-            return MetronomeCluster.DelayConfig(delay_type="Sleep", delay_value=microseconds)
-        @staticmethod
-        def File(data_size: int):
-            return MetronomeCluster.DelayConfig(delay_type="File", delay_value=data_size)
-
-        def to_label(self) -> str:
-            return f"{self.delay_type}{self.delay_value}"
-
-    @dataclass
     class PersistConfig:
         persist_type: str
-        persist_value: Optional[int] = None
+        persist_value: int | None
 
         @staticmethod
         def NoPersist():
-            return MetronomeCluster.PersistConfig(persist_type="NoPersist")
+            return MetronomeCluster.PersistConfig(persist_type="NoPersist", persist_value=None)
         @staticmethod
-        def Individual():
-            return MetronomeCluster.PersistConfig(persist_type="Individual")
-        @staticmethod
-        def Every(interval: int):
-            return MetronomeCluster.PersistConfig(persist_type="Every", persist_value=interval)
-        @staticmethod
-        def Opportunistic():
-            return MetronomeCluster.PersistConfig(persist_type="Opportunistic")
+        def File(data_size: int):
+            return MetronomeCluster.PersistConfig(persist_type="File", persist_value=data_size)
 
         def to_label(self) -> str:
-            if self.persist_type == "Every":
-                return f"Every{self.persist_value}"
+            return f"{self.persist_type}{self.persist_value}"
+
+    @dataclass
+    class BatchConfig:
+        batch_type: str
+        batch_value: int | None
+
+        @staticmethod
+        def Individual():
+            return MetronomeCluster.BatchConfig(batch_type="Individual", batch_value=None)
+        @staticmethod
+        def Every(interval: int):
+            return MetronomeCluster.BatchConfig(batch_type="Every", batch_value=interval)
+        @staticmethod
+        def Opportunistic():
+            return MetronomeCluster.BatchConfig(batch_type="Opportunistic", batch_value=None)
+
+        def to_label(self) -> str:
+            if self.batch_type == "Every":
+                return f"Every{self.batch_value}"
             else:
-                return f"{self.persist_type}"
+                return f"{self.batch_type}"
 
     @dataclass
     class RequestModeConfig:
@@ -118,6 +114,7 @@ class MetronomeCluster:
             if self.request_mode_config_value == "ClosedLoop":
                 return f"ClosedLoop{self.request_mode_config_value}"
             else:
+                assert isinstance(self.request_mode_config_value, list)
                 return f"OpenLoop{self.request_mode_config_value[0]}-{self.request_mode_config_value[1]}"
 
     @dataclass
@@ -130,10 +127,10 @@ class MetronomeCluster:
         cluster_name: str
         nodes: list[int]
         metronome_config: str
+        batch_config: 'MetronomeCluster.BatchConfig'
         persist_config: 'MetronomeCluster.PersistConfig'
-        delay_config: 'MetronomeCluster.DelayConfig'
-        initial_leader: Optional[int]=None
-        metronome_quorum_size: Optional[int]=None
+        initial_leader: int | None=None
+        metronome_quorum_size: int | None=None
 
     @dataclass
     class MetronomeClientToml:
@@ -213,7 +210,7 @@ class MetronomeCluster:
             # Capture and print client process stderr
             ssh_err = False
             for line in iter(client_process.stderr.readline, ""):
-                if line == self.STDERR_INSTANCE_LOOKUP_FAILURE:
+                if line.startswith(self.GCLOUD_IAP_ERROR_TAG):
                     ssh_err = True
                     print(line, end="")
                     break
@@ -266,18 +263,18 @@ class MetronomeCluster:
 
     def change_cluster_config(
         self,
-        metronome_config: Optional[str]=None,
-        persist_config: Optional[PersistConfig]=None,
-        delay_config: Optional[DelayConfig]=None,
-        initial_leader: Optional[int]=None,
-        metronome_quorum_size: Optional[int]=None,
+        metronome_config: str | None=None,
+        batch_config: BatchConfig | None=None,
+        persist_config: PersistConfig | None=None,
+        initial_leader: int | None=None,
+        metronome_quorum_size: int | None=None,
     ):
         if metronome_config is not None:
             self._cluster_config.metronome_config = metronome_config
+        if batch_config is not None:
+            self._cluster_config.batch_config = batch_config
         if persist_config is not None:
             self._cluster_config.persist_config = persist_config
-        if delay_config is not None:
-            self._cluster_config.delay_config = delay_config
         if initial_leader is not None:
             self._cluster_config.initial_leader = initial_leader
         if metronome_quorum_size is not None:
@@ -286,9 +283,9 @@ class MetronomeCluster:
     def change_client_config(
         self,
         client_id: int,
-        request_mode_config: Optional[RequestModeConfig] = None,
-        end_condition: Optional[EndConditionConfig] = None,
-        rust_log: Optional[str]=None,
+        request_mode_config: RequestModeConfig | None = None,
+        end_condition: EndConditionConfig | None = None,
+        rust_log: str | None=None,
     ):
         if request_mode_config is not None:
             self._client_configs[client_id].request_mode_config = request_mode_config
@@ -308,11 +305,11 @@ class MetronomeClusterBuilder:
         self._client_configs: dict[int, MetronomeCluster.ClientConfig] = {}
         # Cluster-wide settings
         self._metronome_config: str = "Off"
+        self._batch_config: MetronomeCluster.BatchConfig = MetronomeCluster.BatchConfig.Individual()
         self._persist_config: MetronomeCluster.PersistConfig = MetronomeCluster.PersistConfig.NoPersist()
-        self._delay_config: MetronomeCluster.DelayConfig = MetronomeCluster.DelayConfig.Sleep(0)
-        self._metronome_quorum_size: Optional[int] = None
-        self._flexible_quorum: Optional[tuple[int, int]] = None
-        self._initial_leader: Optional[int] = None
+        self._metronome_quorum_size: int | None = None
+        self._flexible_quorum: tuple[int, int] | None = None
+        self._initial_leader: int | None = None
         self._gcloud_ssh_user = GcpCluster.get_oslogin_username()
 
     def add_server(
@@ -381,15 +378,15 @@ class MetronomeClusterBuilder:
         self._metronome_config = metronome_config
         return self
 
-    def persist_config(self, persist_config: MetronomeCluster.PersistConfig):
-        if persist_config.persist_value:
-            assert persist_config.persist_value > 0
-        self._persist_config = persist_config
+    def batch_config(self, batch_config: MetronomeCluster.BatchConfig):
+        if batch_config.batch_value:
+            assert batch_config.batch_value > 0
+        self._batch_config = batch_config
         return self
 
-    def delay_config(self, delay_config: MetronomeCluster.DelayConfig):
-        assert delay_config.delay_value >= 0
-        self._delay_config = delay_config
+    def persist_config(self, persist_config: MetronomeCluster.PersistConfig):
+        assert persist_config.persist_value >= 0
+        self._persist_config = persist_config
         return self
 
     def initial_leader(self, initial_leader: int):
@@ -414,8 +411,8 @@ class MetronomeClusterBuilder:
             cluster_name=self.cluster_name,
             nodes=sorted(self._server_configs.keys()),
             metronome_config=self._metronome_config,
+            batch_config=self._batch_config,
             persist_config=self._persist_config,
-            delay_config=self._delay_config,
             initial_leader=self._initial_leader,
             metronome_quorum_size=self._metronome_quorum_size,
         )
@@ -490,8 +487,8 @@ def _generate_server_config(
         cluster_name=cluster_config.cluster_name,
         nodes=cluster_config.nodes,
         metronome_config=cluster_config.metronome_config,
+        batch_config=cluster_config.batch_config,
         persist_config=cluster_config.persist_config,
-        delay_config=cluster_config.delay_config,
         initial_leader=cluster_config.initial_leader,
         metronome_quorum_size=cluster_config.metronome_quorum_size,
     )

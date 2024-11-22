@@ -10,6 +10,8 @@ use metronome::common::{kv::*, messages::*};
 use serde::Serialize;
 use std::{fs::File, io::Write, time::Duration};
 
+const INITIAL_CLIENT_DATA_CAPACITY: usize = 50_000_000;
+
 pub struct ClosedLoopClient {
     end_condition: EndCondition,
     num_parallel_requests: usize,
@@ -30,7 +32,7 @@ impl ClosedLoopClient {
         .await;
         let num_estimated_responses = match config.end_condition {
             EndConditionConfig::ResponsesCollected(n) => n,
-            EndConditionConfig::SecondsPassed(_secs) => 10_000,
+            EndConditionConfig::SecondsPassed(_secs) => INITIAL_CLIENT_DATA_CAPACITY,
         };
         let num_parallel_requests = config.request_mode_config.to_closed_loop_params().unwrap();
         ClosedLoopClient {

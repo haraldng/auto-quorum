@@ -1,10 +1,8 @@
-use metronome::common::messages::{DelayInfo, MetronomeConfigInfo, PersistInfo};
+use metronome::common::messages::{BatchInfo, MetronomeConfigInfo, PersistInfo};
 use omnipaxos::{
     util::NodeId, BatchSetting, ClusterConfig, MetronomeSetting, OmniPaxosConfig, ServerConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs::File, time::Duration};
-use tempfile::tempfile;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MetronomeServerConfig {
@@ -17,22 +15,22 @@ pub struct MetronomeServerConfig {
     pub cluster_name: String,
     pub nodes: Vec<NodeId>,
     pub metronome_config: MetronomeSetting,
+    pub batch_config: BatchConfig,
     pub persist_config: PersistConfig,
-    pub delay_config: DelayConfig,
     pub initial_leader: Option<NodeId>,
     pub metronome_quorum_size: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-#[serde(tag = "delay_type", content = "delay_value")]
-pub enum DelayConfig {
-    Sleep(u64),
+#[serde(tag = "persist_type", content = "persist_value")]
+pub enum PersistConfig {
+    NoPersist,
     File(usize),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-#[serde(tag = "persist_type", content = "persist_value")]
-pub enum PersistConfig {
+#[serde(tag = "batch_type", content = "batch_value")]
+pub enum BatchConfig {
     Individual,
     Every(usize),
     Opportunistic,
@@ -40,14 +38,10 @@ pub enum PersistConfig {
 
 impl Into<OmniPaxosConfig> for MetronomeServerConfig {
     fn into(self) -> OmniPaxosConfig {
-        let delay_strat = self.delay_config.into();
-        let batch_setting = match delay_strat {
-            DelayStrategy::NoDelay => BatchSetting::Opportunistic,
-            _ => match self.persist_config {
-                PersistConfig::Individual => BatchSetting::Individual,
-                PersistConfig::Every(n) => BatchSetting::Every(n),
-                PersistConfig::Opportunistic => BatchSetting::Opportunistic,
-            },
+        let batch_setting = match self.batch_config {
+            BatchConfig::Individual => BatchSetting::Individual,
+            BatchConfig::Every(n) => BatchSetting::Every(n),
+            BatchConfig::Opportunistic => BatchSetting::Opportunistic,
         };
         let cluster_config = ClusterConfig {
             configuration_id: 1,
@@ -70,60 +64,22 @@ impl Into<OmniPaxosConfig> for MetronomeServerConfig {
 
 impl Into<MetronomeConfigInfo> for MetronomeServerConfig {
     fn into(self) -> MetronomeConfigInfo {
-        let persist_info = match self.persist_config {
-            PersistConfig::Individual => PersistInfo::Individual,
-            PersistConfig::Every(n) => PersistInfo::Every(n),
-            PersistConfig::Opportunistic => PersistInfo::Opportunistic,
+        let batch_info = match self.batch_config {
+            BatchConfig::Individual => BatchInfo::Individual,
+            BatchConfig::Every(n) => BatchInfo::Every(n),
+            BatchConfig::Opportunistic => BatchInfo::Opportunistic,
         };
-        let delay_info = match self.delay_config {
-            DelayConfig::Sleep(μs) => DelayInfo::Sleep(μs),
-            DelayConfig::File(d) => DelayInfo::File(d),
+        let persist_info = match self.persist_config {
+            PersistConfig::NoPersist => PersistInfo::NoPersist,
+            PersistConfig::File(d) => PersistInfo::File(d),
         };
         MetronomeConfigInfo {
             cluster_size: self.nodes.len(),
             metronome_info: self.metronome_config,
             metronome_quorum_size: self.metronome_quorum_size,
+            batch_info,
             persist_info,
-            delay_info,
             instrumented: self.instrumentation,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum DelayStrategy {
-    NoDelay,
-    Sleep(Duration),
-    FileWrite(File, usize),
-}
-
-impl From<DelayConfig> for DelayStrategy {
-    fn from(value: DelayConfig) -> Self {
-        match value {
-            DelayConfig::Sleep(0) => DelayStrategy::NoDelay,
-            DelayConfig::Sleep(μs) => DelayStrategy::Sleep(Duration::from_micros(μs)),
-            DelayConfig::File(0) => DelayStrategy::NoDelay,
-            DelayConfig::File(data_size) => {
-                let file = tempfile().expect("Failed to open temp file");
-                DelayStrategy::FileWrite(file, data_size)
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PersistMode {
-    Individual,
-    Every(usize),
-    Opportunistic,
-}
-
-impl From<PersistConfig> for PersistMode {
-    fn from(value: PersistConfig) -> Self {
-        match value {
-            PersistConfig::Individual => PersistMode::Individual,
-            PersistConfig::Every(n) => PersistMode::Every(n),
-            PersistConfig::Opportunistic => PersistMode::Opportunistic,
         }
     }
 }
