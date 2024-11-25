@@ -7,7 +7,7 @@ output_filename = "../benchmarks/logs/local-experiments/client-1.csv"
 
 [request_mode_config]
 request_mode_config_type = "ClosedLoop"
-request_mode_config_value = 200
+request_mode_config_value = 20
 
 [end_condition]
 end_condition_type = "ResponsesCollected"

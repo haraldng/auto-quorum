@@ -1,6 +1,7 @@
 import math
 from pathlib import Path
 import pandas as pd
+from pandas import json_normalize
 import json
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -33,6 +34,7 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
         categories=[format_bytes(0)] + [format_bytes(2**i) for i in range(0, 32)],
         ordered=True
     )
+    print(df.columns)
     return df
 
 def parse_client_summary(file_path: Path) -> pd.DataFrame:
@@ -67,6 +69,7 @@ def normalize_batch_persist_info(client_json: dict):
         server_info['persist_info.value'] = 0
     request_mode = client_json['client_config'].pop('request_mode_config')
     server_info['request_mode'] = request_mode['request_mode_config_type']
+    server_info['request_mode_value'] = request_mode['request_mode_config_value']
     if request_mode['request_mode_config_type'] == "ClosedLoop":
         server_info['num_clients'] = request_mode['request_mode_config_value']
     else:
@@ -144,7 +147,13 @@ def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legen
     return fig, ax
 
 def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, server_logs: pd.DataFrame| None):
-    title = f"metronome={client_summary.metronome_info}, clients=({client_summary.request_mode},{client_summary['request_mode_config_value']}), batch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']}), persist_config=({client_summary['persist_info.type']}, {client_summary['persist_label']}), metronome_quorum_size={client_summary.metronome_quorum_size}"
+    title = ", ".join([
+        f"metronome={client_summary.metronome_info}",
+        f"clients=({client_summary.request_mode},{client_summary.request_mode_value})",
+        f"batch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
+        f"persist_config=({client_summary['persist_info.type']}, {client_summary.persist_label})",
+        f"metronome_quorum_size={client_summary.metronome_quorum_size}"
+    ])
     if server_logs is None:
         assert client_summary.instrumented is False, "No server logs despite instrumented = True"
         fig, ax = plt.subplots(layout="constrained", figsize=(12,6))
@@ -274,17 +283,13 @@ def graph_local_experiment():
         fig.savefig(f"./logs/{experiment_directory}/debug-{i}.svg", format="svg")
 
 
-def graph_closed_loop_experiment(save: bool=True):
+def graph_closed_loop_experiment(save: bool=False):
     # Get experiment data
     # experiment_directory = "5-min/closed-loop-experiments-Opportunistic"
     # run_directory = "5-node-cluster-1000-clients"
-    experiment_directory = "closed-loop-latency-experiments"
-    run_directory = "Opportunistic/5-node-cluster"
-    # three_df = parse_client_logs(f"{experiment_directory}/3-node-cluster-10-clients")
+    experiment_directory = "debug-tests/closed-loop-experiments-Opportunistic"
+    run_directory = "5-node-cluster-10000-clients"
     five_df = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
-    # five_df = parse_experiment_logs(f"{experiment_directory}/5-node-cluster")
-    # seven_df = parse_experiment_logs(f"{experiment_directory}/7-node-cluster")
-
 
     # Create bar chart
     bar_labels = ("baseline", "metronome")
@@ -296,19 +301,18 @@ def graph_closed_loop_experiment(save: bool=True):
             if err is not None:
                 pivot_df = df.pivot_table(index='persist_info.value', columns='metronome_info', values=[metric, err])
                 # print(pivot_df)
-                relative_latency_df = pivot_df['request_latency_average'].div(
-                    pivot_df['request_latency_average']['Baseline'], axis=0
-                )
-                relative_std_dev_df = pivot_df['request_latency_std_dev'].div(
-                    pivot_df['request_latency_std_dev']['Baseline'], axis=0
-                )
-
+                # relative_latency_df = pivot_df['request_latency_average'].div(
+                #     pivot_df['request_latency_average']['Baseline'], axis=0
+                # )
+                # relative_std_dev_df = pivot_df['request_latency_std_dev'].div(
+                #     pivot_df['request_latency_std_dev']['Baseline'], axis=0
+                # )
                 bar_group_labels = list(pivot_df.index)
                 bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
                 latency_means = {}
                 for label in bar_labels:
-                    latency_means[label] = (relative_latency_df[label], None)
-                    # latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
+                    # latency_means[label] = (relative_latency_df[label], None)
+                    latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
             else:
                 pivot_df = df.pivot_table(index='persist_info.value', columns='metronome_info', values=[metric])
                 bar_group_labels = list(pivot_df.index)
@@ -320,57 +324,58 @@ def graph_closed_loop_experiment(save: bool=True):
             ax.set_xlabel("Data Size (bytes)", fontsize=24)
             # plt.xticks(rotation=45)
             # fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})", fontsize=16)
-            fig.suptitle(f"{metric}\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})", fontsize=16)
+            title = f"{metric}\n" + ", ".join([
+                f"cluster_size={client_summary.cluster_size}",
+                f"clients=({client_summary.request_mode},{client_summary.request_mode_value})",
+                f"batch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
+                f"persist_config=({client_summary['persist_info.type']}, {client_summary.persist_label})",
+                f"metronome_quorum_size={client_summary.metronome_quorum_size}",
+            ])
+            fig.suptitle(title, fontsize=16)
             if save:
                 fig.savefig(f"./logs/{experiment_directory}/{run_directory}/{metric}_relative.svg", format="svg")
             plt.show()
             plt.close()
 
     nrows = 500_000
-    # skiprows = 1_000_000
-    skiprows = 10_000
+    skiprows = 100_000
 
-    # # Create violin plot
-    # client_logs = []
-    # for i, client_summary in five_df.iterrows():
-    #     if client_summary['persist_info.value'] == "16 KiB":
-    #         skiprows = 10_000
-    #     client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
-    #     client_log.dropna(subset=["response_time"], inplace=True)
-    #     client_log['latency'] = (client_log['response_time'] - client_log['request_time']) / 1000
-    #     client_log['data_size'] = client_summary['persist_info.value']
-    #     client_log['metronome_info'] = client_summary.metronome_info
-    #     client_logs.append(client_log)
-    # violin_data = pd.concat(client_logs, ignore_index=True)
-    # plt.figure(figsize=(10, 6))
-    # sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", inner='quart', density_norm="width")
-    # # palette = {False: 'skyblue', True: 'orange'}
-    # # sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", split=True, inner='quart', palette=palette, density_norm="width")
-    # # Labels
-    # client_summary = five_df.iloc[0]
-    # # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients={client_summary.request_mode_config}, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})"
-    # title = f"Latency Distribution\ncluster_size={client_summary.cluster_size}, clients=1000, persist_strat=({client_summary['batch_info.type']},{client_summary['batch_info.value']})"
-    # plt.title(title)
-    # plt.xticks(rotation=45)
-    # plt.xlabel("Datasize (bytes)")
-    # plt.ylabel("Response Latency (ms)")
-    # if save:
-    #     plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
-    # plt.show()
-    # plt.close()
+    # Create violin plot
+    client_logs = []
+    for i, client_summary in five_df.iterrows():
+        if client_summary['persist_info.value'] == "16 KiB":
+            skiprows = 10_000
+        client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
+        client_log.dropna(subset=["response_time"], inplace=True)
+        client_log['latency'] = (client_log['response_time'] - client_log['request_time']) / 1000
+        client_log['data_size'] = client_summary['persist_info.value']
+        client_log['metronome_info'] = client_summary.metronome_info
+        client_logs.append(client_log)
+    violin_data = pd.concat(client_logs, ignore_index=True)
+    plt.figure(figsize=(10, 6))
+    sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", inner='quart', density_norm="width")
+    # palette = {False: 'skyblue', True: 'orange'}
+    # sns.violinplot(data=violin_data, x="data_size", y="latency", hue="metronome_info", split=True, inner='quart', palette=palette, density_norm="width")
+    # Labels
+    client_summary = five_df.iloc[0]
+    title = "Latency Distribution\n" + ", ".join([
+        f"cluster_size={client_summary.cluster_size}",
+        f"clients=({client_summary.request_mode},{client_summary.request_mode_value})",
+        f"batch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
+        f"persist_config=({client_summary['persist_info.type']}, {client_summary.persist_label})",
+        f"metronome_quorum_size={client_summary.metronome_quorum_size}",
+    ])
+    plt.title(title)
+    plt.xticks(rotation=45)
+    plt.xlabel("Datasize (bytes)")
+    plt.ylabel("Response Latency (ms)")
+    if save:
+        plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
+    plt.show()
+    plt.close()
 
     # Create debug plots
     for i, (_, client_summary) in enumerate(five_df.iterrows()):
-        # if client_summary['persist_info.value'] == "1 KiB" and client_summary['metronome_info'] == "RoundRobin2":
-        #     pass
-        # else:
-        #     continue
-        # client_log = parse_client_log(client_summary, skiprows=5_500_000)
-        # latencies = (client_log['response_time'] - client_log['request_time']) / 1000
-        # print(latencies.describe())
-        # print()
-        # print(latencies.nlargest(100).index)
-        # fig = graph_experiment_debug(client_summary, client_log, None)
         client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
@@ -521,9 +526,6 @@ def graph_open_loop_experiment(save: bool=True):
     if save:
         fig.savefig(f"./logs/{experiment_directory}/{run_directory}/throughput-latency.svg", format="svg")
 
-
-    
-
     # # Create debug plots
     # for i, (_, client_summary) in enumerate(summaries.iterrows()):
     #     client_log = parse_client_log(client_summary, 100_000)
@@ -566,8 +568,8 @@ def graph_open_loop_experiment(save: bool=True):
 
 def main():
     # graph_local_experiment()
-    # graph_closed_loop_experiment()
-    graph_num_clients_latency_experiment()
+    graph_closed_loop_experiment()
+    # graph_num_clients_latency_experiment()
     # graph_latency_throughput_experiment()
     # graph_metronome_size_experiment()
     pass

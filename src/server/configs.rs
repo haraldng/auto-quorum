@@ -11,6 +11,7 @@ pub struct MetronomeServerConfig {
     pub server_id: NodeId,
     pub instrumentation: bool,
     pub debug_filename: String,
+    pub persist_log_filepath: String,
     // Cluster-wide settings
     pub cluster_name: String,
     pub nodes: Vec<NodeId>,
@@ -71,7 +72,7 @@ impl Into<MetronomeConfigInfo> for MetronomeServerConfig {
         };
         let persist_info = match self.persist_config {
             PersistConfig::NoPersist => PersistInfo::NoPersist,
-            PersistConfig::File(d) => PersistInfo::File(d),
+            PersistConfig::File(data_size) => PersistInfo::File(data_size),
         };
         MetronomeConfigInfo {
             cluster_size: self.nodes.len(),

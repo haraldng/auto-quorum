@@ -16,14 +16,14 @@ use omnipaxos::{
 };
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use serde::Serialize;
-use std::{fs::File, io::Write, time::Duration};
+use std::{fs::File, os::unix::fs::FileExt, time::Duration};
 use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-const INITIAL_LOG_CAPACITY: usize = 50_000_000;
-const COMPACT_LIMIT: usize = 200_000_000;
+const INITIAL_LOG_CAPACITY: usize = 10_000_000;
+const COMPACT_LIMIT: usize = 9_000_000;
 const COMPACT_RETAIN_SIZE: usize = 500_000;
-const PULL_FROM_NETWORK_SIZE: usize = 100_000;
+const PULL_FROM_NETWORK_SIZE: usize = 20_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 type TimeStamp = i64;
@@ -34,17 +34,19 @@ pub(crate) enum PersistStrategy {
     FileWrite(File, usize),
 }
 
-impl From<PersistConfig> for PersistStrategy {
-    fn from(value: PersistConfig) -> Self {
-        match value {
+impl PersistStrategy {
+    fn from(config: PersistConfig, path: String) -> Self {
+        match config {
             PersistConfig::NoPersist => PersistStrategy::NoPersist,
             PersistConfig::File(0) => PersistStrategy::NoPersist,
             PersistConfig::File(data_size) => {
-                let file = tempfile::Builder::new()
-                    .append(true)
-                    .tempfile()
-                    .expect("Failed to open temp file")
-                    .into_file();
+                let file = File::options()
+                    .write(true)
+                    .append(false)
+                    .truncate(true)
+                    .create(true)
+                    .open(path)
+                    .expect("Failed to open file");
                 PersistStrategy::FileWrite(file, data_size)
             }
         }
@@ -105,6 +107,8 @@ impl MetronomeServer {
             true => Some(InstrumentationData::new(config.clone())),
             false => None,
         };
+        let persist_strat =
+            PersistStrategy::from(config.persist_config, config.persist_log_filepath.clone());
         let mut server = MetronomeServer {
             id: server_id,
             peers,
@@ -114,7 +118,7 @@ impl MetronomeServer {
             client_messages,
             omnipaxos,
             initial_leader,
-            persist_strat: config.persist_config.into(),
+            persist_strat,
             decided_slots_buffer: Vec::with_capacity(1000),
             instrumentation_data,
             config,
@@ -125,13 +129,6 @@ impl MetronomeServer {
     }
 
     pub async fn run(&mut self) {
-        // Hack to avoid slow first disk write
-        if let PersistStrategy::FileWrite(ref mut file, entry_size) = self.persist_strat {
-            let buffer = vec![b'A'; entry_size];
-            file.write_all(&buffer).expect("Failed to write file");
-            file.sync_data().expect("Failed to flush file");
-        }
-
         // NOTE: This will cap how many messages an Opportunistic flush strategy can batch
         let buffer_size = PULL_FROM_NETWORK_SIZE;
         let mut client_message_buffer = Vec::with_capacity(buffer_size);
@@ -144,21 +141,21 @@ impl MetronomeServer {
                     // Ensures cluster is connected and leader is promoted before client starts sending
                     // requests.
                     _ = election_interval.tick() => {
-                        self.become_initial_leader(&mut leader_attempt);
+                        self.become_initial_leader(&mut leader_attempt).await;
                         let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
                         if self.id == leader_id && phase == Phase::Accept {
                             info!("{}: Leader fully initialized", self.id);
                             debug!("Sending ready message to client {}", self.id);
-                            self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into()));
+                            self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into())).await;
                             break;
                         }
                     },
                     // Still necessary for network handshakes
                     _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
-                        self.handle_cluster_messages(&mut cluster_message_buffer);
+                        self.handle_cluster_messages(&mut cluster_message_buffer).await;
                     },
                     _ = self.client_messages.recv_many(&mut client_message_buffer, buffer_size) => {
-                        self.handle_client_messages(&mut client_message_buffer);
+                        self.handle_client_messages(&mut client_message_buffer).await;
                     },
                 }
             }
@@ -168,10 +165,10 @@ impl MetronomeServer {
         loop {
             let done_signal = tokio::select! {
                 _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
-                    self.handle_cluster_messages(&mut cluster_message_buffer)
+                    self.handle_cluster_messages(&mut cluster_message_buffer).await
                 },
                 _ = self.client_messages.recv_many(&mut client_message_buffer, buffer_size) => {
-                    self.handle_client_messages(&mut client_message_buffer)
+                    self.handle_client_messages(&mut client_message_buffer).await
                 },
             };
             if done_signal {
@@ -181,7 +178,7 @@ impl MetronomeServer {
     }
 
     // We don't use Omnipaxos leader election and instead force an initial leader
-    fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
+    async fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
         let (_leader, phase) = self.omnipaxos.get_current_leader_state();
         match phase {
             Phase::Accept => (),
@@ -196,12 +193,12 @@ impl MetronomeServer {
                     self.id, ballot
                 );
                 self.omnipaxos.initialize_prepare_phase(ballot);
-                self.send_outgoing_msgs();
+                self.send_outgoing_msgs().await;
             }
         }
     }
 
-    fn handle_cluster_messages(&mut self, messages: &mut Vec<(ClusterMessage, i64)>) -> bool {
+    async fn handle_cluster_messages(&mut self, messages: &mut Vec<(ClusterMessage, i64)>) -> bool {
         for (message, net_recv_time) in messages.drain(..) {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
@@ -220,15 +217,15 @@ impl MetronomeServer {
             }
         }
         if self.id == self.omnipaxos.get_current_leader().unwrap_or_default() {
-            self.handle_decided_entries();
+            self.handle_decided_entries().await;
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs();
+        self.send_outgoing_msgs().await;
         return false;
     }
 
-    fn handle_client_messages(
+    async fn handle_client_messages(
         &mut self,
         messages: &mut Vec<(ClientId, ClientMessage, i64)>,
     ) -> bool {
@@ -254,7 +251,7 @@ impl MetronomeServer {
                     info!("{}: Received Done signal from client", self.id);
                     let done_msg = ClusterMessage::Done;
                     for peer in &self.peers {
-                        self.network.send_to_cluster(*peer, done_msg.clone());
+                        self.network.send_to_cluster(*peer, done_msg.clone()).await;
                     }
                     // NOTE: If we exit the program before Done is sent it may be dropped
                     // TODO: Allow for wait on network flushing all pending messages instead
@@ -270,11 +267,11 @@ impl MetronomeServer {
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs();
+        self.send_outgoing_msgs().await;
         return false;
     }
 
-    fn handle_decided_entries(&mut self) {
+    async fn handle_decided_entries(&mut self) {
         self.omnipaxos
             .take_decided_slots_since_last_call(&mut self.decided_slots_buffer);
         if let Some(data) = &mut self.instrumentation_data {
@@ -301,7 +298,9 @@ impl MetronomeServer {
                     Some(read_result) => ServerMessage::Read(command.id, read_result),
                     None => ServerMessage::Write(command.id),
                 };
-                self.network.send_to_client(command.client_id, response);
+                self.network
+                    .send_to_client(command.client_id, response)
+                    .await;
                 debug!("Sending response {}", command.id);
             }
         }
@@ -324,27 +323,27 @@ impl MetronomeServer {
             .expect("Append should never fail since we never reconfig");
     }
 
-    fn send_outgoing_msgs(&mut self) {
+    async fn send_outgoing_msgs(&mut self) {
         if self.id == self.initial_leader {
-            self.send_outgoing_msgs_leader();
+            self.send_outgoing_msgs_leader().await;
         } else {
-            self.send_outgoing_msgs_follower();
+            self.send_outgoing_msgs_follower().await;
         }
     }
 
     // Metronome leader functions as in normal Omnipaxos
-    fn send_outgoing_msgs_leader(&mut self) {
+    async fn send_outgoing_msgs_leader(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         self.instrument_accdec(&messages);
         for msg in messages {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network.send_to_cluster(to, cluster_msg);
+            self.network.send_to_cluster(to, cluster_msg).await;
         }
     }
 
     // Metronome acceptors handle accepted messages differently
-    fn send_outgoing_msgs_follower(&mut self) {
+    async fn send_outgoing_msgs_follower(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
         for msg in messages {
             if let Some(to_flush) = msg.get_accepted_slots() {
@@ -352,7 +351,7 @@ impl MetronomeServer {
             }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network.send_to_cluster(to, cluster_msg);
+            self.network.send_to_cluster(to, cluster_msg).await;
         }
     }
 
@@ -369,7 +368,7 @@ impl MetronomeServer {
                     data.persist_start(to_flush);
                 }
                 let buffer = vec![b'A'; entry_size * to_flush.len()];
-                file.write_all(&buffer).expect("Failed to write file");
+                file.write_all_at(&buffer, 0).expect("Failed to write file");
                 file.sync_data().expect("Failed to flush file");
                 if let Some(data) = &mut self.instrumentation_data {
                     data.persist_end(to_flush);

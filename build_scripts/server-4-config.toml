@@ -4,15 +4,16 @@ local_deployment = true
 server_id = 4
 nodes = [1, 2, 3, 4, 5]
 initial_leader = 1
-metronome_config = "RoundRobin2"
+metronome_config = "Off"
 #metronome_quorum_size = 3
 instrumentation = true
 debug_filename = "../benchmarks/logs/local-experiments/server-4.csv"
+persist_log_filepath = "../benchmarks/logs/local-experiments/server-4.log"
 
 [persist_config]
 persist_type = "File"
 persist_value = 256
 
 [batch_config]
-batch_type = "Individual"
+batch_type = "Opportunistic"
 #batch_value = 60

@@ -38,6 +38,7 @@ class MetronomeCluster:
         server_id: int
         instrumentation: bool
         debug_filename: str
+        persist_log_filepath: str
         rust_log: str="info"
 
     @dataclass
@@ -123,6 +124,7 @@ class MetronomeCluster:
         server_id: int
         instrumentation: bool
         debug_filename: str
+        persist_log_filepath: str
         # Cluster-wide config
         cluster_name: str
         nodes: list[int]
@@ -221,7 +223,7 @@ class MetronomeCluster:
             # Retry cluster processes if client failed due to ssh instance lookup error
             if ssh_err and tries < 3:
                 print(f"Retrying client and server SSH connections")
-                time.sleep(3)
+                time.sleep(5)
                 tries += 1
                 self.start_servers()
                 self.start_client(client_id)
@@ -316,7 +318,7 @@ class MetronomeClusterBuilder:
         self,
         server_id: int,
         zone: str,
-        machine_type: str = "e2-standard-8",
+        machine_type: str = "e2-standard-4",
         instrumentation: bool=False,
         rust_log: str="info"
     ):
@@ -337,6 +339,7 @@ class MetronomeClusterBuilder:
             server_id,
             instrumentation=instrumentation,
             debug_filename=f"server-{server_id}.csv",
+            persist_log_filepath="../persist.log",
             rust_log=rust_log,
         )
         self._server_configs[server_id] = server_config
@@ -447,9 +450,12 @@ def start_server_command(
     container_name = "server"
     container_image_location = "my-project-1499979282244/metronome_server"
     instance_config_location = "~/server-config.toml"
-    container_config_location = f"/home/$(whoami)/server-config.toml"
+    container_config_location = "/home/$(whoami)/server-config.toml"
     instance_output_dir = "./results"
     container_output_dir = "/app"
+    instance_persist_log_location = "~/persist.log"
+    # container_persist_log_location = "/home/$(whoami)/persist.log"
+    container_persist_log_location = "/persist.log"
     instance_err_location = f"{instance_output_dir}/xerr-server-{config.server_id}.log"
     server_config = _generate_server_config(cluster_config, config)
 
@@ -457,13 +463,14 @@ def start_server_command(
     # kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
     pull_command = f"docker pull gcr.io/{container_image_location}"
     kill_prev_container_command = f"docker kill {container_name}"
-    gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location}"
+    gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config}' > {instance_config_location} && touch persist.log"
     docker_command = f"""docker run \\
         --name {container_name} \\
         -p 800{config.server_id}:800{config.server_id} \\
         --env RUST_LOG={config.rust_log} \\
         --env CONFIG_FILE="{container_config_location}" \\
         -v {instance_config_location}:{container_config_location} \\
+        -v {instance_persist_log_location}:{container_persist_log_location} \\
         -v {instance_output_dir}:{container_output_dir} \\
         --rm \\
         "gcr.io/{container_image_location}" \\
@@ -484,6 +491,7 @@ def _generate_server_config(
         server_id=config.server_id,
         instrumentation=config.instrumentation,
         debug_filename=config.debug_filename,
+        persist_log_filepath=config.persist_log_filepath,
         cluster_name=cluster_config.cluster_name,
         nodes=cluster_config.nodes,
         metronome_config=cluster_config.metronome_config,

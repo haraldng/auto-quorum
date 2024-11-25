@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 
 pub struct Network {
     cluster_name: String,
@@ -201,12 +201,12 @@ impl Network {
         }
     }
 
-    pub fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+    pub async fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
         match self.cluster_id_to_idx(to) {
             Some(idx) => match &mut self.peer_connections[idx] {
                 Some(ref mut connection) => {
                     // TODO: remove connection if it closes
-                    connection.send(msg);
+                    connection.send(msg).await;
                 }
                 None => warn!("Not connected to node {to}: couldn't send {msg:?}"),
             },
@@ -214,11 +214,11 @@ impl Network {
         }
     }
 
-    pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
+    pub async fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         if let Some(connection) = self.client_connections.get_mut(&to) {
             // debug!("Responding to client {to}: {msg:?}");
             // TODO: remove connection if it closes
-            connection.send(msg);
+            connection.send(msg).await;
         } else {
             warn!("Not connected to client {to}");
         }
@@ -235,10 +235,11 @@ enum NewConnection {
     ToClient(ClientConnection),
 }
 const SOCKET_BUFFER_SIZE: usize = 20_000;
+const CONNECTION_CHANNEL_SIZE: usize = 20_000;
 
 struct PeerConnection {
     peer_id: NodeId,
-    outgoing_messages: UnboundedSender<ClusterMessage>,
+    outgoing_messages: Sender<ClusterMessage>,
 }
 
 impl PeerConnection {
@@ -269,7 +270,7 @@ impl PeerConnection {
             }
         });
         // Writer Actor
-        let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+        let (message_tx, mut message_rx) = mpsc::channel(CONNECTION_CHANNEL_SIZE);
         let _writer_task = tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
             while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
@@ -291,16 +292,17 @@ impl PeerConnection {
         }
     }
 
-    pub fn send(&mut self, msg: ClusterMessage) {
+    pub async fn send(&mut self, msg: ClusterMessage) {
         self.outgoing_messages
             .send(msg)
+            .await
             .expect("Tried to send on a closed channel");
     }
 }
 
 struct ClientConnection {
     client_id: ClientId,
-    outgoing_messages: UnboundedSender<ServerMessage>,
+    outgoing_messages: Sender<ServerMessage>,
 }
 
 impl ClientConnection {
@@ -332,10 +334,7 @@ impl ClientConnection {
             }
         });
         // Writer Actor
-        let (message_tx, mut message_rx): (
-            UnboundedSender<ServerMessage>,
-            UnboundedReceiver<ServerMessage>,
-        ) = mpsc::unbounded_channel();
+        let (message_tx, mut message_rx) = mpsc::channel(CONNECTION_CHANNEL_SIZE);
         let _writer_task = tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
             while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
@@ -354,9 +353,10 @@ impl ClientConnection {
         }
     }
 
-    pub fn send(&mut self, msg: ServerMessage) {
+    pub async fn send(&mut self, msg: ServerMessage) {
         self.outgoing_messages
             .send(msg)
+            .await
             .expect("Tried to send on a closed channel");
     }
 }

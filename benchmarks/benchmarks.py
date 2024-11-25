@@ -4,7 +4,7 @@ import time
 
 
 def closed_loop_experiment(cluster_size: int, number_of_clients: int, batch_config: MetronomeCluster.BatchConfig, end_condition: MetronomeCluster.EndConditionConfig):
-    experiment_log_dir = Path(f"./logs/5-min/closed-loop-experiments-{batch_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
+    experiment_log_dir = Path(f"./logs/debug-tests/closed-loop-experiments-{batch_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients")
     print(f"RUNNING CLOSED LOOP EXPERIMENT: {cluster_size=}, {end_condition=}, {number_of_clients=}")
     print(experiment_log_dir)
 
@@ -14,12 +14,12 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, batch_conf
     for i in range(1, cluster_size+1):
         cluster = cluster.add_server(
             i,
-            "us-central1-a",
+            "us-east1-b",
             instrumentation=False,
-            rust_log="error",
+            rust_log="info",
         )
     cluster = cluster.add_client(1,
-        "us-central1-a",
+        "us-east1-b",
         request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(number_of_clients),
         end_condition=end_condition,
         rust_log="info",
@@ -31,16 +31,16 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, batch_conf
         persist_config = MetronomeCluster.PersistConfig.File(data_size)
         cluster.change_cluster_config(persist_config=persist_config)
         # for metronome_config in ["Off", "RoundRobin2", "FastestFollower"]:
-        for metronome_config in ["FastestFollower"]:
+        for metronome_config in ["RoundRobin2"]:
             print(f"{metronome_config=}, {data_size=}")
             cluster.change_cluster_config(metronome_config=metronome_config)
-            cluster.start_servers()
-            cluster.start_client(1)
+            cluster.start_servers(pull_images=True)
+            cluster.start_client(1, pull_image=True)
             cluster.await_cluster()
             cluster.stop_servers()
             iteration_directory = Path.joinpath(experiment_log_dir, f"metronome-{metronome_config}-datasize-{data_size}")
+            time.sleep(2)
             cluster.get_logs(iteration_directory)
-            # time.sleep(10)
     # cluster.shutdown()
 
 def num_clients_latency_experiment(cluster_size: int, batch_config: MetronomeCluster.BatchConfig, end_condition: MetronomeCluster.EndConditionConfig, metronome_quorum_size: int | None=None):
@@ -176,13 +176,13 @@ def main():
     # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(2*60)
     # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
 
-    # batch_config = MetronomeCluster.BatchConfig.Opportunistic()
-    # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(1*60)
-    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
-
     batch_config = MetronomeCluster.BatchConfig.Opportunistic()
-    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(5)
-    num_clients_latency_experiment(cluster_size=3, batch_config=batch_config, end_condition=end_condition)
+    end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(5*60)
+    closed_loop_experiment(cluster_size=5, number_of_clients=10_000, batch_config=batch_config, end_condition=end_condition)
+
+    # batch_config = MetronomeCluster.BatchConfig.Opportunistic()
+    # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(5)
+    # num_clients_latency_experiment(cluster_size=3, batch_config=batch_config, end_condition=end_condition)
 
     # persist_config = MetronomeCluster.PersistConfig.File(0)
     # end_condition = MetronomeCluster.EndConditionConfig.SecondsPassed(2)

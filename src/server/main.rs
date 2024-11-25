@@ -49,6 +49,7 @@ pub async fn main() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
+    log::info!("Starting server");
     let mut server = MetronomeServer::new(metronome_config).await;
     server.run().await;
 }

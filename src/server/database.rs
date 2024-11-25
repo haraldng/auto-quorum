@@ -8,7 +8,7 @@ pub struct Database {
 impl Database {
     pub fn new() -> Self {
         Self {
-            db: HashMap::with_capacity(1_000_000),
+            db: HashMap::with_capacity(20_000),
         }
     }
 
