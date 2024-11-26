@@ -11,6 +11,7 @@ pub struct ClientConfig {
     pub request_mode_config: RequestModeConfig,
     pub end_condition: EndConditionConfig,
     pub summary_filename: String,
+    pub summary_only: bool,
     pub output_filename: String,
 }
 

@@ -23,6 +23,7 @@ def closed_loop_experiment(cluster_size: int, number_of_clients: int, batch_conf
         request_mode_config=MetronomeCluster.RequestModeConfig.ClosedLoop(number_of_clients),
         end_condition=end_condition,
         rust_log="info",
+        summary_only=True,
     ).build()
 
     # Run experiments

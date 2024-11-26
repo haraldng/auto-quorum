@@ -8,6 +8,7 @@ use toml;
 
 mod client;
 mod configs;
+mod data_collection;
 mod network;
 mod open_loop_client;
 

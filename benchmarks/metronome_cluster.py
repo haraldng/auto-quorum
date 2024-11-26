@@ -1,7 +1,7 @@
 import subprocess
 import time
 import toml
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 
 from gcp_cluster import GcpCluster, InstanceConfig
@@ -48,6 +48,7 @@ class MetronomeCluster:
         request_mode_config: 'MetronomeCluster.RequestModeConfig'
         end_condition: 'MetronomeCluster.EndConditionConfig'
         summary_filename: str
+        summary_only: bool
         output_filename: str
         rust_log: str="info"
 
@@ -142,6 +143,7 @@ class MetronomeCluster:
         request_mode_config: 'MetronomeCluster.RequestModeConfig'
         end_condition: 'MetronomeCluster.EndConditionConfig'
         summary_filename: str
+        summary_only: bool
         output_filename: str
 
 
@@ -287,14 +289,11 @@ class MetronomeCluster:
         client_id: int,
         request_mode_config: RequestModeConfig | None = None,
         end_condition: EndConditionConfig | None = None,
-        rust_log: str | None=None,
     ):
         if request_mode_config is not None:
             self._client_configs[client_id].request_mode_config = request_mode_config
         if end_condition is not None:
             self._client_configs[client_id].end_condition = end_condition
-        if rust_log is not None:
-            self._client_configs[client_id].rust_log = rust_log
 
 # Builder class for MetronomeCluster. Used to define and then validate the configs necessary to
 # start a MetronomeCluster
@@ -318,7 +317,7 @@ class MetronomeClusterBuilder:
         self,
         server_id: int,
         zone: str,
-        machine_type: str = "e2-standard-4",
+        machine_type: str = "e2-standard-8",
         instrumentation: bool=False,
         rust_log: str="info"
     ):
@@ -352,7 +351,8 @@ class MetronomeClusterBuilder:
         request_mode_config: MetronomeCluster.RequestModeConfig,
         end_condition: MetronomeCluster.EndConditionConfig,
         machine_type: str = "e2-standard-4",
-        rust_log: str="info"
+        rust_log: str="info",
+        summary_only: bool = False,
     ):
         assert server_id > 0
         assert server_id not in self._client_configs.keys(), f"Client {server_id} already exists"
@@ -370,6 +370,7 @@ class MetronomeClusterBuilder:
             request_mode_config=request_mode_config,
             end_condition=end_condition,
             summary_filename=f"client-{server_id}.json",
+            summary_only=summary_only,
             output_filename=f"client-{server_id}.csv",
             rust_log=rust_log,
         )
@@ -388,7 +389,8 @@ class MetronomeClusterBuilder:
         return self
 
     def persist_config(self, persist_config: MetronomeCluster.PersistConfig):
-        assert persist_config.persist_value >= 0
+        if persist_config.persist_value is not None:
+            assert persist_config.persist_value >= 0
         self._persist_config = persist_config
         return self
 
@@ -562,14 +564,18 @@ def _generate_client_config(
     cluster_config: MetronomeCluster.ClusterConfig,
     config: MetronomeCluster.ClientConfig,
 ) -> str:
+    toml_fields = {f.name for f in fields(MetronomeCluster.MetronomeClientToml)}
+    shared_fields = {k:v for k, v in asdict(config).items() if k in toml_fields}
     client_toml = MetronomeCluster.MetronomeClientToml(
         cluster_name=cluster_config.cluster_name,
         location=config.instance_config.zone,
-        server_id=config.server_id,
-        request_mode_config=config.request_mode_config,
-        end_condition=config.end_condition,
-        summary_filename=config.summary_filename,
-        output_filename=config.output_filename,
+        **shared_fields,
+        # server_id=config.server_id,
+        # request_mode_config=config.request_mode_config,
+        # end_condition=config.end_condition,
+        # summary_filename=config.summary_filename,
+        # summary_only=config.summary_only,
+        # output_filename=config.output_filename,
     )
     client_toml_str = toml.dumps(asdict(client_toml))
     return client_toml_str

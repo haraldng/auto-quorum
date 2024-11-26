@@ -20,7 +20,7 @@ pub struct Network {
     incoming_messages: Receiver<ServerMessage>,
     outgoing_messages: UnboundedSender<ClientMessage>,
 }
-const SOCKET_BUFFER_SIZE: usize = 10_000;
+const SOCKET_BUFFER_SIZE: usize = 20_000;
 
 impl Network {
     pub async fn new(cluster_name: String, server_id: NodeId, local_deployment: bool) -> Self {

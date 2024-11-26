@@ -1,6 +1,6 @@
 use crate::{
-    client::ClientData,
-    configs::{ClientConfig, EndCondition, EndConditionConfig},
+    configs::{ClientConfig, EndCondition},
+    data_collection::ClientData,
     network::Network,
 };
 use futures::StreamExt;
@@ -28,10 +28,6 @@ impl OpenLoopClient {
             local_deployment,
         )
         .await;
-        let num_estimated_responses = match config.end_condition {
-            EndConditionConfig::ResponsesCollected(n) => n,
-            EndConditionConfig::SecondsPassed(_secs) => 10_000,
-        };
         let (request_delay, requests_per_interval) =
             config.request_mode_config.to_open_loop_params().unwrap();
         OpenLoopClient {
@@ -40,7 +36,7 @@ impl OpenLoopClient {
             requests_per_interval,
             next_request_id: 0,
             network,
-            client_data: ClientData::new(num_estimated_responses),
+            client_data: ClientData::new(&config),
             config,
             leaders_config: None,
         }
