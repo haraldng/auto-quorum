@@ -2,6 +2,7 @@ usage="Usage: run-local-cluster.sh cluster_size optimize_setting"
 [ -z "$1" ] &&  echo "No cluster_size given! $usage" && exit 1
 cluster_size=$1
 
+# Clean up child processes
 interrupt() {
     pkill -P $$
 }

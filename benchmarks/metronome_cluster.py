@@ -306,8 +306,8 @@ class MetronomeClusterBuilder:
         self._client_configs: dict[int, MetronomeCluster.ClientConfig] = {}
         # Cluster-wide settings
         self._metronome_config: str = "Off"
-        self._batch_config: MetronomeCluster.BatchConfig = MetronomeCluster.BatchConfig.Individual()
-        self._persist_config: MetronomeCluster.PersistConfig = MetronomeCluster.PersistConfig.NoPersist()
+        self._batch_config: MetronomeCluster.BatchConfig | None = None
+        self._persist_config: MetronomeCluster.PersistConfig | None = None
         self._metronome_quorum_size: int | None = None
         self._flexible_quorum: tuple[int, int] | None = None
         self._initial_leader: int | None = None
@@ -412,6 +412,8 @@ class MetronomeClusterBuilder:
         if self._metronome_quorum_size is not None:
             majority = len(self._server_configs) // 2 + 1
             assert self._metronome_quorum_size >= majority, f"Metronome quorum is {self._metronome_quorum_size} but it can't be smaller than majority which is {majority}"
+        assert self._batch_config is not None, "Need to set cluster's batch config"
+        assert self._persist_config is not None, "Need to set cluster's persist config"
         cluster_config = MetronomeCluster.ClusterConfig(
             cluster_name=self.cluster_name,
             nodes=sorted(self._server_configs.keys()),

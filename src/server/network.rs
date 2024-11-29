@@ -10,9 +10,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, channel};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc::Receiver,
+};
 
 pub struct Network {
     cluster_name: String,
@@ -22,8 +25,11 @@ pub struct Network {
     peer_connections: Vec<Option<PeerConnection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
+    batch_size: usize,
     client_message_sender: Sender<(ClientId, ClientMessage, i64)>,
     cluster_message_sender: Sender<(ClusterMessage, i64)>,
+    pub cluster_messages: Receiver<(ClusterMessage, i64)>,
+    pub client_messages: Receiver<(ClientId, ClientMessage, i64)>,
 }
 
 impl Network {
@@ -33,21 +39,25 @@ impl Network {
         peers: Vec<NodeId>,
         num_clients: usize,
         local_deployment: bool,
-        client_message_sender: Sender<(ClientId, ClientMessage, i64)>,
-        cluster_message_sender: Sender<(ClusterMessage, i64)>,
+        batch_size: usize,
     ) -> Self {
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peers.len(), Default::default);
+        let (cluster_message_sender, cluster_messages) = channel(batch_size);
+        let (client_message_sender, client_messages) = channel(batch_size);
         let mut network = Self {
             cluster_name,
+            is_local: local_deployment,
             id,
             peers,
             peer_connections: cluster_connections,
             client_connections: HashMap::new(),
             max_client_id: Arc::new(Mutex::new(0)),
+            batch_size,
             client_message_sender,
             cluster_message_sender,
-            is_local: local_deployment,
+            cluster_messages,
+            client_messages,
         };
         network.initialize_connections(num_clients).await;
         network
@@ -87,6 +97,7 @@ impl Network {
         let client_sender = self.client_message_sender.clone();
         let cluster_sender = self.cluster_message_sender.clone();
         let max_client_id_handle = self.max_client_id.clone();
+        let batch_size = self.batch_size;
         tokio::spawn(async move {
             let listener = TcpListener::bind(listening_address).await.unwrap();
             loop {
@@ -100,6 +111,7 @@ impl Network {
                             cluster_sender.clone(),
                             connection_sender.clone(),
                             max_client_id_handle.clone(),
+                            batch_size,
                         ));
                     }
                     Err(e) => error!("Error listening for new connection: {:?}", e),
@@ -114,6 +126,7 @@ impl Network {
         cluster_message_sender: Sender<(ClusterMessage, i64)>,
         connection_sender: Sender<NewConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
+        batch_size: usize,
     ) {
         // Identify connector's ID and type by handshake
         let mut registration_connection = frame_registration_connection(connection);
@@ -125,6 +138,7 @@ impl Network {
                 NewConnection::ToPeer(PeerConnection::new(
                     node_id,
                     underlying_stream,
+                    batch_size,
                     cluster_message_sender,
                 ))
             }
@@ -139,6 +153,7 @@ impl Network {
                 NewConnection::ToClient(ClientConnection::new(
                     next_client_id,
                     underlying_stream,
+                    batch_size,
                     client_message_sender,
                 ))
             }
@@ -170,6 +185,7 @@ impl Network {
             };
             let reconnect_delay = Duration::from_secs(1);
             let mut reconnect_interval = tokio::time::interval(reconnect_delay);
+            let batch_size = self.batch_size;
             tokio::spawn(async move {
                 // Establish connection
                 let peer_connection = loop {
@@ -194,7 +210,8 @@ impl Network {
                 }
                 let underlying_stream = registration_connection.into_inner().into_inner();
                 // Create connection actor
-                let peer_actor = PeerConnection::new(peer, underlying_stream, cluster_sender);
+                let peer_actor =
+                    PeerConnection::new(peer, underlying_stream, batch_size, cluster_sender);
                 let new_connection = NewConnection::ToPeer(peer_actor);
                 connection_sender.send(new_connection).await.unwrap();
             });
@@ -234,8 +251,6 @@ enum NewConnection {
     ToPeer(PeerConnection),
     ToClient(ClientConnection),
 }
-const SOCKET_BUFFER_SIZE: usize = 20_000;
-const CONNECTION_CHANNEL_SIZE: usize = 20_000;
 
 struct PeerConnection {
     peer_id: NodeId,
@@ -246,12 +261,13 @@ impl PeerConnection {
     pub fn new(
         peer_id: NodeId,
         connection: TcpStream,
+        batch_size: usize,
         incoming_messages: Sender<(ClusterMessage, i64)>,
     ) -> Self {
         let (reader, mut writer) = frame_cluster_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
-            let mut buf_reader = reader.ready_chunks(SOCKET_BUFFER_SIZE);
+            let mut buf_reader = reader.ready_chunks(batch_size);
             while let Some(messages) = buf_reader.next().await {
                 let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
@@ -270,10 +286,10 @@ impl PeerConnection {
             }
         });
         // Writer Actor
-        let (message_tx, mut message_rx) = mpsc::channel(CONNECTION_CHANNEL_SIZE);
+        let (message_tx, mut message_rx) = mpsc::channel(batch_size);
         let _writer_task = tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
-            while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
+            let mut buffer = Vec::with_capacity(batch_size);
+            while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
                         warn!("Couldn't feed message to node {peer_id}: {err}");
@@ -309,12 +325,13 @@ impl ClientConnection {
     pub fn new(
         client_id: ClientId,
         connection: TcpStream,
+        batch_size: usize,
         incoming_messages: Sender<(ClientId, ClientMessage, i64)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
         let _reader_task = tokio::spawn(async move {
-            let mut buf_reader = reader.ready_chunks(SOCKET_BUFFER_SIZE);
+            let mut buf_reader = reader.ready_chunks(batch_size);
             while let Some(messages) = buf_reader.next().await {
                 let receive_time = Utc::now().timestamp_micros();
                 for msg in messages {
@@ -334,10 +351,10 @@ impl ClientConnection {
             }
         });
         // Writer Actor
-        let (message_tx, mut message_rx) = mpsc::channel(CONNECTION_CHANNEL_SIZE);
+        let (message_tx, mut message_rx) = mpsc::channel(batch_size);
         let _writer_task = tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
-            while message_rx.recv_many(&mut buffer, SOCKET_BUFFER_SIZE).await != 0 {
+            let mut buffer = Vec::with_capacity(batch_size);
+            while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
                         warn!("Couldn't send message to client {client_id}: {err}");

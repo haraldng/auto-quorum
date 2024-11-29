@@ -17,13 +17,13 @@ use omnipaxos::{
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use serde::Serialize;
 use std::{fs::File, os::unix::fs::FileExt, time::Duration};
-use tokio::sync::mpsc::Receiver;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const INITIAL_LOG_CAPACITY: usize = 10_000_000;
 const COMPACT_LIMIT: usize = 9_000_000;
 const COMPACT_RETAIN_SIZE: usize = 500_000;
-const PULL_FROM_NETWORK_SIZE: usize = 20_000;
+// NOTE: This will cap how many messages an Opportunistic flush strategy can batch
+const NETWORK_BATCH_SIZE: usize = 20_000;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 type TimeStamp = i64;
@@ -58,8 +58,6 @@ pub struct MetronomeServer {
     peers: Vec<NodeId>,
     database: Database,
     network: Network,
-    cluster_messages: Receiver<(ClusterMessage, i64)>,
-    client_messages: Receiver<(ClientId, ClientMessage, i64)>,
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
     persist_strat: PersistStrategy,
@@ -89,18 +87,13 @@ impl MetronomeServer {
             true => 1,
             false => 0,
         };
-        let (cluster_message_sender, cluster_messages) =
-            tokio::sync::mpsc::channel(PULL_FROM_NETWORK_SIZE);
-        let (client_message_sender, client_messages) =
-            tokio::sync::mpsc::channel(PULL_FROM_NETWORK_SIZE);
         let network = Network::new(
             config.cluster_name.clone(),
             server_id,
             peers.clone(),
             initial_clients,
             local_deployment,
-            client_message_sender,
-            cluster_message_sender,
+            NETWORK_BATCH_SIZE,
         )
         .await;
         let instrumentation_data = match config.instrumentation {
@@ -114,8 +107,6 @@ impl MetronomeServer {
             peers,
             database: Database::new(),
             network,
-            cluster_messages,
-            client_messages,
             omnipaxos,
             initial_leader,
             persist_strat,
@@ -129,46 +120,20 @@ impl MetronomeServer {
     }
 
     pub async fn run(&mut self) {
-        // NOTE: This will cap how many messages an Opportunistic flush strategy can batch
-        let buffer_size = PULL_FROM_NETWORK_SIZE;
-        let mut client_message_buffer = Vec::with_capacity(buffer_size);
-        let mut cluster_message_buffer = Vec::with_capacity(buffer_size);
+        let mut client_msg_buffer = Vec::with_capacity(NETWORK_BATCH_SIZE);
+        let mut cluster_msg_buffer = Vec::with_capacity(NETWORK_BATCH_SIZE);
         if self.id == self.initial_leader {
-            let mut leader_attempt = 0;
-            let mut election_interval = tokio::time::interval(LEADER_WAIT);
-            loop {
-                tokio::select! {
-                    // Ensures cluster is connected and leader is promoted before client starts sending
-                    // requests.
-                    _ = election_interval.tick() => {
-                        self.become_initial_leader(&mut leader_attempt).await;
-                        let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
-                        if self.id == leader_id && phase == Phase::Accept {
-                            info!("{}: Leader fully initialized", self.id);
-                            debug!("Sending ready message to client {}", self.id);
-                            self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into())).await;
-                            break;
-                        }
-                    },
-                    // Still necessary for network handshakes
-                    _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
-                        self.handle_cluster_messages(&mut cluster_message_buffer).await;
-                    },
-                    _ = self.client_messages.recv_many(&mut client_message_buffer, buffer_size) => {
-                        self.handle_client_messages(&mut client_message_buffer).await;
-                    },
-                }
-            }
+            self.become_initial_leader(&mut cluster_msg_buffer, &mut client_msg_buffer)
+                .await;
         }
-
         // Main event loop
         loop {
             let done_signal = tokio::select! {
-                _ = self.cluster_messages.recv_many(&mut cluster_message_buffer, buffer_size) => {
-                    self.handle_cluster_messages(&mut cluster_message_buffer).await
+                _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
+                    self.handle_cluster_messages(&mut cluster_msg_buffer).await
                 },
-                _ = self.client_messages.recv_many(&mut client_message_buffer, buffer_size) => {
-                    self.handle_client_messages(&mut client_message_buffer).await
+                _ = self.network.client_messages.recv_many(&mut client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                    self.handle_client_messages(&mut client_msg_buffer).await
                 },
             };
             if done_signal {
@@ -178,7 +143,39 @@ impl MetronomeServer {
     }
 
     // We don't use Omnipaxos leader election and instead force an initial leader
-    async fn become_initial_leader(&mut self, leader_attempt: &mut u32) {
+    async fn become_initial_leader(
+        &mut self,
+        cluster_msg_buffer: &mut Vec<(ClusterMessage, TimeStamp)>,
+        client_msg_buffer: &mut Vec<(ClientId, ClientMessage, TimeStamp)>,
+    ) {
+        let mut leader_attempt = 0;
+        let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
+        loop {
+            tokio::select! {
+                // Ensures cluster is connected and leader is promoted before client starts sending
+                // requests.
+                _ = leader_takeover_interval.tick() => {
+                    self.take_leadership(&mut leader_attempt).await;
+                    let (leader_id, phase) = self.omnipaxos.get_current_leader_state();
+                    if self.id == leader_id && phase == Phase::Accept {
+                        info!("{}: Leader fully initialized", self.id);
+                        debug!("Sending ready message to client {}", self.id);
+                        self.network.send_to_client(self.id, ServerMessage::Ready(self.config.clone().into())).await;
+                        break;
+                    }
+                },
+                // Still necessary for network handshakes
+                _ = self.network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
+                    self.handle_cluster_messages(cluster_msg_buffer).await;
+                },
+                _ = self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                    self.handle_client_messages(client_msg_buffer).await;
+                },
+            }
+        }
+    }
+
+    async fn take_leadership(&mut self, leader_attempt: &mut u32) {
         let (_leader, phase) = self.omnipaxos.get_current_leader_state();
         match phase {
             Phase::Accept => (),
