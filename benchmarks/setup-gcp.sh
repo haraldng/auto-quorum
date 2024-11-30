@@ -38,9 +38,10 @@ for role in $roles; do
   gcloud projects add-iam-policy-binding "${project_id}" --member=serviceAccount:"${deployment_service_account_mail}" "--role=roles/${role}"
 done;
 
-println_green "Creating firewall rules"
-gcloud compute firewall-rules create default-allow-http --allow tcp:80 --target-tags=http-server
-gcloud compute firewall-rules create omnipaxos-server --allow tcp:8000-8010 --target-tags=omnipaxos-server
+# Only needed if instances need to network outside of the VPC
+# println_green "Creating firewall rules"
+# gcloud compute firewall-rules create default-allow-http --allow tcp:80 --target-tags=http-server
+# gcloud compute firewall-rules create omnipaxos-server --allow tcp:8000-8010 --target-tags=omnipaxos-server
 
 println_green "Creating private DNS zone for VPC"
 gcloud dns managed-zones create internal-network \
