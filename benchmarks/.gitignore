@@ -195,7 +195,7 @@ Temporary Items
 # End of https://www.toptal.com/developers/gitignore/api/macos
 
 # Python uv
-uv.lock
+# uv.lock
 
 # Secrets
 master-service-account-key.json
