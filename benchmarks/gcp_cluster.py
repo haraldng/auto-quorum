@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import subprocess
@@ -7,16 +8,15 @@ from google.cloud import dns
 from google.cloud.compute_v1 import DeleteInstanceRequest, InsertInstanceRequest, types
 from google.api_core.extended_operation import ExtendedOperation
 
+@dataclass(frozen=True)
 class InstanceConfig:
-    def __init__(self, name: str, zone: str, machine_type: str, startup_script: str, firewall_tag: Optional[str]=None, dns_name: Optional[str]=None, service_account: Optional[str]=None) -> None:
-        self.name = name
-        self.zone = zone
-        self.machine_type = machine_type
-        self.startup_script = startup_script
-        self.firewall_tag = firewall_tag
-        self.dns_name = dns_name
-        self.service_account = service_account
-        self._recreate = False
+    name: str
+    zone: str
+    machine_type: str
+    startup_script: str
+    firewall_tag: Optional[str]=None
+    dns_name: Optional[str]=None
+    service_account: Optional[str]=None
 
     def matches_instance(self, instance: compute_v1.Instance) -> bool:
         if instance.name != self.name:
@@ -73,16 +73,19 @@ Run: gcloud dns managed-zones create internal-network \\
         # Identify new/changed instances
         # TODO: Already running instances may still need to be assigned a DNS name
         instances_to_create = dict()
+        instances_to_shutdown = []
         for name, instance_config in new_instance_configs.items():
             running_instance = self.instances.get(name)
             if running_instance is not None:
                 if not instance_config.matches_instance(running_instance):
                     instances_to_create[name] = instance_config
-                    instances_to_create[name]._recreate = True
+                    instances_to_shutdown.append(name)
             else:
                 instances_to_create[name] = instance_config
         new_instance_names = list(instances_to_create.keys())
+
         print(f"Instances to create/modify: {new_instance_names}")
+        self.shutdown_instances(instances_to_shutdown)
         # Identify unused instances
         unused_instances = set(self.instances.keys()) - set(new_instance_configs.keys())
         if len(unused_instances) > 0:
@@ -97,7 +100,7 @@ Run: gcloud dns managed-zones create internal-network \\
         This method establishes an SSH connection to the specified GCP instance and runs the provided command. 
         The connection uses Google's IAP service for tunneling and uses on the user returned by 
         `get_os_username()` since OS login is enabled for created instances. Note that there is a 
-        delay between when an instance starts and when it is registered by the IAP service.
+        delay between when an instance starts and when it is SSH-able.
 
         See Also:
             - https://cloud.google.com/compute/docs/instances/ssh#gcloud for more information on gcloud ssh.
@@ -108,7 +111,8 @@ Run: gcloud dns managed-zones create internal-network \\
         gcloud_command = [
             "gcloud", "compute", "ssh", name,
             "--zone", zone,
-            "--tunnel-through-iap", "--project", self.project_id,
+            "--tunnel-through-iap",
+            "--project", self.project_id,
             "--command", command
         ]
         stderr = subprocess.PIPE if capture_stderr else None
@@ -128,7 +132,8 @@ Run: gcloud dns managed-zones create internal-network \\
         gcloud_command = [
             "gcloud", "compute", "scp",
             "--zone", zone,
-            "--tunnel-through-iap", "--project", self.project_id,
+            "--tunnel-through-iap",
+            "--project", self.project_id,
             "--compress", f"{name}:{src_dir}/*", dest_dir
         ]
         p = subprocess.Popen(gcloud_command, shell=False)
@@ -187,9 +192,6 @@ Run: gcloud dns managed-zones create internal-network \\
             self.instances.pop(name, None)
 
     def _create_instances(self, new_instance_configs: dict[str, InstanceConfig]) -> None:
-        # Delete instances which are to be recreated
-        self.shutdown_instances([config.name for config in new_instance_configs.values() if config._recreate])
-
         # Send create instance requests
         create_instance_operations = []
         requests = 0
@@ -288,7 +290,7 @@ Run: gcloud dns managed-zones create internal-network \\
         list_instances_request = compute_v1.AggregatedListInstancesRequest() 
         list_instances_request.project = self.project_id
         agg_list = self.instances_client.aggregated_list(request=list_instances_request)
-        for zone, response in agg_list:
+        for _zone, response in agg_list:
             for instance in response.instances:
                 assert instances.get(instance.name) is None, f"Cluster misconfigured: two instances have the same name {instance.name}"
                 instance.zone = instance.zone.split("/")[-1]

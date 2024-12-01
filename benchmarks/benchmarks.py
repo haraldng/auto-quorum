@@ -170,17 +170,17 @@ def metronome_size_experiment(
     # cluster.shutdown()
 
 def main():
-    batch_config = BatchConfig.Every(100)
-    end_condition = EndConditionConfig.SecondsPassed(1)
-    closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
+    # batch_config = BatchConfig.Every(100)
+    # end_condition = EndConditionConfig.SecondsPassed(1)
+    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
 
     # batch_config = BatchConfig.Opportunistic()
     # end_condition = EndConditionConfig.SecondsPassed(60)
     # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
 
-    # batch_config = BatchConfig.Opportunistic()
-    # end_condition = EndConditionConfig.SecondsPassed(60)
-    # num_clients_latency_experiment(num_runs=2, cluster_size=5, batch_config=batch_config, end_condition=end_condition)
+    batch_config = BatchConfig.Opportunistic()
+    end_condition = EndConditionConfig.SecondsPassed(60)
+    num_clients_latency_experiment(num_runs=2, cluster_size=5, batch_config=batch_config, end_condition=end_condition)
 
     # batch_config = BatchConfig.Opportunistic()
     # end_condition = EndConditionConfig.SecondsPassed(60)

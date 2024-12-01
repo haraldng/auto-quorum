@@ -1,6 +1,7 @@
 import subprocess
 import time
 from pathlib import Path
+from itertools import chain
 
 from gcp_cluster import GcpCluster, InstanceConfig
 from metronome_configs import *
@@ -27,7 +28,8 @@ class MetronomeCluster:
 
     _server_processes: dict[int, subprocess.Popen]
     _client_processes: dict[int, subprocess.Popen]
-    GCLOUD_IAP_ERROR_TAG: str = "ERROR: (gcloud.compute.start-iap-tunnel)"
+    _cluster_config: ClusterConfig
+    _gcp_cluster: GcpCluster
 
     def __init__(self, project_id: str, cluster_config: ClusterConfig):
         self._server_processes = {}
@@ -37,10 +39,15 @@ class MetronomeCluster:
         instance_configs.extend([c.instance_config for c in cluster_config.client_configs.values()])
         self._gcp_cluster = GcpCluster(project_id, instance_configs)
 
-    def start_servers(self, pull_images: bool=False):
-        print("Starting servers")
-        for server_id in self._cluster_config.server_configs.keys():
-            self.start_server(server_id, pull_images)
+    def start_servers(self, servers: list[int] | None=None, pull_images: bool=False):
+        if servers is None:
+            print("Starting all servers")
+            for server_id in self._cluster_config.server_configs.keys():
+                self.start_server(server_id, pull_images)
+        else:
+            print(f"Starting servers {servers}")
+            for server_id in servers:
+                self.start_server(server_id, pull_images)
 
     def start_server(self, server_id: int, pull_image: bool=False):
         server_config = self._get_server_config(server_id)
@@ -51,15 +58,20 @@ class MetronomeCluster:
         server_process = self._gcp_cluster.ssh_command(server_config.instance_config.name, start_command)
         self._server_processes[server_id] = server_process
 
-    def stop_server(self, server_id: int):
+    def stop_server(self, server_id: int) -> int | None:
         _ = self._get_server_config(server_id)
         current_server_process = self._server_processes.pop(server_id, None)
         if current_server_process is not None:
             current_server_process.terminate()
+            return server_id
+        return None
 
-    def stop_servers(self):
+    def stop_servers(self) -> list[int]:
+        stopped_processes = []
         for server_id in self._cluster_config.server_configs.keys():
-            self.stop_server(server_id)
+            if self.stop_server(server_id) is not None:
+                stopped_processes.append(server_id)
+        return stopped_processes
 
     def await_servers(self):
         print(f"Awaiting servers...")
@@ -67,58 +79,88 @@ class MetronomeCluster:
             server_process.wait(timeout=600)
         self._server_processes.clear()
 
+    def start_clients(self, clients: list[int] | None=None, pull_images: bool=False):
+        if clients is None:
+            print("Starting all clients")
+            for client_id in self._cluster_config.client_configs.keys():
+                self.start_client(client_id, pull_images)
+        else:
+            print(f"Starting clients {clients}")
+            for client_id in clients:
+                self.start_client(client_id, pull_images)
+
     def start_client(self, client_id: int, pull_image: bool=False):
         client_config = self._get_client_config(client_id)
-        current_client_process = self._client_processes.get(client_id)
+        current_client_process = self._client_processes.pop(client_id, None)
         if current_client_process is not None:
             current_client_process.terminate()
         start_command = self._start_client_command(client_id, pull_image=pull_image)
-        client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command, capture_stderr=True)
+        client_process = self._gcp_cluster.ssh_command(client_config.instance_config.name, start_command)
         self._client_processes[client_id] = client_process
 
-    def await_cluster(self):
-        """
-        Waits for client and server processes to finish, retrying if SSH instance lookup fails.
+    def stop_client(self, client_id: int) -> int | None:
+        _ = self._get_client_config(client_id)
+        current_client_process = self._client_processes.pop(client_id, None)
+        if current_client_process is not None:
+            current_client_process.terminate()
+            return client_id
+        return None
 
-        This method retries SSH connections up to 3 times if the client fails due to GCP instance lookup delay 
-        (when using `gcloud compute ssh` with `--tunnel-through-iap`). If the retries fail, it stops the servers. 
+    def stop_clients(self) -> list[int]:
+        stopped_processes = []
+        for client_id in self._cluster_config.client_configs.keys():
+            if self.stop_client(client_id) is not None:
+                stopped_processes.append(client_id)
+        return stopped_processes
+
+    def await_cluster(self, timeout: int | None=None):
         """
-        print(f"Awaiting client...")
-        assert len(self._client_processes) > 0, "Need a client to exist to await on cluster"
-        tries = 0
+        Waits for client and server processes to finish, retrying if SSH connection fails. Aborts processes if timeout (in seconds)
+        is reached.
+
+        This method retries client and server SSH connections up to 3 times if an instance SSH connection fails. This is necessary
+        because there is an undefined delay between when an instance is created and when it becomes SSH-able. If any instance fails 
+        to connect, all the connections are retried.
+        """
+        print(f"Awaiting cluster...")
+        retries = 0
+        ticks = 0
         while True:
-            client_id, client_process = self._client_processes.popitem()
-            assert client_process.stderr is not None, "Client processes should capture stderr"
+            a_process_failed = False
+            a_process_is_running = False
+            all_processes = chain(self._client_processes.values(), self._server_processes.values())
+            for process in all_processes:
+                return_code = process.poll()
+                if return_code is None:
+                    a_process_is_running = True
+                elif return_code == 255:
+                    a_process_failed = True
 
-            # Capture and print client process stderr
-            ssh_err = False
-            for line in iter(client_process.stderr.readline, ""):
-                if line.startswith(self.GCLOUD_IAP_ERROR_TAG):
-                    ssh_err = True
-                    print(line, end="")
+            if a_process_failed:
+                stopped_clients = self.stop_clients()
+                stopped_servers = self.stop_servers()
+                if retries < 3:
+                    print(f"Retrying client and server SSH connections...")
+                    time.sleep(10)
+                    retries += 1
+                    self.start_servers(stopped_servers)
+                    self.start_clients(stopped_clients)
+                else:
+                    print("Failed SSH 3 times, aborting cluster.")
                     break
-                print(line, end="")
-            client_process.stderr.close()
-            client_process.wait()
-
-            # Retry cluster processes if client failed due to ssh instance lookup error
-            if ssh_err and tries < 3:
-                print(f"Retrying client and server SSH connections")
-                time.sleep(5)
-                tries += 1
-                self.stop_servers()
-                self.start_servers()
-                self.start_client(client_id)
+            elif a_process_is_running:
+                time.sleep(1)
+                ticks += 1
+                if timeout is not None and ticks > timeout:
+                    print("Timeout reached, stopping all processes.")
+                    self.stop_clients()
+                    self.stop_servers()
+                    break
             else:
+                print("Cluster finished successfully.")
                 break
-        if ssh_err:
-            print("Failed SSH 3 times")
-            self.stop_servers()
-        else:
-            # TODO: await remaining clients
-            # TODO: should await servers here but when running for a long time it seems server docker containers end, but ssh sessions don't end
-            # self.await_servers()
-            print("Cluster finished")
+        self._client_processes.clear()
+        self._server_processes.clear()
 
     def shutdown(self):
         instance_names = [c.instance_config.name for c in self._cluster_config.server_configs.values()]
