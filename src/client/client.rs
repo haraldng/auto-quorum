@@ -69,6 +69,7 @@ impl ClosedLoopClient {
 
         // Shutdown cluster and collect results
         self.network.send(ClientMessage::Done);
+        self.network.shutdown().await;
         self.client_data
             .save_summary(self.config.clone(), self.leaders_config.unwrap())
             .expect("Failed to write summary file");
@@ -77,7 +78,7 @@ impl ClosedLoopClient {
             .expect("Failed to write output file");
     }
 
-    // Send new requests on reponse until response limit is reached
+    // Send new requests on reponse until resntponse limit is reached
     async fn run_until_response_limit(&mut self, response_limit: usize) {
         let mut response_count = 0;
         loop {

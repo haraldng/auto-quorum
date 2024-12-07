@@ -1,12 +1,13 @@
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import subprocess
 
-from google.cloud import compute_v1
-from google.cloud import dns
-from google.cloud.compute_v1 import DeleteInstanceRequest, InsertInstanceRequest, types
 from google.api_core.extended_operation import ExtendedOperation
+from google.cloud import compute_v1, dns
+from google.cloud.compute_v1 import (DeleteInstanceRequest,
+                                     InsertInstanceRequest, types)
+
 
 @dataclass(frozen=True)
 class InstanceConfig:
@@ -226,7 +227,8 @@ Run: gcloud dns managed-zones create internal-network \\
             auto_delete=True,
             initialize_params=types.AttachedDiskInitializeParams(
                 disk_size_gb=10,
-                disk_type=f"zones/{instance_config.zone}/diskTypes/pd-balanced",
+                # disk_type=f"zones/{instance_config.zone}/diskTypes/pd-balanced",
+                disk_type=f"zones/{instance_config.zone}/diskTypes/pd-standard",
                 # Minimal OS optimized for running Docker containers
                 source_image="projects/cos-cloud/global/images/family/cos-stable",
                 # source_image="projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts",

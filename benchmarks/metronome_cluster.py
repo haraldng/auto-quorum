@@ -225,10 +225,8 @@ class MetronomeCluster:
         instance_err_location = f"{instance_output_dir}/xerr-server-{server_config.server_id}.log"
         server_config_toml = server_config.generate_server_toml(self._cluster_config)
 
-        # pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
-        # kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
-        pull_command = f"docker pull gcr.io/{container_image_location}"
-        kill_prev_container_command = f"docker kill {container_name}"
+        pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
+        kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
         gen_config_command = f"mkdir -p {instance_output_dir} && echo -e '{server_config_toml}' > {instance_config_location} && touch persist.log"
         docker_command = f"""docker run \\
             --name {container_name} \\
@@ -258,10 +256,8 @@ class MetronomeCluster:
         container_output_dir = "/app"
         client_config_toml = client_config.generate_client_toml(self._cluster_config)
 
-        # pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
-        # kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
-        pull_command = f"docker pull gcr.io/{container_image_location}"
-        kill_prev_container_command = f"docker kill {container_name}"
+        pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
+        kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
         gen_config_command = f"echo -e '{client_config_toml}' > {instance_config_location}"
         docker_command = f"""docker run \\
         --name={container_name} \\
@@ -271,7 +267,6 @@ class MetronomeCluster:
         -v {instance_config_location}:{container_config_location} \\
         -v {instance_output_dir}:{container_output_dir} \\
         gcr.io/{container_image_location}"""
-        full_command = f"{kill_prev_container_command}; sleep 2; {gen_config_command} && {docker_command}"
         if pull_image:
             full_command = f"{kill_prev_container_command}; {pull_command}; {gen_config_command} && {docker_command}"
         else:

@@ -9,14 +9,18 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
     time::interval,
 };
 
 pub struct Network {
-    reader_handle: JoinHandle<()>,
-    writer_handle: JoinHandle<()>,
+    // reader_handle: JoinHandle<()>,
+    writer_handle: Option<JoinHandle<()>>,
+    writer_stop_signal: Option<oneshot::Sender<()>>,
     incoming_messages: Receiver<ServerMessage>,
     outgoing_messages: UnboundedSender<ClientMessage>,
 }
@@ -30,11 +34,18 @@ impl Network {
         // Spawn reader and writer actors
         let (incoming_message_tx, incoming_message_rx) = tokio::sync::mpsc::channel(1000);
         let (outgoing_message_tx, outgoing_message_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader_handle = tokio::spawn(Self::reader_actor(from_server_conn, incoming_message_tx));
-        let writer_handle = tokio::spawn(Self::writer_actor(to_server_conn, outgoing_message_rx));
+        let (stop_signal_tx, stop_signal_rx) = tokio::sync::oneshot::channel();
+        let _reader_handle =
+            tokio::spawn(Self::reader_actor(from_server_conn, incoming_message_tx));
+        let writer_handle = tokio::spawn(Self::writer_actor(
+            to_server_conn,
+            outgoing_message_rx,
+            stop_signal_rx,
+        ));
         Self {
-            reader_handle,
-            writer_handle,
+            // reader_handle,
+            writer_handle: Some(writer_handle),
+            writer_stop_signal: Some(stop_signal_tx),
             incoming_messages: incoming_message_rx,
             outgoing_messages: outgoing_message_tx,
         }
@@ -92,27 +103,50 @@ impl Network {
     async fn writer_actor(
         mut writer: ToServerConnection,
         mut outgoing_messages: UnboundedReceiver<ClientMessage>,
+        mut stop_signal: oneshot::Receiver<()>, // Add oneshot receiver
     ) {
         let mut buffer = Vec::with_capacity(SOCKET_BUFFER_SIZE);
-        while outgoing_messages
-            .recv_many(&mut buffer, SOCKET_BUFFER_SIZE)
-            .await
-            != 0
-        {
-            for msg in buffer.drain(..) {
-                if let Err(err) = writer.feed(msg).await {
-                    warn!("Couldn't send message to server: {err}");
+
+        loop {
+            tokio::select! {
+                // Normal behavior: receive messages from outgoing_messages
+                result = outgoing_messages.recv_many(&mut buffer, SOCKET_BUFFER_SIZE) => {
+                    if result == 0 {
+                        break;
+                    }
+                    for msg in buffer.drain(..) {
+                        if let Err(err) = writer.feed(msg).await {
+                            warn!("Couldn't send message to server: {err}");
+                        }
+                    }
+                    writer.flush().await.unwrap();
+                }
+
+                // Stop signal received: exit the loop
+                _ = &mut stop_signal => {
+                    // Try to empty outgoing message queue before exiting
+                    while let Ok(msg) = outgoing_messages.try_recv() {
+                        let _ = writer.feed(msg).await;
+                    }
+                    let _ = writer.flush().await;
+                    break;
                 }
             }
-            writer.flush().await.unwrap();
         }
-        error!("Connection to server lost");
+        info!("Connection to server closed");
     }
 
     pub fn send(&mut self, message: ClientMessage) {
         if let Err(e) = self.outgoing_messages.send(message) {
             error!("Couldn't send message to server: {e}");
         }
+    }
+
+    pub async fn shutdown(&mut self) {
+        let stop_sender = self.writer_stop_signal.take().unwrap();
+        let writer = self.writer_handle.take().unwrap();
+        let _ = stop_sender.send(()).unwrap();
+        let _ = writer.await;
     }
 }
 
@@ -124,10 +158,10 @@ impl Stream for Network {
     }
 }
 
-impl Drop for Network {
-    // Shutdown reader/writer tasks on destruction
-    fn drop(&mut self) {
-        self.reader_handle.abort();
-        self.writer_handle.abort();
-    }
-}
+// impl Drop for Network {
+//     // Shutdown reader/writer tasks on destruction
+//     fn drop(&mut self) {
+//         self.reader_handle.abort();
+//         self.writer_handle.abort();
+//     }
+// }
