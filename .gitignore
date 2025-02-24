@@ -1,3 +1,7 @@
+# PROJECT SPECIFIC IGNORES
+logs/
+
+# GENERAL IGNORES
 # Created by https://www.toptal.com/developers/gitignore/api/rust
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust
 
@@ -60,11 +64,3 @@ Temporary Items
 *.icloud
 
 # End of https://www.toptal.com/developers/gitignore/api/macos
-
-graphs/
-logs/
-config/*/*.conf
-!config/*/c1.conf
-
-# Secrets
-service-account-key.json

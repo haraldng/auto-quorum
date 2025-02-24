@@ -2,7 +2,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use log::*;
 use metronome::common::{kv::NodeId, messages::*, utils::*};
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -17,6 +17,8 @@ use tokio::{
     time::interval,
 };
 
+use crate::configs::ClientConfig;
+
 pub struct Network {
     // reader_handle: JoinHandle<()>,
     writer_handle: Option<JoinHandle<()>>,
@@ -27,9 +29,14 @@ pub struct Network {
 const SOCKET_BUFFER_SIZE: usize = 20_000;
 
 impl Network {
-    pub async fn new(cluster_name: String, server_id: NodeId, local_deployment: bool) -> Self {
+    pub async fn new(config: ClientConfig) -> Self {
         // Get connection to server
-        let server_address = Self::get_server_address(&cluster_name, server_id, local_deployment);
+        let server_address = config
+            .server_address
+            .to_socket_addrs()
+            .expect("Unable to resolve server IP")
+            .next()
+            .unwrap();
         let (from_server_conn, to_server_conn) = Self::get_server_connection(server_address).await;
         // Spawn reader and writer actors
         let (incoming_message_tx, incoming_message_rx) = tokio::sync::mpsc::channel(1000);

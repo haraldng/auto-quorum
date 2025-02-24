@@ -2,9 +2,7 @@ use chrono::Utc;
 use client::ClosedLoopClient;
 use configs::{ClientConfig, RequestModeConfig};
 use open_loop_client::OpenLoopClient;
-use std::{env, fs};
 use tokio::time::Duration;
-use toml;
 
 mod client;
 mod configs;
@@ -30,15 +28,7 @@ async fn wait_until_sync_time(scheduled_start_utc_ms: Option<i64>) {
 #[tokio::main]
 pub async fn main() {
     env_logger::init();
-    let config_file = match env::var("CONFIG_FILE") {
-        Ok(file_path) => file_path,
-        Err(_) => panic!("Requires CONFIG_FILE environment variable"),
-    };
-    let config_string = match fs::read_to_string(config_file.clone()) {
-        Ok(string) => string,
-        Err(e) => panic!("Couldn't read config file {config_file}: {e}"),
-    };
-    let client_config: ClientConfig = match toml::from_str(&config_string) {
+    let client_config = match ClientConfig::new() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };

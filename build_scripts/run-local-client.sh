@@ -1,9 +1,18 @@
-usage="Usage: run-local-client.sh <server_id_client_should_connect_to>"
-[ -z "$1" ] &&  echo "No first_clients_server_id given! $usage" && exit 1
+#!/bin/bash
 
-server_id=$1
-client1_config_path="./client-${server_id}-config.toml"
-local_experiment_dir="../benchmarks/logs/local-experiments"
+server_id=1
+rust_log="info"
+
+# Clean up child processes
+interrupt() {
+    pkill -P $$
+}
+trap "interrupt" SIGINT
+
+# Clients' output is saved into logs dir
+local_experiment_dir="./logs"
 mkdir -p "${local_experiment_dir}"
 
-RUST_LOG=info CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../Cargo.toml" --bin client
+# Run client
+client_config_path="./client-1-config.toml"
+RUST_LOG=$rust_log CONFIG_FILE="$client_config_path"  cargo run --manifest-path="../Cargo.toml" --bin client

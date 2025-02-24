@@ -1,4 +1,4 @@
-FROM rust:1.76 AS chef
+FROM rust:1.84 AS chef
 
 # Stop if a command fails
 RUN set -eux

@@ -63,46 +63,39 @@ pub struct MetronomeServer {
     persist_strat: PersistStrategy,
     decided_slots_buffer: Vec<usize>,
     instrumentation_data: Option<InstrumentationData>,
-    config: MetronomeServerConfig,
+    config: MetronomeConfig,
 }
 
 impl MetronomeServer {
-    pub async fn new(config: MetronomeServerConfig) -> Self {
-        let server_id = config.server_id;
-        let nodes = config.nodes.clone();
+    pub async fn new(config: MetronomeConfig) -> Self {
+        let server_id = config.server.server_id;
+        let nodes = config.cluster.nodes.clone();
         let peers: Vec<u64> = nodes
             .into_iter()
             .filter(|node| *node != server_id)
             .collect();
-        let local_deployment = config.local_deployment.unwrap_or(false);
         info!(
             "Node: {:?}: using metronome: {:?}, batch_config: {:?}",
-            server_id, config.metronome_config, config.batch_config
+            server_id, config.cluster.metronome_config, config.cluster.batch_config
         );
         let storage = MemoryStorage::with_capacity(INITIAL_LOG_CAPACITY);
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
-        let initial_leader = config.initial_leader.unwrap_or(1);
+        let initial_leader = config.cluster.initial_leader.unwrap_or(1);
         let initial_clients = match server_id == initial_leader {
             true => 1,
             false => 0,
         };
-        let network = Network::new(
-            config.cluster_name.clone(),
-            server_id,
-            peers.clone(),
-            initial_clients,
-            local_deployment,
-            NETWORK_BATCH_SIZE,
-        )
-        .await;
-        let instrumentation_data = match config.instrumentation {
+        let network = Network::new(config.clone(), initial_clients, NETWORK_BATCH_SIZE).await;
+        let instrumentation_data = match config.server.instrumentation {
             true => Some(InstrumentationData::new(config.clone())),
             false => None,
         };
-        let persist_strat =
-            PersistStrategy::from(config.persist_config, config.persist_log_filepath.clone());
-        let mut server = MetronomeServer {
+        let persist_strat = PersistStrategy::from(
+            config.cluster.persist_config,
+            config.server.persist_log_filepath.clone(),
+        );
+        MetronomeServer {
             id: server_id,
             peers,
             database: Database::new(),
@@ -113,10 +106,7 @@ impl MetronomeServer {
             decided_slots_buffer: Vec::with_capacity(1000),
             instrumentation_data,
             config,
-        };
-        // Clears outgoing_messages of initial BLE messages
-        let _ = server.omnipaxos.outgoing_messages();
-        server
+        }
     }
 
     pub async fn run(&mut self) {
@@ -205,7 +195,7 @@ impl MetronomeServer {
                 ClusterMessage::Done => {
                     info!("{}: Received Done signal from leader", self.id);
                     if let Some(data) = &self.instrumentation_data {
-                        data.acceptor_data_to_csv(self.config.debug_filename.clone())
+                        data.acceptor_data_to_csv(self.config.server.debug_filename.clone())
                             .expect("File write failed");
                         data.debug_acceptor_data();
                     }
@@ -254,7 +244,7 @@ impl MetronomeServer {
                     // TODO: Allow for wait on network flushing all pending messages instead
                     std::thread::sleep(Duration::from_secs(1));
                     if let Some(data) = &self.instrumentation_data {
-                        data.request_data_to_csv(self.config.debug_filename.clone())
+                        data.request_data_to_csv(self.config.server.debug_filename.clone())
                             .expect("File write failed");
                         //data.debug_request_data();
                     }
@@ -424,9 +414,9 @@ struct InstrumentationData {
 }
 
 impl InstrumentationData {
-    fn new(config: MetronomeServerConfig) -> Self {
-        let num_nodes = config.nodes.len();
-        let metronome_quorum = match config.metronome_quorum_size {
+    fn new(config: MetronomeConfig) -> Self {
+        let num_nodes = config.cluster.nodes.len();
+        let metronome_quorum = match config.cluster.metronome_quorum_size {
             Some(quorum_size) => quorum_size,
             None => (num_nodes / 2) + 1,
         };
@@ -434,7 +424,7 @@ impl InstrumentationData {
             request_data: Vec::with_capacity(1000),
             acceptor_data: Vec::with_capacity(1000),
             metronome_batch_size: n_choose_k(num_nodes, metronome_quorum),
-            id: config.server_id,
+            id: config.server.server_id,
         }
     }
 

@@ -1,9 +1,13 @@
 # NOTE: Dont use `docker compose up --build` because s2-s5 will pull a stale image that
 # won't reflect any changes s1 makes to the image in the build step. Instead call
 # `docker compose build` then `docker compose up`.
-x-common-variables: &common-variables
+x-common-variables: &server-common-variables
   RUST_LOG: "info"
-  CONFIG_FILE: "${HOME}/server-config.toml"
+  SERVER_CONFIG_FILE: "/app/server-config.toml"
+  CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
+  METRONOME_NODE_ADDRS: "s1:8000,s2:8000,s3:8000,s4:8000,s5:8000" # Overwrite node_addrs in cluster config TOML
+  METRONOME_LISTEN_ADDRESS: "0.0.0.0"                             # Overwrite listen_address in server config TOMLs
+  METRONOME_LISTEN_PORT: 8000                                     # Overwrite listen_port in server config TOMLs
 
 services:
   s1:
@@ -13,44 +17,57 @@ services:
       dockerfile: server.dockerfile
     container_name: s1
     environment:
-      <<: *common-variables
+      <<: *server-common-variables
     volumes:
-      - ./server-1-config.toml:${HOME}/server-config.toml
-    ports:
-      - "8001:8001"
+      - ./server-1-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
   s2:
     image: metronome-server
     container_name: s2
     environment:
-      <<: *common-variables
+      <<: *server-common-variables
     volumes:
-      - ./server-2-config.toml:${HOME}/server-config.toml
-    ports:
-      - "8002:8002"
+      - ./server-2-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
   s3:
     image: metronome-server
     container_name: s3
     environment:
-      <<: *common-variables
+      <<: *server-common-variables
     volumes:
-      - ./server-3-config.toml:${HOME}/server-config.toml
-    ports:
-      - "8003:8003"
+      - ./server-3-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
   s4:
     image: metronome-server
     container_name: s4
     environment:
-      <<: *common-variables
+      <<: *server-common-variables
     volumes:
-      - ./server-4-config.toml:${HOME}/server-config.toml
-    ports:
-      - "8004:8004"
+      - ./server-4-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
   s5:
     image: metronome-server
     container_name: s5
     environment:
-      <<: *common-variables
+      <<: *server-common-variables
     volumes:
-      - ./server-5-config.toml:${HOME}/server-config.toml
-    ports:
-      - "8005:8005"
+      - ./server-5-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  c1:
+    image: metronome-client
+    build:
+      context: ./..
+      dockerfile: client.dockerfile
+    container_name: c1
+    environment:
+      RUST_LOG: "info"
+      CONFIG_FILE: "/app/client-config.toml"
+      METRONOME_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
+    volumes:
+      - ./client-1-config.toml:/app/client-config.toml
+      - ./logs/:/app/logs/

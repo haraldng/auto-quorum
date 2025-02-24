@@ -1,18 +1,33 @@
+use config::{Config, ConfigError, Environment, File};
 use metronome::common::kv::NodeId;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{env, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
-    pub cluster_name: String,
     pub location: String,
     pub server_id: NodeId,
-    pub local_deployment: Option<bool>,
+    pub server_address: String,
     pub request_mode_config: RequestModeConfig,
     pub end_condition: EndConditionConfig,
     pub summary_filename: String,
     pub summary_only: bool,
     pub output_filename: String,
+}
+
+impl ClientConfig {
+    pub fn new() -> Result<Self, ConfigError> {
+        let config_file = match env::var("CONFIG_FILE") {
+            Ok(file_path) => file_path,
+            Err(_) => panic!("Requires CONFIG_FILE environment variable to be set"),
+        };
+        let config = Config::builder()
+            .add_source(File::with_name(&config_file))
+            // Add-in/overwrite settings with environment variables (with a prefix of METRONOME)
+            .add_source(Environment::with_prefix("METRONOME").try_parsing(true))
+            .build()?;
+        config.try_deserialize()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]

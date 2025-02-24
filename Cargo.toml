@@ -16,12 +16,10 @@ tokio-util = { version = "0.7.10", features = ["codec"] }
 # omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch" }
 omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide", features = ["serde", "toml_config"] }
 omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide" }
-# omnipaxos = { path = "../omnipaxos/omnipaxos/", features = ["serde", "toml_config"] }
-# omnipaxos_storage = {path = "../omnipaxos/omnipaxos_storage/" }
-toml = "0.8.11"
 tempfile = "3.13.0"
 chrono = "0.4.38"
 csv = "1.3.0"
+config = "0.15.8"
 
 [[bin]]
 name = "client"

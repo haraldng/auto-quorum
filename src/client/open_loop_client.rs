@@ -21,13 +21,7 @@ pub struct OpenLoopClient {
 
 impl OpenLoopClient {
     pub async fn new(config: ClientConfig) -> Self {
-        let local_deployment = config.local_deployment.unwrap_or(false);
-        let network = Network::new(
-            config.cluster_name.clone(),
-            config.server_id,
-            local_deployment,
-        )
-        .await;
+        let network = Network::new(config.clone()).await;
         let (request_delay, requests_per_interval) =
             config.request_mode_config.to_open_loop_params().unwrap();
         OpenLoopClient {

@@ -1,19 +1,7 @@
-cluster_name = "local-cluster"
 location = "local-1"
-local_deployment = true
 server_id = 1
-nodes = [1, 2, 3, 4, 5]
-initial_leader = 1
-metronome_config = "Off"
-#metronome_quorum_size = 3
+listen_address = "127.0.0.1"
+listen_port = 8001
 instrumentation = true
-debug_filename = "../benchmarks/logs/local-experiments/server-1.csv"
-persist_log_filepath = "../benchmarks/logs/local-experiments/server-1.log"
-
-[persist_config]
-persist_type = "File"
-persist_value = 256
-
-[batch_config]
-batch_type = "Opportunistic"
-#batch_value = 60
+debug_filename = "./logs/server-1.csv"
+persist_log_filepath = "./logs/server-1.log"

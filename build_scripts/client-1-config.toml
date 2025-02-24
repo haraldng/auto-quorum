@@ -1,9 +1,9 @@
-cluster_name = "local-cluster"
 location = "local-1"
 server_id = 1
-local_deployment = true
-summary_filename = "../benchmarks/logs/local-experiments/client-1.json"
-output_filename = "../benchmarks/logs/local-experiments/client-1.csv"
+server_address = "127.0.0.1:8001"
+summary_only = false
+summary_filename = "./logs/client-1.json"
+output_filename = "./logs/client-1.csv"
 
 [request_mode_config]
 request_mode_config_type = "ClosedLoop"
