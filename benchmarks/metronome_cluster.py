@@ -1,10 +1,11 @@
 import subprocess
 import time
-from pathlib import Path
 from itertools import chain
+from pathlib import Path
 
 from gcp_cluster import GcpCluster, InstanceConfig
 from metronome_configs import *
+
 
 class MetronomeCluster:
     """
@@ -256,6 +257,7 @@ class MetronomeCluster:
         container_output_dir = "/app"
         client_config_toml = client_config.generate_client_toml(self._cluster_config)
 
+        pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
         pull_command = f"docker pull gcr.io/{container_image_location} > /dev/null"
         kill_prev_container_command = f"docker kill {container_name} > /dev/null 2>&1"
         gen_config_command = f"echo -e '{client_config_toml}' > {instance_config_location}"

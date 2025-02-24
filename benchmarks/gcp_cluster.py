@@ -227,8 +227,8 @@ Run: gcloud dns managed-zones create internal-network \\
             auto_delete=True,
             initialize_params=types.AttachedDiskInitializeParams(
                 disk_size_gb=10,
-                # disk_type=f"zones/{instance_config.zone}/diskTypes/pd-balanced",
-                disk_type=f"zones/{instance_config.zone}/diskTypes/pd-standard",
+                disk_type=f"zones/{instance_config.zone}/diskTypes/pd-balanced",
+                # disk_type=f"zones/{instance_config.zone}/diskTypes/pd-standard",
                 # Minimal OS optimized for running Docker containers
                 source_image="projects/cos-cloud/global/images/family/cos-stable",
                 # source_image="projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts",

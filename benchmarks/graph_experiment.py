@@ -1,12 +1,15 @@
-import math
-from pathlib import Path
-import pandas as pd
 import json
-import matplotlib.pyplot as plt
+import math
+import os
+from pathlib import Path
+
 import matplotlib.colors as mcolors
-from matplotlib import ticker
-import seaborn as sns
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib import ticker
+from pandas.io.pytables import _ensure_term
 
 
 def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
@@ -15,14 +18,14 @@ def parse_clients_summaries(experiment_name: str) -> pd.DataFrame:
     df = pd.concat(experiment_data)
     # Ensure the metronome_info column is treated as an ordered Categorical variable
     category_mapping = {
-        "Off": "Baseline",
+        "Off": "OmniPaxos",
         "RoundRobin": "Metronome_old",
         "RoundRobin2": "Metronome",
-        "FastestFollower": "Straggler Detection"
+        "FastestFollower": "Metronome-WS"
     }
     df['metronome_info'] = pd.Categorical(
         df['metronome_info'].map(category_mapping), 
-        categories=["Baseline", "Metronome_old", "Metronome", "Straggler Detection"], 
+        categories=["OmniPaxos", "Metronome_old", "Metronome", "Metronome-WS"], 
         ordered=True
     )
     df = df.sort_values(by=['persist_info.value', 'metronome_info']).reset_index()
@@ -138,13 +141,13 @@ def create_base_barchart(latency_means: dict, bar_group_labels: list[str], legen
         ax.bar_label(rects, fmt='%.2f', padding=3)
         multiplier += 1
     if relative:
-        ax.set_ylabel('Relative Latency', fontsize=24)
+        ax.set_ylabel('Relative Latency', fontsize=16)
     else:
-        ax.set_ylabel('Average Latency (ms)', fontsize=24)
-    ax.tick_params(axis='y', labelsize=20)
-    ax.set_xticks(x + width * bar_group_size/2, bar_group_labels, fontsize=20)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')  # Legend outside plot
-    # ax.legend(**legend_args)
+        ax.set_ylabel('Average Latency (ms)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=12)
+    ax.set_xticks(x + width * bar_group_size/2, bar_group_labels, fontsize=16)
+    # ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')  # Legend outside plot
+    ax.legend(**legend_args)
     return fig, ax
 
 def graph_experiment_debug(client_summary: pd.Series, client_log: pd.DataFrame, server_logs: pd.DataFrame| None):
@@ -191,7 +194,7 @@ def graph_request_latency_subplot(fig, client_summary: pd.Series, client_log: pd
     fig.scatter(client_log['request_time'], latencies, label='Client Request Latency', alpha=0.3)
     fig.set_ylim(bottom=0)
     fig.set_ylabel('Request latency (ms)')
-    fig.legend()
+    fig.legend(frameon=False)
 
 def graph_acceptor_queue_subplot(fig, client_summary: pd.Series, server_logs: pd.DataFrame):
     followers = range(2, client_summary.cluster_size+1)
@@ -209,7 +212,7 @@ def graph_acceptor_queue_subplot(fig, client_summary: pd.Series, server_logs: pd
         fig.plot(events['timestamp'], events['queue_length'], label=f'Follower {follower}')
     fig.set_ylabel('Queue Length')
     fig.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    # fig.legend()
+    # fig.legend(frameon=False)
 
 
 def graph_persist_latency_subplot(fig, client_summary: pd.Series, server_logs: pd.DataFrame):
@@ -267,7 +270,7 @@ def graph_average_persist_latency_subplot(fig, client_summary: pd.Series, server
         start_times = server_logs[start_key].dropna()
         end_times = server_logs[f'follower_{follower}.send_accepted'].dropna()
         fig.plot(start_times, end_times - start_times, label=f'Follower {follower}')
-    fig.legend()
+    fig.legend(frameon=False)
     fig.set_ylim(bottom=0)
     fig.set_ylabel('Persist latency (us)')
 
@@ -285,44 +288,48 @@ def graph_local_experiment():
 
 
 def graph_closed_loop_experiment(relative:bool=False, save: bool=True):
+    relative = False
     # Get experiment data
     experiment_directory = "closed-loop-experiments-Opportunistic"
     run_directory = "5-node-cluster-1000-clients"
+    save_path = f"./logs/to_show2/{experiment_directory}/{run_directory}/"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
 
-    # Create bar chart
-    bar_labels = ("baseline", "metronome")
-    legend_args = {"loc": "upper left", "ncols": 1, "fontsize": 16}
-    client_summary = summaries.iloc[0]
-    for (metric, err) in [("request_latency_average", "request_latency_std_dev")]:
-        pivot_df = summaries.pivot_table(index='persist_label', columns='metronome_info', values=[metric, err])
-        # print(pivot_df)
-        relative_latency_df = pivot_df['request_latency_average'].div(
-            pivot_df['request_latency_average']['Baseline'], axis=0
-        )
-        bar_group_labels = list(pivot_df.index)
-        bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
-        latency_means = {}
-        for label in bar_labels:
-            if relative:
-                latency_means[label] = (relative_latency_df[label], None)
-            else:
-                latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
-        fig, ax = create_base_barchart(latency_means, bar_group_labels, legend_args, relative)
-        ax.set_xlabel("Entry Size (bytes)", fontsize=24)
-        title = f"{metric}\n" + ", ".join([
-            f"cluster_size={client_summary.cluster_size}",
-            f"clients=({client_summary.request_mode},{client_summary.request_mode_value})",
-            f"\nbatch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
-        ])
-        fig.suptitle(title, fontsize=16)
-        if save:
-            if relative:
-                fig.savefig(f"./logs/{experiment_directory}/{run_directory}/{metric}_relative.svg", format="svg")
-            else:
-                fig.savefig(f"./logs/{experiment_directory}/{run_directory}/{metric}.svg", format="svg")
-        plt.show()
-        plt.close()
+    # # Create bar chart
+    # bar_labels = ("baseline", "metronome")
+    # legend_args = {"loc": "upper left", "ncols": 2, "fontsize": 12, "frameon": False}
+    # # legend_args = {"loc": "upper right", "ncols": 1, "fontsize": 12, "frameon": False}
+    # client_summary = summaries.iloc[0]
+    # for (metric, err) in [("request_latency_average", "request_latency_std_dev")]:
+    #     pivot_df = summaries.pivot_table(index='persist_label', columns='metronome_info', values=[metric, err])
+    #     # print(pivot_df)
+    #     relative_latency_df = pivot_df['request_latency_average'].div(
+    #         pivot_df['request_latency_average']['OmniPaxos'], axis=0
+    #     )
+    #     bar_group_labels = list(pivot_df.index)
+    #     bar_labels = pivot_df.columns.get_level_values('metronome_info').unique().values
+    #     latency_means = {}
+    #     for label in bar_labels:
+    #         if relative:
+    #             latency_means[label] = (relative_latency_df[label], None)
+    #         else:
+    #             latency_means[label] = (pivot_df[metric][label], pivot_df[err][label])
+    #     fig, ax = create_base_barchart(latency_means, bar_group_labels, legend_args, relative)
+    #     ax.set_xlabel("Data Size (bytes)", fontsize=16)
+    #     title = f"{metric}\n" + ", ".join([
+    #         f"cluster_size={client_summary.cluster_size}",
+    #         f"clients=({client_summary.request_mode},{client_summary.request_mode_value})",
+    #         f"\nbatch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
+    #     ])
+    #     fig.suptitle(title, fontsize=16)
+    #     if save:
+    #         os.makedirs(save_path, exist_ok=True)
+    #         if relative:
+    #             fig.savefig(f"{save_path}/{metric}_relative.svg", format="svg")
+    #         else:
+    #             fig.savefig(f"{save_path}/{metric}.svg", format="svg")
+    #     plt.show()
+    #     plt.close()
 
     nrows = 500_000
     skiprows = 100_000
@@ -349,11 +356,16 @@ def graph_closed_loop_experiment(relative:bool=False, save: bool=True):
         f"\nbatch_config=({client_summary['batch_info.type']},{client_summary['batch_info.value']})",
     ])
     plt.title(title)
-    plt.xticks(rotation=45)
-    plt.xlabel("Entry Size (bytes)")
-    plt.ylabel("Response Latency (ms)")
+    plt.legend(title=None, frameon=True)
+    plt.tick_params(axis='y', labelsize=12)
+    plt.tick_params(axis='x', labelsize=14)
+    plt.ylim(bottom=0, top=16)
+    plt.xlabel("Data Size (bytes)", fontsize=14)
+    plt.ylabel("Response Latency (ms)", fontsize=14)
+    plt.tight_layout()
     if save:
-        plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(f"./logs/to_show2/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
     plt.show()
     plt.close()
 
@@ -363,7 +375,8 @@ def graph_closed_loop_experiment(relative:bool=False, save: bool=True):
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
-            fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
+            os.makedirs(save_path, exist_ok=True)
+            fig.savefig(f"{save_path}/debug-{i}.png", format="png")
         # plt.show()
         plt.close()
     return
@@ -373,40 +386,41 @@ def graph_num_clients_latency_experiment(relative=False, save: bool=True):
     # Get experiment data
     experiment_directory = "/num-clients-latency-experiments"
     run_directory = "Opportunistic/5-node-cluster"
+    save_path = f"./logs/to_show2/{experiment_directory}/{run_directory}"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
 
     # # Add relative latency column
-    # baseline_latencies = summaries[summaries['metronome_info'] == 'Baseline'].set_index(['persist_info.value', 'num_clients'])['request_latency_average']
+    # baseline_latencies = summaries[summaries['metronome_info'] == 'OmniPaxos'].set_index(['persist_info.value', 'num_clients'])['request_latency_average']
     # def calculate_relative_latency(row):
-    #     if row['metronome_info'] == 'Baseline':
-    #         return 1.0  # Baseline relative latency is 1.0
+    #     if row['metronome_info'] == 'OmniPaxos':
+    #         return 1.0  # OmniPaxos relative latency is 1.0
     #     try:
     #         baseline_latency = baseline_latencies.loc[(row['persist_label'], row['num_clients'])]
     #         return row['request_latency_average'] / baseline_latency
     #     except KeyError:
-    #         return float('nan')  # Handle missing Baseline entries
+    #         return float('nan')  # Handle missing OmniPaxos entries
     # summaries['rel_latency'] = summaries.apply(calculate_relative_latency, axis=1)
     #
     # # Add relative throughput column
-    # baseline_latencies = summaries[summaries['metronome_info'] == 'Baseline'].set_index(['persist_info.value', 'num_clients'])['throughput']
+    # baseline_latencies = summaries[summaries['metronome_info'] == 'OmniPaxos'].set_index(['persist_info.value', 'num_clients'])['throughput']
     # def calculate_relative_latency(row):
-    #     if row['metronome_info'] == 'Baseline':
-    #         return 1.0  # Baseline relative latency is 1.0
+    #     if row['metronome_info'] == 'OmniPaxos':
+    #         return 1.0  # OmniPaxos relative latency is 1.0
     #     try:
     #         baseline_latency = baseline_latencies.loc[(row['persist_info.value'], row['num_clients'])]
     #         return row['throughput'] / baseline_latency
     #     except KeyError:
-    #         return float('nan')  # Handle missing Baseline entries
+    #         return float('nan')  # Handle missing OmniPaxos entries
     # summaries['rel_throughput'] = summaries.apply(calculate_relative_latency, axis=1)
 
     # Set up shared x-axis plot
     fig, axs = plt.subplots(3, 1, sharex=True, gridspec_kw={'height_ratios': [1, 1, 1]}, layout="constrained")
     fig.set_size_inches((12,9))
     axs[2].set_xlabel("Number of Clients", fontsize=14)
-    fig.suptitle("Closed Loop Clients vs. Average Request Latency", fontsize=16)
     # axs[0].set_xscale("log")  # Log scale for x-axis (if needed)
-    textures = {"Baseline": ("o", "-"), "Metronome": ("D", "--")}
     colors = {"256 B": plt.cm.tab10(0), "1 KiB": plt.cm.tab10(1), "0 B": plt.cm.tab10(2)}
+    markers = {"256 B": "o", "1 KiB": "D", "0 B": "s"}
+    textures = {"OmniPaxos": "--", "Metronome": "-"}
 
     # # Zoomed-in window
     # zoom_ax = inset_axes(axs[2], width="20%", height="50%", loc="upper left", bbox_to_anchor=(0.1, 0.01, 1, 1), bbox_transform=axs[2].transAxes)
@@ -436,27 +450,61 @@ def graph_num_clients_latency_experiment(relative=False, save: bool=True):
         throughput = group["throughput"]["mean"]
         entry_size = group["persist_info.value"]["first"]
         disk_throughput = (throughput * entry_size) / 1_000_000
-        if metronome != "Baseline":
+        if metronome != "OmniPaxos":
             disk_throughput *= critical_factor
-        label = f"Entry size: {entry_size_label}, {metronome}"
+        if entry_size_label == "0 B":
+            label = "In-memory"
+        else:
+            label = f"{entry_size_label}, {metronome}"
         color = colors[entry_size_label]
-        marker, linestyle = textures[metronome]
+        marker = markers[entry_size_label]
+        linestyle = textures[metronome]
+        y_offset = -12 if entry_size_label == "256 B" else 9
 
         axs[2].errorbar(num_clients, latency, std_dev, label=label, marker=marker, linestyle=linestyle, color=color, elinewidth=1, capsize=2, capthick=1)
+        for x, y in zip(num_clients, latency):
+            axs[2].annotate(
+                f"{y:.2f}",  # Format the value as needed
+                (x, y),  # Position at the marker
+                textcoords="offset points",  # Offset the text
+                xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+                ha='center',  # Center-align the text
+                fontsize=8,   # Adjust text size as needed
+                color=color
+            )
         # zoom_ax.plot(num_clients, latency, marker=marker, linestyle=linestyle, color=color)
         if relative:
             axs[1].plot(num_clients, rel_latency, label=label, marker=marker, linestyle=linestyle, color=color)
         else:
             axs[1].plot(num_clients, throughput, label=label, marker=marker, linestyle=linestyle, color=color)
+            for x, y in zip(num_clients, throughput):
+                axs[1].annotate(
+                    f"{y:.2f}",  # Format the value as needed
+                    (x, y),  # Position at the marker
+                    textcoords="offset points",  # Offset the text
+                    xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+                    ha='center',  # Center-align the text
+                    fontsize=8,   # Adjust text size as needed
+                    color=color
+                )
         axs[0].plot(num_clients, disk_throughput, label=label, marker=marker, linestyle=linestyle, color=color)
+        for x, y in zip(num_clients, disk_throughput):
+            axs[0].annotate(
+                f"{y:.2f}",  # Format the value as needed
+                (x, y),  # Position at the marker
+                textcoords="offset points",  # Offset the text
+                xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+                ha='center',  # Center-align the text
+                fontsize=8,   # Adjust text size as needed
+                color=color
+            )
         axs[2].fill_between(num_clients, latency - std_dev, latency + std_dev, alpha=0.2, color=color)
-
     axs[0].legend(
-        title="Configurations",
-        bbox_to_anchor=(0.5, 1.15),
+        bbox_to_anchor=(0.5, 1.10),
         loc='center',
         ncol=len(summaries.persist_label.unique()),
         fontsize=10,
+        frameon=False,
     )
     def format_ticks(x, pos):
         return f'{x/1000:.0f}k'  # Divide by 1000 and append 'k'
@@ -470,14 +518,16 @@ def graph_num_clients_latency_experiment(relative=False, save: bool=True):
     axs[1].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
     axs[0].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
     # fig.tight_layout()  # Adjust layout to fit legend
-    plt.show()
     if save:
-        fig.savefig(f"./logs/{experiment_directory}/{run_directory}/throughput-latency.svg", format="svg")
+        os.makedirs(save_path, exist_ok=True)
+        fig.savefig(f"{save_path}/throughput-latency-exact-numbers.svg", format="svg")
+    plt.show()
 
 def graph_open_loop_experiment(save: bool=True):
     # Get experiment data
     experiment_directory = "latency-throughput-experiment"
     run_directory = "5-node-cluster-File0"
+    save_path = f"./logs/to_show2/{experiment_directory}/{run_directory}"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
     throughput_data = summaries[['request_mode', 'metronome_info','throughput', 'request_latency_average', 'request_latency_std_dev']].sort_values(by=['throughput'])
     print(throughput_data)
@@ -502,12 +552,13 @@ def graph_open_loop_experiment(save: bool=True):
     ax.set_xlabel("Throughput", fontsize=14)
     ax.set_ylabel("Request Latency Average", fontsize=14)
     ax.set_title("Throughput vs. Request Latency Average", fontsize=16)
-    ax.legend()
+    ax.legend(frameon=False)
     ax.grid(True)
 
     plt.show()
     if save:
-        fig.savefig(f"./logs/{experiment_directory}/{run_directory}/throughput-latency.svg", format="svg")
+        os.makedirs(save_path, exist_ok=True)
+        fig.savefig(f"{save_path}/throughput-latency.svg", format="svg")
 
     # # Create debug plots
     # for i, (_, client_summary) in enumerate(summaries.iterrows()):
@@ -516,7 +567,8 @@ def graph_open_loop_experiment(save: bool=True):
     #     # client_log = client_log.iloc[-10_000:].reset_index(drop=True)
     #     fig = graph_experiment_debug(client_summary, client_log, server_logs)
     #     if save:
-    #         fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
+    #         os.makedirs(save_path, exist_ok=True)
+    #         fig.savefig(f"{save_path}/debug-{i}.png", format="png")
     return
 
 
@@ -552,10 +604,11 @@ def graph_metronome_size_experiment(save: bool=True):
     # Get experiment data
     experiment_directory = "metronome-size-experiments"
     run_directory = "Opportunistic/7-node-cluster"
+    save_path = f"./logs/to_show2/{experiment_directory}/{run_directory}"
     summaries = parse_clients_summaries(f"{experiment_directory}/{run_directory}")
     summaries = summaries.sort_values(by=['metronome_quorum_size']).reset_index()
     labels = [
-        str(size) if size is not None else "Baseline" 
+        str(size) if size is not None else "OmniPaxos" 
         for size in summaries["metronome_quorum_size"]
     ]
     unique_labels = set()
@@ -565,7 +618,7 @@ def graph_metronome_size_experiment(save: bool=True):
     ]
     latencies = summaries["request_latency_average"]
     std_dev = summaries["request_latency_std_dev"]
-    colors = ["tab:orange" if info != "Baseline" else "tab:blue" for info in labels]
+    colors = ["tab:orange" if info != "OmniPaxos" else "tab:blue" for info in labels]
 
     # Create bar chart
     plt.figure(figsize=(8, 5))
@@ -579,8 +632,8 @@ def graph_metronome_size_experiment(save: bool=True):
         linewidth=1.5
     )
     plt.bar_label(rects, fmt='%.2f', padding=3)
-    plt.xlabel("Metronome Quorum Size")
-    plt.ylabel("Average Request Latency (ms)")
+    plt.xlabel("Metronome Quorum Size", fontsize=14)
+    plt.ylabel("Average Request Latency (ms)", fontsize=14)
     client_summary = summaries.loc[0]
     title = f"Average Request Latency\n" + ", ".join([
         f"cluster_size={client_summary.cluster_size}",
@@ -589,10 +642,11 @@ def graph_metronome_size_experiment(save: bool=True):
         f"persist_config=({client_summary['persist_info.type']}, {client_summary.persist_label})",
     ])
     plt.title(title)
-    plt.legend()
+    plt.legend(frameon=False)
     plt.tight_layout()
     if save:
-        plt.savefig(f"./logs/{experiment_directory}/{run_directory}/request_latency.svg", format="svg")
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(f"{save_path}/request_latency.svg", format="svg")
     plt.show()
     plt.close()
 
@@ -620,11 +674,12 @@ def graph_metronome_size_experiment(save: bool=True):
         f"persist_config=({client_summary['persist_info.type']}, {client_summary.persist_label})",
     ])
     plt.title(title)
-    plt.xticks(rotation=45)
+    # plt.xticks(rotation=45)
     plt.xlabel("Metronome Quorum Size")
     plt.ylabel("Response Latency (ms)")
     if save:
-        plt.savefig(f"./logs/{experiment_directory}/{run_directory}/latency_distribution.svg", format="svg")
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(f"{save_path}/latency_distribution.svg", format="svg")
     plt.show()
     plt.close()
 
@@ -634,15 +689,16 @@ def graph_metronome_size_experiment(save: bool=True):
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
         fig = graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
-            fig.savefig(f"./logs/{experiment_directory}/{run_directory}/debug-{i}.png", format="png")
+            os.makedirs(save_path, exist_ok=True)
+            fig.savefig(f"{save_path}/debug-{i}.png", format="png")
         # plt.show()
         plt.close()
     return
 
 def main():
     # graph_local_experiment()
-    # graph_closed_loop_experiment()
-    graph_num_clients_latency_experiment()
+    graph_closed_loop_experiment(relative=False)
+    # graph_num_clients_latency_experiment()
     # graph_metronome_size_experiment()
     pass
 

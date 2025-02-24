@@ -2,8 +2,12 @@ import time
 from pathlib import Path
 
 from metronome_cluster import MetronomeClusterBuilder
-from metronome_configs import (BatchConfig, EndConditionConfig, PersistConfig,
-                               RequestModeConfig)
+from metronome_configs import (
+    BatchConfig,
+    EndConditionConfig,
+    PersistConfig,
+    RequestModeConfig,
+)
 
 
 def closed_loop_experiment(
@@ -13,7 +17,7 @@ def closed_loop_experiment(
     end_condition: EndConditionConfig,
 ):
     experiment_log_dir = Path(
-        f"./logs/closed-loop-experiments-{batch_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients"
+        f"./logs/straggler-closed-loop-experiments-{batch_config.to_label()}/{cluster_size}-node-cluster-{number_of_clients}-clients"
     )
     print(
         f"RUNNING CLOSED LOOP EXPERIMENT: {cluster_size=}, {end_condition=}, {number_of_clients=}"
@@ -30,11 +34,13 @@ def closed_loop_experiment(
         .persist_config(dummy_persist_config)
     )
     for i in range(1, cluster_size + 1):
+        machine_type = "e2-standard-2" if i == 3 else "e2-standard-8"
         cluster = cluster.add_server(
             i,
             "us-east1-b",
             instrumentation=False,
             rust_log="info",
+            machine_type=machine_type,
         )
     cluster = cluster.add_client(
         1,
@@ -46,8 +52,7 @@ def closed_loop_experiment(
     ).build()
 
     # Run experiments
-    # for data_size in [256, 1024]:
-    for data_size in [1024]:
+    for data_size in [256, 1024]:
         persist_config = PersistConfig.File(data_size)
         cluster.change_cluster_config(persist_config=persist_config)
         for metronome_config in ["Off", "RoundRobin2", "FastestFollower"]:
@@ -75,7 +80,7 @@ def num_clients_latency_experiment(
         f"-met-quorum-{metronome_quorum_size}" if metronome_quorum_size else ""
     )
     experiment_log_dir = Path(
-        f"./logs/num-clients-latency-experiments-HHD/{batch_config.to_label()}/{cluster_size}-node-cluster{metronome_quorum_size_label}"
+        f"./logs/num-clients-latency-experiments-HHD2/{batch_config.to_label()}/{cluster_size}-node-cluster{metronome_quorum_size_label}"
     )
     print(
         f"RUNNING NUM CLIENTS-LATENCY EXPERIMENT: {cluster_size=}, {end_condition=}, {batch_config=}"
@@ -215,21 +220,31 @@ def metronome_size_experiment(
 
 def main():
     # batch_config = BatchConfig.Every(100)
-    # end_condition = EndConditionConfig.SecondsPassed(1)
-    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
-
-    # batch_config = BatchConfig.Opportunistic()
     # end_condition = EndConditionConfig.SecondsPassed(60)
-    # closed_loop_experiment(cluster_size=5, number_of_clients=1000, batch_config=batch_config, end_condition=end_condition)
+    # closed_loop_experiment(
+    #     cluster_size=5,
+    #     number_of_clients=1000,
+    #     batch_config=batch_config,
+    #     end_condition=end_condition,
+    # )
 
     batch_config = BatchConfig.Opportunistic()
     end_condition = EndConditionConfig.SecondsPassed(60)
-    num_clients_latency_experiment(
-        num_runs=2,
+    closed_loop_experiment(
         cluster_size=5,
+        number_of_clients=1000,
         batch_config=batch_config,
         end_condition=end_condition,
     )
+
+    # batch_config = BatchConfig.Opportunistic()
+    # end_condition = EndConditionConfig.SecondsPassed(5)
+    # num_clients_latency_experiment(
+    #     num_runs=1,
+    #     cluster_size=5,
+    #     batch_config=batch_config,
+    #     end_condition=end_condition,
+    # )
 
     # batch_config = BatchConfig.Opportunistic()
     # end_condition = EndConditionConfig.SecondsPassed(60)
