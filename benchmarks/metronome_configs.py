@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, replace
 
 import toml
 
@@ -9,79 +9,16 @@ from gcp_cluster import InstanceConfig
 
 @dataclass(frozen=True)
 class ClusterConfig:
-    cluster_name: str
-    nodes: list[int]
-    metronome_config: str
-    batch_config: BatchConfig
-    persist_config: PersistConfig
+    metronome_cluster_config: MetronomeClusterConfig
     server_configs: dict[int, ServerConfig]
     client_configs: dict[int, ClientConfig]
-    initial_leader: int | None = None
-    metronome_quorum_size: int | None = None
-
-    def __post_init__(self):
-        self.validate()
-
-    # TODO: Validate that config won't cause deadlock due to parallel requests not reaching server batch io size
-    def validate(self):
-        if self.metronome_config not in [
-            "Off",
-            "RoundRobin",
-            "RoundRobin2",
-            "FastestFollower",
-        ]:
-            raise ValueError(
-                f"Invalid metronome_config: {self.metronome_config}. Expected one of ['Off', 'RoundRobin', 'RoundRobin2', 'FastestFollower']"
-            )
-
-        for client_id in self.client_configs.keys():
-            if client_id not in self.server_configs.keys():
-                raise ValueError(f"Client {client_id} has no server to connect to")
-
-        if self.initial_leader:
-            if self.initial_leader not in self.server_configs.keys():
-                raise ValueError(
-                    f"Initial leader {self.initial_leader} must be one of the server nodes"
-                )
-
-        if self.metronome_quorum_size is not None:
-            majority = len(self.server_configs) // 2 + 1
-            if self.metronome_quorum_size < majority:
-                raise ValueError(
-                    f"Metronome quorum size is {self.metronome_quorum_size}, but it can't be smaller than the majority ({majority})"
-                )
-
-        server_ids = sorted(self.server_configs.keys())
-        if self.nodes != server_ids:
-            raise ValueError(
-                f"Cluster nodes {self.nodes} must match defined server ids {server_ids}"
-            )
-
-    def with_updated(self, **kwargs) -> ClusterConfig:
-        new_config = replace(self, **kwargs)
-        new_config.validate()
-        return new_config
-
-
-@dataclass(frozen=True)
-class ServerConfig:
-    instance_config: InstanceConfig
-    server_id: int
-    instrumentation: bool
-    debug_filename: str
-    persist_log_filepath: str
-    rust_log: str = "info"
+    client_image: str
+    server_image: str
 
     @dataclass(frozen=True)
-    class MetronomeServerToml:
-        location: str
-        server_id: int
-        instrumentation: bool
-        debug_filename: str
-        persist_log_filepath: str
-        # Cluster-wide config
-        cluster_name: str
+    class MetronomeClusterConfig:
         nodes: list[int]
+        node_addrs: list[str]
         metronome_config: str
         batch_config: BatchConfig
         persist_config: PersistConfig
@@ -91,10 +28,78 @@ class ServerConfig:
     def __post_init__(self):
         self.validate()
 
+    # TODO: Validate that config won't cause deadlock due to parallel requests not reaching server batch io size
     def validate(self):
-        if self.server_id <= 0:
+        met_config = self.metronome_cluster_config
+        if met_config.metronome_config not in [
+            "Off",
+            "RoundRobin",
+            "RoundRobin2",
+            "FastestFollower",
+        ]:
             raise ValueError(
-                f"Invalid server_id: {self.server_id}. It must be greater than 0."
+                f"Invalid metronome_config: {met_config.metronome_config}. Expected one of ['Off', 'RoundRobin', 'RoundRobin2', 'FastestFollower']"
+            )
+
+        for client_id in self.client_configs.keys():
+            if client_id not in self.server_configs.keys():
+                raise ValueError(f"Client {client_id} has no server to connect to")
+
+        if met_config.initial_leader:
+            if met_config.initial_leader not in self.server_configs.keys():
+                raise ValueError(
+                    f"Initial leader {met_config.initial_leader} must be one of the server nodes"
+                )
+
+        if met_config.metronome_quorum_size is not None:
+            majority = len(self.server_configs) // 2 + 1
+            if met_config.metronome_quorum_size < majority:
+                raise ValueError(
+                    f"Metronome quorum size is {met_config.metronome_quorum_size}, but it can't be smaller than the majority ({majority})"
+                )
+
+        server_ids = sorted(self.server_configs.keys())
+        if met_config.nodes != server_ids:
+            raise ValueError(
+                f"Cluster nodes {met_config.nodes} must match defined server ids {server_ids}"
+            )
+
+    def update_metronome_config(self, **kwargs) -> ClusterConfig:
+        new_op_config = replace(self.metronome_cluster_config, **kwargs)
+        new_config = replace(self, metronome_cluster_config=new_op_config)
+        new_config.validate()
+        return new_config
+
+    def generate_cluster_toml(self) -> str:
+        cluster_toml_str = toml.dumps(asdict(self.metronome_cluster_config))
+        return cluster_toml_str
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    instance_config: InstanceConfig
+    metronome_server_config: MetronomeServerConfig
+    rust_log: str
+    server_address: str
+
+    @dataclass(frozen=True)
+    class MetronomeServerConfig:
+        location: str
+        server_id: int
+        listen_address: str
+        listen_port: int
+        instrumentation: bool
+        debug_filename: str
+        persist_log_filepath: str
+
+    def __post_init__(self):
+        self.validate()
+
+    def validate(self):
+        met_config = self.metronome_server_config
+        if met_config.server_id <= 0:
+            raise ValueError(
+                f"Invalid server_id: {met_config.server_id}. It must be greater than 0."
             )
 
         valid_rust_log_levels = ["error", "debug", "trace", "info", "warn"]
@@ -103,45 +108,28 @@ class ServerConfig:
                 f"Invalid rust_log level: {self.rust_log}. Expected one of {valid_rust_log_levels}."
             )
 
-    def with_updated(self, **kwargs) -> ServerConfig:
-        new_config = replace(self, **kwargs)
+    def update_metronome_config(self, **kwargs) -> ServerConfig:
+        new_op_config = replace(self.metronome_server_config, **kwargs)
+        new_config = replace(self, metronome_server_config=new_op_config)
+        new_config.validate()
         return new_config
 
-    def generate_server_toml(self, cluster_config: ClusterConfig) -> str:
-        server_toml = ServerConfig.MetronomeServerToml(
-            location=self.instance_config.zone,
-            server_id=self.server_id,
-            instrumentation=self.instrumentation,
-            debug_filename=self.debug_filename,
-            persist_log_filepath=self.persist_log_filepath,
-            cluster_name=cluster_config.cluster_name,
-            nodes=cluster_config.nodes,
-            metronome_config=cluster_config.metronome_config,
-            batch_config=cluster_config.batch_config,
-            persist_config=cluster_config.persist_config,
-            initial_leader=cluster_config.initial_leader,
-            metronome_quorum_size=cluster_config.metronome_quorum_size,
-        )
-        server_toml_str = toml.dumps(asdict(server_toml))
+    def generate_server_toml(self) -> str:
+        server_toml_str = toml.dumps(asdict(self.metronome_server_config))
         return server_toml_str
 
 
 @dataclass(frozen=True)
 class ClientConfig:
     instance_config: InstanceConfig
-    server_id: int
-    request_mode_config: RequestModeConfig
-    end_condition: EndConditionConfig
-    summary_filename: str
-    summary_only: bool
-    output_filename: str
+    metronome_client_config: MetronomeClientConfig
     rust_log: str = "info"
 
     @dataclass(frozen=True)
-    class MetronomeClientToml:
-        cluster_name: str
+    class MetronomeClientConfig:
         location: str
         server_id: int
+        server_address: str
         request_mode_config: RequestModeConfig
         end_condition: EndConditionConfig
         summary_filename: str
@@ -152,9 +140,10 @@ class ClientConfig:
         self.validate()
 
     def validate(self):
-        if self.server_id <= 0:
+        met_config = self.metronome_client_config
+        if met_config.server_id <= 0:
             raise ValueError(
-                f"Invalid server_id: {self.server_id}. It must be greater than 0."
+                f"Invalid server_id: {met_config.server_id}. It must be greater than 0."
             )
 
         valid_rust_log_levels = ["error", "debug", "trace", "info", "warn"]
@@ -163,19 +152,14 @@ class ClientConfig:
                 f"Invalid rust_log level: {self.rust_log}. Expected one of {valid_rust_log_levels}."
             )
 
-    def with_updated(self, **kwargs) -> ClientConfig:
-        new_config = replace(self, **kwargs)
+    def update_metronome_config(self, **kwargs) -> ClientConfig:
+        new_op_config = replace(self.metronome_client_config, **kwargs)
+        new_config = replace(self, metronome_client_config=new_op_config)
+        new_config.validate()
         return new_config
 
-    def generate_client_toml(self, cluster_config: ClusterConfig) -> str:
-        toml_fields = {f.name for f in fields(ClientConfig.MetronomeClientToml)}
-        shared_fields = {k: v for k, v in asdict(self).items() if k in toml_fields}
-        client_toml = ClientConfig.MetronomeClientToml(
-            cluster_name=cluster_config.cluster_name,
-            location=self.instance_config.zone,
-            **shared_fields,
-        )
-        client_toml_str = toml.dumps(asdict(client_toml))
+    def generate_client_toml(self) -> str:
+        client_toml_str = toml.dumps(asdict(self.metronome_client_config))
         return client_toml_str
 
 
