@@ -46,6 +46,7 @@ pub mod messages {
         pub metronome_quorum_size: Option<usize>,
         pub batch_info: BatchInfo,
         pub persist_info: PersistInfo,
+        pub worksteal_flag: bool,
         pub instrumented: bool,
     }
 

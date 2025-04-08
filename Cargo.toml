@@ -12,10 +12,10 @@ serde_json = "1.0.111"
 tokio = { version = "1.35.1", features = ["full"] }
 tokio-serde = { version = "0.8.0", features = ["bincode"] }
 tokio-util = { version = "0.7.10", features = ["codec"] }
-# omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch", features = ["serde", "toml_config"] }
-# omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git", branch = "metronome-nobatch" }
-omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide", features = ["serde", "toml_config"] }
-omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-nodecide" }
+omnipaxos = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-worksteal-flush", features = ["serde", "toml_config"] }
+omnipaxos_storage = { git = "https://github.com/kevin-harrison/omnipaxos.git", branch = "metronome-worksteal-flush" }
+# omnipaxos = { path = "../omnipaxos/omnipaxos/",features = ["serde", "toml_config"] }
+# omnipaxos_storage = { path = "../omnipaxos/omnipaxos_storage/" }
 tempfile = "3.13.0"
 chrono = "0.4.38"
 csv = "1.3.0"

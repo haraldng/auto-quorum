@@ -7,8 +7,8 @@ output_filename = "./logs/client-1.csv"
 
 [request_mode_config]
 request_mode_config_type = "ClosedLoop"
-request_mode_config_value = 20
+request_mode_config_value = 100
 
 [end_condition]
-end_condition_type = "ResponsesCollected"
-end_condition_value = 1000
+end_condition_type = "SecondsPassed"
+end_condition_value = 5

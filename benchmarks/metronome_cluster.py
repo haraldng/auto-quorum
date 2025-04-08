@@ -58,7 +58,8 @@ class MetronomeCluster:
         )
         if clients_finished:
             self._gcp_ssh_client.clear_processes(client_process_ids)
-            self._gcp_ssh_client.stop_processes(server_process_ids)
+            # TODO: uncomment
+            # self._gcp_ssh_client.stop_processes(server_process_ids)
         else:
             self._gcp_ssh_client.stop_processes(server_process_ids + client_process_ids)
         time.sleep(2)
@@ -196,6 +197,7 @@ class MetronomeClusterBuilder:
         self._metronome_config: str = "Off"
         self._batch_config: BatchConfig | None = None
         self._persist_config: PersistConfig | None = None
+        self._worksteal_flag: bool = False
         self._metronome_quorum_size: int | None = None
         self._flexible_quorum: tuple[int, int] | None = None
         self._initial_leader: int | None = None
@@ -298,6 +300,10 @@ class MetronomeClusterBuilder:
         self._persist_config = persist_config
         return self
 
+    def worksteal_flag(self, flag: bool):
+        self._worksteal_flag = flag
+        return self
+
     def initial_leader(self, initial_leader: int):
         self._initial_leader = initial_leader
         return self
@@ -330,6 +336,7 @@ class MetronomeClusterBuilder:
                 metronome_config=self._metronome_config,
                 batch_config=self._batch_config,
                 persist_config=self._persist_config,
+                worksteal_flag=self._worksteal_flag,
                 initial_leader=self._initial_leader,
                 metronome_quorum_size=self._metronome_quorum_size,
             ),

@@ -22,6 +22,7 @@ class ClusterConfig:
         metronome_config: str
         batch_config: BatchConfig
         persist_config: PersistConfig
+        worksteal_flag: bool
         initial_leader: int | None = None
         metronome_quorum_size: int | None = None
 

@@ -17,6 +17,7 @@ pub struct ClusterConfig {
     pub metronome_config: MetronomeSetting,
     pub batch_config: BatchConfig,
     pub persist_config: PersistConfig,
+    pub worksteal_flag: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -96,6 +97,7 @@ impl Into<MetronomeConfigInfo> for MetronomeConfig {
             metronome_quorum_size: self.cluster.metronome_quorum_size,
             batch_info,
             persist_info,
+            worksteal_flag: self.cluster.worksteal_flag,
             instrumented: self.server.instrumentation,
         }
     }

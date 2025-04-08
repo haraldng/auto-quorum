@@ -117,6 +117,9 @@ impl MetronomeServer {
                 .await;
         }
         // Main event loop
+        let worksteal_period = Duration::from_millis(100);
+        let mut worksteal_interval = tokio::time::interval(worksteal_period);
+        worksteal_interval.tick().await;
         loop {
             let done_signal = tokio::select! {
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
@@ -125,6 +128,10 @@ impl MetronomeServer {
                 _ = self.network.client_messages.recv_many(&mut client_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(&mut client_msg_buffer).await
                 },
+                _ = worksteal_interval.tick(), if self.config.cluster.worksteal_flag => {
+                    self.handle_worksteal().await;
+                    false
+                }
             };
             if done_signal {
                 break;
@@ -180,7 +187,7 @@ impl MetronomeServer {
                     self.id, ballot
                 );
                 self.omnipaxos.initialize_prepare_phase(ballot);
-                self.send_outgoing_msgs().await;
+                self.send_outgoing_msgs(false).await;
             }
         }
     }
@@ -208,7 +215,7 @@ impl MetronomeServer {
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs().await;
+        self.send_outgoing_msgs(false).await;
         return false;
     }
 
@@ -254,8 +261,13 @@ impl MetronomeServer {
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs().await;
+        self.send_outgoing_msgs(false).await;
         return false;
+    }
+
+    async fn handle_worksteal(&mut self) {
+        self.omnipaxos.steal_pending_accepts();
+        self.send_outgoing_msgs(true).await;
     }
 
     async fn handle_decided_entries(&mut self) {
@@ -310,17 +322,24 @@ impl MetronomeServer {
             .expect("Append should never fail since we never reconfig");
     }
 
-    async fn send_outgoing_msgs(&mut self) {
+    async fn send_outgoing_msgs(&mut self, worksteal: bool) {
         if self.id == self.initial_leader {
-            self.send_outgoing_msgs_leader().await;
+            self.send_outgoing_msgs_leader(worksteal).await;
         } else {
-            self.send_outgoing_msgs_follower().await;
+            self.send_outgoing_msgs_follower(worksteal).await;
         }
     }
 
     // Metronome leader functions as in normal Omnipaxos
-    async fn send_outgoing_msgs_leader(&mut self) {
+    async fn send_outgoing_msgs_leader(&mut self, worksteal: bool) {
         let messages = self.omnipaxos.outgoing_messages();
+        if worksteal {
+            info!(
+                "{}: Sending {} messages on worksteal call.",
+                self.id,
+                messages.len(),
+            );
+        }
         self.instrument_accdec(&messages);
         for msg in messages {
             let to = msg.get_receiver();
@@ -330,15 +349,29 @@ impl MetronomeServer {
     }
 
     // Metronome acceptors handle accepted messages differently
-    async fn send_outgoing_msgs_follower(&mut self) {
+    async fn send_outgoing_msgs_follower(&mut self, worksteal: bool) {
         let messages = self.omnipaxos.outgoing_messages();
+        let num_messages = messages.len();
+        let mut total_flush = 0;
         for msg in messages {
             if let Some(to_flush) = msg.get_accepted_slots() {
+                total_flush += to_flush.len();
                 self.emulate_disk_flush(to_flush);
             }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network.send_to_cluster(to, cluster_msg).await;
+        }
+        if worksteal {
+            info!(
+                "{}: Sending {num_messages} messages with {total_flush} entries on worksteal call.",
+                self.id
+            );
+        } else {
+            // info!(
+            //     "{}: Sending {num_messages} messages with {total_flush} entries.",
+            //     self.id
+            // );
         }
     }
 
