@@ -3,6 +3,7 @@ use crate::{
     data_collection::ClientData,
     network::Network,
 };
+use futures::future::{pending, Either};
 use futures::StreamExt;
 use log::*;
 use metronome::common::{kv::*, messages::*};
@@ -53,7 +54,14 @@ impl ClosedLoopClient {
         // Send requests and collect responses
         match self.end_condition {
             EndCondition::ResponsesCollected(n) => self.run_until_response_limit(n).await,
-            EndCondition::TimePassed(t) => self.run_until_duration_limit(t).await,
+            EndCondition::TimePassed(t) => {
+                self.run_until_duration_limit(
+                    t,
+                    self.config.send_disable_config,
+                    self.config.send_disable_command.clone(),
+                )
+                .await
+            }
         }
         self.client_data.experiment_end();
         info!(
@@ -97,10 +105,24 @@ impl ClosedLoopClient {
     }
 
     // Send new requests on reponse until duration_limit time has passed
-    async fn run_until_duration_limit(&mut self, duration_limit: Duration) {
+    async fn run_until_duration_limit(
+        &mut self,
+        duration_limit: Duration,
+        send_disable: Option<u64>,
+        disable_command: Option<String>,
+    ) {
         let mut end_duration = tokio::time::interval(duration_limit);
         end_duration.tick().await; // First tick resolves immediately
+        let mut disable_interval =
+            send_disable.map(|ms| tokio::time::interval(Duration::from_millis(ms)));
+        if let Some(ref mut timer) = disable_interval {
+            timer.tick().await;
+        }
         loop {
+            let disable_future = match disable_interval {
+                Some(ref mut timer) => Either::Left(timer.tick()),
+                None => Either::Right(pending()),
+            };
             tokio::select! {
                 biased;
                 incoming_message = self.network.next() => {
@@ -118,7 +140,14 @@ impl ClosedLoopClient {
                         None => panic!("Connection to server lost before end condition"),
                     }
                 },
-                _ = end_duration.tick() => break,
+                _ = disable_future => {
+                    info!("Sending disable server 3 to leader");
+                    self.network.send(ClientMessage::Disable(3, disable_command.clone().unwrap()));
+                }
+                _ = end_duration.tick() => {
+                    info!("End duration reached");
+                    break
+                },
             }
         }
     }

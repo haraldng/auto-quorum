@@ -10,6 +10,8 @@ pub struct ClientConfig {
     pub server_address: String,
     pub request_mode_config: RequestModeConfig,
     pub end_condition: EndConditionConfig,
+    pub send_disable_config: Option<u64>,
+    pub send_disable_command: Option<String>,
     pub summary_filename: String,
     pub summary_only: bool,
     pub output_filename: String,

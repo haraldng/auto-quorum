@@ -12,6 +12,7 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
+        Disable(NodeId, String),
         Done,
     }
 
@@ -26,6 +27,7 @@ pub mod messages {
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
         BatchAppend(Vec<(CommandId, KVCommand)>),
+        Disable(NodeId, String),
         Done,
     }
 
@@ -46,7 +48,8 @@ pub mod messages {
         pub metronome_quorum_size: Option<usize>,
         pub batch_info: BatchInfo,
         pub persist_info: PersistInfo,
-        pub worksteal_flag: bool,
+        pub worksteal_ms: Option<u64>,
+        pub straggler: Option<NodeId>,
         pub instrumented: bool,
     }
 
@@ -65,29 +68,13 @@ pub mod messages {
 }
 
 pub mod utils {
-    use super::{kv::NodeId, messages::*};
-    use std::net::{SocketAddr, ToSocketAddrs};
+    use super::messages::*;
     use tokio::net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
     };
     use tokio_serde::{formats::Bincode, Framed};
     use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
-
-    pub fn get_node_addr(
-        cluster_name: &String,
-        node: NodeId,
-        is_local: bool,
-    ) -> Result<SocketAddr, std::io::Error> {
-        let dns_name = if is_local {
-            // format!("s{node}:800{node}")
-            format!("localhost:800{node}")
-        } else {
-            format!("{cluster_name}-server-{node}.internal.zone.:800{node}")
-        };
-        let address = dns_name.to_socket_addrs()?.next().unwrap();
-        Ok(address)
-    }
 
     pub type RegistrationConnection = Framed<
         CodecFramed<TcpStream, LengthDelimitedCodec>,

@@ -14,6 +14,7 @@ class InstanceConfig:
     zone: str
     machine_type: str
     startup_script: str
+    disk_type: str = "pd-balanced"
     custom_metadata: Optional[dict] = None
     firewall_tag: Optional[str] = None
     dns_name: Optional[str] = None
@@ -26,6 +27,9 @@ class InstanceConfig:
             return False
         if instance.machine_type != self.machine_type:
             return False
+        # TODO: detect disk changes
+        # if instance.disks[0].initialize_params != self.disk_type:
+        #     return False
         # TODO: detect tag changes
         # if self.firewall_tag is not None and not self.firewall_tag in instance.tags:
         #     return False
@@ -241,7 +245,7 @@ Run: gcloud dns managed-zones create internal-network \\
             auto_delete=True,
             initialize_params=types.AttachedDiskInitializeParams(
                 disk_size_gb=10,
-                disk_type=f"zones/{instance_config.zone}/diskTypes/pd-balanced",
+                disk_type=f"zones/{instance_config.zone}/diskTypes/{instance_config.disk_type}",
                 # Minimal OS optimized for running Docker containers
                 source_image="projects/cos-cloud/global/images/family/cos-stable",
                 # source_image="projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts",

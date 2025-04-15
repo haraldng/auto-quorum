@@ -1,6 +1,6 @@
 use futures::{SinkExt, Stream, StreamExt};
 use log::*;
-use metronome::common::{kv::NodeId, messages::*, utils::*};
+use metronome::common::{messages::*, utils::*};
 use std::{
     net::{SocketAddr, ToSocketAddrs},
     pin::Pin,
@@ -55,17 +55,6 @@ impl Network {
             writer_stop_signal: Some(stop_signal_tx),
             incoming_messages: incoming_message_rx,
             outgoing_messages: outgoing_message_tx,
-        }
-    }
-
-    fn get_server_address(
-        cluster_name: &String,
-        server_id: NodeId,
-        local_deployment: bool,
-    ) -> SocketAddr {
-        match get_node_addr(cluster_name, server_id, local_deployment) {
-            Ok(address) => address,
-            Err(e) => panic!("Couldn't resolve server's DNS name: {e}"),
         }
     }
 

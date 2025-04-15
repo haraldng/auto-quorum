@@ -1,8 +1,9 @@
 nodes = [1, 2, 3, 4, 5]
 node_addrs = ["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003", "127.0.0.1:8004", "127.0.0.1:8005"]
 initial_leader = 1
-worksteal_flag = true
-#metronome_quorum_size = 3
+#worksteal_ms = 100
+#straggler = 3
+# metronome_quorum_size = 4
 
 metronome_config = "RoundRobin2"
 

@@ -197,7 +197,8 @@ class MetronomeClusterBuilder:
         self._metronome_config: str = "Off"
         self._batch_config: BatchConfig | None = None
         self._persist_config: PersistConfig | None = None
-        self._worksteal_flag: bool = False
+        self._worksteal_ms: int | None = None
+        self._stragglers: list[int] = []
         self._metronome_quorum_size: int | None = None
         self._flexible_quorum: tuple[int, int] | None = None
         self._initial_leader: int | None = None
@@ -209,11 +210,15 @@ class MetronomeClusterBuilder:
         zone: str,
         machine_type: str = "e2-standard-8",
         instrumentation: bool = False,
+        straggler: bool = False,
         rust_log: str = "info",
     ):
         if server_id in self._server_configs.keys():
             raise ValueError(f"Server {server_id} already exists")
         instance_name = f"user-{self._gcloud_oslogin_uid}-cluster-{self.cluster_id}-server-{server_id}"
+        disk_type = "pd-standard" if straggler else "pd-balanced"
+        if straggler:
+            self._stragglers.append(server_id)
         instance_config = InstanceConfig(
             name=instance_name,
             zone=zone,
@@ -226,6 +231,7 @@ class MetronomeClusterBuilder:
             },
             dns_name=instance_name,
             service_account=self._service_account,
+            disk_type=disk_type,
         )
         server_address = (
             f"{instance_config.dns_name}.internal.zone.:{self._server_port}"
@@ -253,6 +259,8 @@ class MetronomeClusterBuilder:
         zone: str,
         request_mode_config: RequestModeConfig,
         end_condition: EndConditionConfig,
+        send_disable: int | None = None,
+        send_disable_command: str | None = None,
         machine_type: str = "e2-standard-4",
         rust_log: str = "info",
         summary_only: bool = False,
@@ -279,6 +287,8 @@ class MetronomeClusterBuilder:
                 server_address="",
                 request_mode_config=request_mode_config,
                 end_condition=end_condition,
+                send_disable_config=send_disable,
+                send_disable_command=send_disable_command,
                 summary_only=summary_only,
                 summary_filename=f"client-{server_id}.json",
                 output_filename=f"client-{server_id}.csv",
@@ -300,8 +310,8 @@ class MetronomeClusterBuilder:
         self._persist_config = persist_config
         return self
 
-    def worksteal_flag(self, flag: bool):
-        self._worksteal_flag = flag
+    def worksteal_ms(self, milliseconds: int):
+        self._worksteal_ms = milliseconds
         return self
 
     def initial_leader(self, initial_leader: int):
@@ -329,6 +339,11 @@ class MetronomeClusterBuilder:
         node_addrs = list(
             map(lambda id: self._server_configs[id].server_address, nodes)
         )
+        if len(self._stragglers) > 0:
+            straggler = self._stragglers[0]
+        else:
+            straggler = None
+        assert len(self._stragglers) <= 1, "Multiple straggler unimplemented"
         cluster_config = ClusterConfig(
             metronome_cluster_config=ClusterConfig.MetronomeClusterConfig(
                 nodes=nodes,
@@ -336,7 +351,8 @@ class MetronomeClusterBuilder:
                 metronome_config=self._metronome_config,
                 batch_config=self._batch_config,
                 persist_config=self._persist_config,
-                worksteal_flag=self._worksteal_flag,
+                worksteal_ms=self._worksteal_ms,
+                straggler=straggler,
                 initial_leader=self._initial_leader,
                 metronome_quorum_size=self._metronome_quorum_size,
             ),

@@ -4,6 +4,8 @@ server_address = "127.0.0.1:8001"
 summary_only = false
 summary_filename = "./logs/client-1.json"
 output_filename = "./logs/client-1.csv"
+send_disable_config = 3000
+send_disable_command = "BiggerQuorum"
 
 [request_mode_config]
 request_mode_config_type = "ClosedLoop"

@@ -196,7 +196,7 @@ def metronome_size_debug_plots(
     for i, (_, client_summary) in enumerate(summaries.iterrows()):
         client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
-        fig = graph_experiment_debug(client_summary, client_log, server_logs)
+        graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
             save_filename = f"debug/debug-{i}.png"
             save_metronome_size_plot(save_filename, format="png")

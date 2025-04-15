@@ -25,9 +25,15 @@ def parse_clients_summaries(experiment_dir: Path) -> pd.DataFrame:
         "RoundRobin2": "Metronome",
         "FastestFollower": "Metronome-WS",
     }
+
+    # for backwards compatibility
+    if "worksteal_flag" in df.columns:
+        df.rename(columns={"worksteal_flag": "worksteal_ms"}, inplace=True)
+        df["worksteal_ms"] = np.nan
+
     df["metronome_info"] = df["metronome_info"].map(category_mapping)
     worksteal_mask = (df["metronome_info"] == "Metronome") & (
-        df["worksteal_flag"].fillna(False)
+        df["worksteal_ms"].fillna(False)
     )
     df.loc[worksteal_mask, "metronome_info"] = "Metronome-WS-new"
     df["metronome_info"] = pd.Categorical(
@@ -42,7 +48,6 @@ def parse_clients_summaries(experiment_dir: Path) -> pd.DataFrame:
         ordered=True,
     )
     pd.set_option("display.max_colwidth", None)
-    print(df[["file", "metronome_info", "worksteal_flag"]])
     df = df.sort_values(by=["persist_info.value", "metronome_info"]).reset_index()
     # Ensure the file entry_size column is treated as a Categorical variable, ordered by size
     df["persist_label"] = df["persist_info.value"].apply(format_bytes)
@@ -272,8 +277,6 @@ def graph_experiment_debug(
         graph_acceptor_queue_subplot(axs[1], client_summary, server_logs)
         # graph_persist_latency_subplot(axs[2], client_summary, server_logs)
         graph_average_persist_latency_subplot(axs[2], client_summary, server_logs)
-        plt.show()
-        return fig
 
 
 def graph_request_latency_subplot(
@@ -396,18 +399,6 @@ def graph_average_persist_latency_subplot(
     fig.set_ylabel("Persist latency (us)")
 
 
-def graph_local_experiment():
-    # Get experiment data
-    experiment_directory = "local-experiments"
-    df = parse_clients_summaries(experiment_directory)
-    for i, (_, client_summary) in enumerate(df.iterrows()):
-        client_log = parse_client_log(client_summary)
-        server_logs = parse_server_logs(client_summary)
-        fig = graph_experiment_debug(client_summary, client_log, server_logs)
-        plt.show()
-        fig.savefig(f"./logs/{experiment_directory}/debug-{i}.svg", format="svg")
-
-
 def graph_open_loop_experiment(save: bool = True):
     # Get experiment data
     experiment_directory = "latency-throughput-experiment"
@@ -423,7 +414,6 @@ def graph_open_loop_experiment(save: bool = True):
             "request_latency_std_dev",
         ]
     ].sort_values(by=["throughput"])
-    print(throughput_data)
     # throughput_data.to_csv(f"./logs/{experiment_directory}/{run_directory}/data.csv")
 
     # Separate data by 'metronome_info' for different lines

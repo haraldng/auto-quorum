@@ -15,7 +15,7 @@ from graphs.base_graphs import (
     parse_server_logs,
 )
 
-STRAGGLER_DIR: Path = LOGS_DIR / "straggler-experiment" / "Every100"
+STRAGGLER_DIR: Path = LOGS_DIR / "straggler-experiment" / "Opportunistic"
 STRAGGLER_SAVE_DIR: Path = SAVE_DIR / "straggler-experiment"
 
 
@@ -41,9 +41,10 @@ def straggler_bar_chart(relative: bool = False, save: bool = True):
             index="persist_label", columns="metronome_info", values=[metric, err]
         )
         # print(pivot_df)
-        relative_latency_df = pivot_df["request_latency_average"].div(
-            pivot_df["request_latency_average"]["OmniPaxos"], axis=0
-        )
+        if relative:
+            relative_latency_df = pivot_df["request_latency_average"].div(
+                pivot_df["request_latency_average"]["OmniPaxos"], axis=0
+            )
         bar_group_labels = list(pivot_df.index)
         bar_labels = pivot_df.columns.get_level_values("metronome_info").unique().values
         latency_means = {}
@@ -124,7 +125,7 @@ def straggler_debug_plots(nrows: int, skiprows: int, save: bool = True):
     for i, (_, client_summary) in enumerate(summaries.iterrows()):
         client_log = parse_client_log(client_summary, nrows=nrows, skiprows=skiprows)
         server_logs = parse_server_logs(client_summary, nrows=nrows, skiprows=skiprows)
-        fig = graph_experiment_debug(client_summary, client_log, server_logs)
+        graph_experiment_debug(client_summary, client_log, server_logs)
         if save:
             save_filename = f"debug/debug-{i}.png"
             save_straggler_plot(save_filename, format="png")

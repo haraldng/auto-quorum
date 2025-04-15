@@ -17,7 +17,8 @@ pub struct ClusterConfig {
     pub metronome_config: MetronomeSetting,
     pub batch_config: BatchConfig,
     pub persist_config: PersistConfig,
-    pub worksteal_flag: bool,
+    pub worksteal_ms: Option<u64>,
+    pub straggler: Option<NodeId>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -56,10 +57,14 @@ pub enum BatchConfig {
 
 impl Into<OmniPaxosConfig> for MetronomeConfig {
     fn into(self) -> OmniPaxosConfig {
-        let batch_setting = match self.cluster.batch_config {
-            BatchConfig::Individual => BatchSetting::Individual,
-            BatchConfig::Every(n) => BatchSetting::Every(n),
-            BatchConfig::Opportunistic => BatchSetting::Opportunistic,
+        let im_straggler = Some(self.server.server_id) == self.cluster.straggler;
+        let batch_setting = match (self.cluster.batch_config, im_straggler) {
+            (BatchConfig::Individual, _) => BatchSetting::Individual,
+            (BatchConfig::Opportunistic, false) => BatchSetting::Opportunistic,
+            // TODO: dont hard code?
+            (BatchConfig::Opportunistic, true) => BatchSetting::Every(10),
+            (BatchConfig::Every(n), false) => BatchSetting::Every(n),
+            (BatchConfig::Every(n), true) => BatchSetting::Every(n / 3),
         };
         let cluster_config = OmnipaxosClusterConfig {
             configuration_id: 1,
@@ -97,7 +102,8 @@ impl Into<MetronomeConfigInfo> for MetronomeConfig {
             metronome_quorum_size: self.cluster.metronome_quorum_size,
             batch_info,
             persist_info,
-            worksteal_flag: self.cluster.worksteal_flag,
+            worksteal_ms: self.cluster.worksteal_ms,
+            straggler: self.cluster.straggler,
             instrumented: self.server.instrumentation,
         }
     }

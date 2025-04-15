@@ -22,7 +22,8 @@ class ClusterConfig:
         metronome_config: str
         batch_config: BatchConfig
         persist_config: PersistConfig
-        worksteal_flag: bool
+        worksteal_ms: int | None = None
+        straggler: int | None = None
         initial_leader: int | None = None
         metronome_quorum_size: int | None = None
 
@@ -133,6 +134,8 @@ class ClientConfig:
         server_address: str
         request_mode_config: RequestModeConfig
         end_condition: EndConditionConfig
+        send_disable_config: int | None
+        send_disable_command: str | None
         summary_filename: str
         summary_only: bool
         output_filename: str

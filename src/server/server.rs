@@ -2,6 +2,7 @@ use crate::{configs::*, database::Database, network::Network};
 use chrono::Utc;
 use core::panic;
 use csv::Writer;
+use futures::future::{pending, Either};
 use log::*;
 use metronome::common::{kv::*, messages::*};
 use omnipaxos::{
@@ -17,6 +18,7 @@ use omnipaxos::{
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use serde::Serialize;
 use std::{fs::File, os::unix::fs::FileExt, time::Duration};
+use tokio::time::interval;
 
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const INITIAL_LOG_CAPACITY: usize = 10_000_000;
@@ -61,9 +63,10 @@ pub struct MetronomeServer {
     omnipaxos: OmniPaxosInstance,
     initial_leader: NodeId,
     persist_strat: PersistStrategy,
-    decided_slots_buffer: Vec<usize>,
+    decided_idx: usize,
     instrumentation_data: Option<InstrumentationData>,
     config: MetronomeConfig,
+    enabled: bool,
 }
 
 impl MetronomeServer {
@@ -103,9 +106,10 @@ impl MetronomeServer {
             omnipaxos,
             initial_leader,
             persist_strat,
-            decided_slots_buffer: Vec::with_capacity(1000),
+            decided_idx: 0,
             instrumentation_data,
             config,
+            enabled: true,
         }
     }
 
@@ -117,10 +121,19 @@ impl MetronomeServer {
                 .await;
         }
         // Main event loop
-        let worksteal_period = Duration::from_millis(100);
-        let mut worksteal_interval = tokio::time::interval(worksteal_period);
-        worksteal_interval.tick().await;
+        let mut worksteal_interval = self
+            .config
+            .cluster
+            .worksteal_ms
+            .map(|millis| interval(Duration::from_millis(millis)));
+        if let Some(ref mut timer) = worksteal_interval {
+            timer.tick().await;
+        }
         loop {
+            let worksteal_future = match worksteal_interval {
+                Some(ref mut timer) => Either::Left(timer.tick()),
+                None => Either::Right(pending()),
+            };
             let done_signal = tokio::select! {
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buffer).await
@@ -128,7 +141,7 @@ impl MetronomeServer {
                 _ = self.network.client_messages.recv_many(&mut client_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(&mut client_msg_buffer).await
                 },
-                _ = worksteal_interval.tick(), if self.config.cluster.worksteal_flag => {
+                _ = worksteal_future => {
                     self.handle_worksteal().await;
                     false
                 }
@@ -146,10 +159,11 @@ impl MetronomeServer {
         client_msg_buffer: &mut Vec<(ClientId, ClientMessage, TimeStamp)>,
     ) {
         let mut leader_attempt = 0;
-        let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
+        let mut leader_takeover_interval = interval(LEADER_WAIT);
         loop {
             tokio::select! {
                 // Ensures cluster is connected and leader is promoted before client starts sending
+
                 // requests.
                 _ = leader_takeover_interval.tick() => {
                     self.take_leadership(&mut leader_attempt).await;
@@ -187,7 +201,7 @@ impl MetronomeServer {
                     self.id, ballot
                 );
                 self.omnipaxos.initialize_prepare_phase(ballot);
-                self.send_outgoing_msgs(false).await;
+                self.send_outgoing_msgs().await;
             }
         }
     }
@@ -196,8 +210,29 @@ impl MetronomeServer {
         for (message, net_recv_time) in messages.drain(..) {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
-                    self.instrument_incoming_paxos_message(&m, net_recv_time);
-                    self.omnipaxos.handle_incoming(m);
+                    if self.enabled {
+                        self.instrument_incoming_paxos_message(&m, net_recv_time);
+                        self.omnipaxos.handle_incoming(m);
+                    }
+                }
+                ClusterMessage::Disable(server_id, command) => {
+                    info!(
+                        "{}: Received Disable {server_id} signal from leader",
+                        self.id
+                    );
+                    if server_id == self.id {
+                        self.enabled = false;
+                    } else {
+                        // TODO: BiggerQuorum doesn't work
+                        // if command.as_str() == "BiggerQuorum" {
+                        //     self.omnipaxos.steal_pending_accepts(1);
+                        //     self.omnipaxos.steal_pending_accepts(2);
+                        //     self.omnipaxos.steal_pending_accepts(3);
+                        //     self.omnipaxos.steal_pending_accepts(4);
+                        //     self.omnipaxos.steal_pending_accepts(5);
+                        // }
+                        self.omnipaxos.change_metronome_setting(command);
+                    }
                 }
                 ClusterMessage::Done => {
                     info!("{}: Received Done signal from leader", self.id);
@@ -215,7 +250,7 @@ impl MetronomeServer {
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs(false).await;
+        self.send_outgoing_msgs().await;
         return false;
     }
 
@@ -241,6 +276,19 @@ impl MetronomeServer {
                         self.commit_command_to_log(client_id, command_id, kv_command);
                     }
                 }
+                (_, ClientMessage::Disable(server_id, command), _) => {
+                    if server_id == self.id {
+                        panic!("Leader shouldn't disable");
+                    }
+                    for peer in &self.peers {
+                        self.network
+                            .send_to_cluster(
+                                *peer,
+                                ClusterMessage::Disable(server_id, command.clone()),
+                            )
+                            .await;
+                    }
+                }
                 (_, ClientMessage::Done, _) => {
                     info!("{}: Received Done signal from client", self.id);
                     let done_msg = ClusterMessage::Done;
@@ -261,35 +309,36 @@ impl MetronomeServer {
         }
         // To minimize latency, rather than send outgoing messages on a timer, just check for any
         // outgoing whenever we could have updated the state of Omnipaxos.
-        self.send_outgoing_msgs(false).await;
+        self.send_outgoing_msgs().await;
         return false;
     }
 
     async fn handle_worksteal(&mut self) {
-        self.omnipaxos.steal_pending_accepts();
-        self.send_outgoing_msgs(true).await;
+        let straggler = self.config.cluster.straggler.unwrap();
+        self.omnipaxos.steal_pending_accepts(straggler);
+        self.send_outgoing_msgs().await;
     }
 
     async fn handle_decided_entries(&mut self) {
-        self.omnipaxos
-            .take_decided_slots_since_last_call(&mut self.decided_slots_buffer);
-        if let Some(data) = &mut self.instrumentation_data {
-            for slot in &self.decided_slots_buffer {
-                data.commited(*slot);
+        let new_decided_idx = self.omnipaxos.get_decided_idx();
+        if new_decided_idx == self.decided_idx {
+            // No new decided entries
+            return;
+        }
+        // Compact old entries
+        let in_mem_log_length = new_decided_idx - self.omnipaxos.get_compacted_idx();
+        if in_mem_log_length > COMPACT_LIMIT {
+            let compact_idx = new_decided_idx - COMPACT_RETAIN_SIZE;
+            match self.omnipaxos.trim(Some(compact_idx)) {
+                Ok(_) => info!("Compacted in-memory log at idx {compact_idx}"),
+                Err(e) => panic!("Failed compaction at idx {compact_idx}: {e:?}"),
             }
         }
-        if !self.decided_slots_buffer.is_empty() {
-            let last_dec_slot = self.decided_slots_buffer[self.decided_slots_buffer.len() - 1];
-            let in_mem_log_length = last_dec_slot - self.omnipaxos.get_compacted_idx();
-            if in_mem_log_length > COMPACT_LIMIT {
-                let compact_idx = last_dec_slot - COMPACT_RETAIN_SIZE;
-                match self.omnipaxos.trim(Some(compact_idx)) {
-                    Ok(_) => info!("Compacted in-memory log at idx {compact_idx}"),
-                    Err(e) => panic!("Failed compaction at idx {compact_idx}: {e:?}"),
-                }
+        // Update database
+        for slot in self.decided_idx..new_decided_idx {
+            if let Some(data) = &mut self.instrumentation_data {
+                data.commited(slot);
             }
-        }
-        for slot in self.decided_slots_buffer.drain(..) {
             let command = self.omnipaxos.read_raw(slot);
             let read = self.database.handle_command(command.kv_cmd);
             if command.coordinator_id == self.id {
@@ -303,6 +352,7 @@ impl MetronomeServer {
                 debug!("Sending response {}", command.id);
             }
         }
+        self.decided_idx = new_decided_idx;
     }
 
     fn commit_command_to_log(
@@ -322,24 +372,17 @@ impl MetronomeServer {
             .expect("Append should never fail since we never reconfig");
     }
 
-    async fn send_outgoing_msgs(&mut self, worksteal: bool) {
+    async fn send_outgoing_msgs(&mut self) {
         if self.id == self.initial_leader {
-            self.send_outgoing_msgs_leader(worksteal).await;
+            self.send_outgoing_msgs_leader().await;
         } else {
-            self.send_outgoing_msgs_follower(worksteal).await;
+            self.send_outgoing_msgs_follower().await;
         }
     }
 
     // Metronome leader functions as in normal Omnipaxos
-    async fn send_outgoing_msgs_leader(&mut self, worksteal: bool) {
+    async fn send_outgoing_msgs_leader(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
-        if worksteal {
-            info!(
-                "{}: Sending {} messages on worksteal call.",
-                self.id,
-                messages.len(),
-            );
-        }
         self.instrument_accdec(&messages);
         for msg in messages {
             let to = msg.get_receiver();
@@ -349,29 +392,15 @@ impl MetronomeServer {
     }
 
     // Metronome acceptors handle accepted messages differently
-    async fn send_outgoing_msgs_follower(&mut self, worksteal: bool) {
+    async fn send_outgoing_msgs_follower(&mut self) {
         let messages = self.omnipaxos.outgoing_messages();
-        let num_messages = messages.len();
-        let mut total_flush = 0;
         for msg in messages {
             if let Some(to_flush) = msg.get_accepted_slots() {
-                total_flush += to_flush.len();
                 self.emulate_disk_flush(to_flush);
             }
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network.send_to_cluster(to, cluster_msg).await;
-        }
-        if worksteal {
-            info!(
-                "{}: Sending {num_messages} messages with {total_flush} entries on worksteal call.",
-                self.id
-            );
-        } else {
-            // info!(
-            //     "{}: Sending {num_messages} messages with {total_flush} entries.",
-            //     self.id
-            // );
         }
     }
 
