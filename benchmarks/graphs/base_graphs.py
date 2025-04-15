@@ -27,8 +27,7 @@ def parse_clients_summaries(experiment_dir: Path) -> pd.DataFrame:
     }
 
     # for backwards compatibility
-    if "worksteal_flag" in df.columns:
-        df.rename(columns={"worksteal_flag": "worksteal_ms"}, inplace=True)
+    if "worksteal_ms" not in df.columns:
         df["worksteal_ms"] = np.nan
 
     df["metronome_info"] = df["metronome_info"].map(category_mapping)

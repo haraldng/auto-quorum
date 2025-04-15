@@ -48,7 +48,7 @@ def save_straggler_plot(filename: str, format: str = "svg"):
     plt.savefig(file_path, format=format)
 
 
-def new_straggler_plot():
+def new_straggler_plot(save: bool = True):
     summaries = straggler_experiment_data()
     # Moving average latency lines
     for _, summary in summaries.iterrows():
@@ -79,4 +79,8 @@ def new_straggler_plot():
     plt.legend()
     plt.grid(False)
 
+    if save:
+        save_filename = "timeseries_latency.svg"
+        save_straggler_plot(save_filename)
     plt.show()
+    plt.close()

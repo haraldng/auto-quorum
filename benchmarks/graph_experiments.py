@@ -25,7 +25,7 @@ from graphs.straggler_graphs import (
 # straggler_violin_plot(300_000, None)
 # straggler_debug_plots(300_000, None)
 
-# new_straggler_plot()
+new_straggler_plot()
 
 # increasing_clients_graph()
 

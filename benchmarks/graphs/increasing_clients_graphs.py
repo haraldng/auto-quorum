@@ -24,32 +24,8 @@ def save_increasing_clients_plot(filename: str, format: str = "svg"):
     plt.savefig(file_path, format=format)
 
 
-def increasing_clients_graph(relative: bool = False, save: bool = True):
+def increasing_clients_graph(save: bool = True):
     summaries = increasing_clients_experiment_data()
-
-    # # Add relative latency column
-    # baseline_latencies = summaries[summaries['metronome_info'] == 'OmniPaxos'].set_index(['persist_info.value', 'num_clients'])['request_latency_average']
-    # def calculate_relative_latency(row):
-    #     if row['metronome_info'] == 'OmniPaxos':
-    #         return 1.0  # OmniPaxos relative latency is 1.0
-    #     try:
-    #         baseline_latency = baseline_latencies.loc[(row['persist_label'], row['num_clients'])]
-    #         return row['request_latency_average'] / baseline_latency
-    #     except KeyError:
-    #         return float('nan')  # Handle missing OmniPaxos entries
-    # summaries['rel_latency'] = summaries.apply(calculate_relative_latency, axis=1)
-    #
-    # # Add relative throughput column
-    # baseline_latencies = summaries[summaries['metronome_info'] == 'OmniPaxos'].set_index(['persist_info.value', 'num_clients'])['throughput']
-    # def calculate_relative_latency(row):
-    #     if row['metronome_info'] == 'OmniPaxos':
-    #         return 1.0  # OmniPaxos relative latency is 1.0
-    #     try:
-    #         baseline_latency = baseline_latencies.loc[(row['persist_info.value'], row['num_clients'])]
-    #         return row['throughput'] / baseline_latency
-    #     except KeyError:
-    #         return float('nan')  # Handle missing OmniPaxos entries
-    # summaries['rel_throughput'] = summaries.apply(calculate_relative_latency, axis=1)
 
     # Set up shared x-axis plot
     fig, axs = plt.subplots(
@@ -69,11 +45,6 @@ def increasing_clients_graph(relative: bool = False, save: bool = True):
     }
     markers = {"256 B": "o", "1 KiB": "D", "0 B": "s"}
     textures = {"OmniPaxos": "--", "Metronome": "-"}
-
-    # # Zoomed-in window
-    # zoom_ax = inset_axes(axs[2], width="20%", height="50%", loc="upper left", bbox_to_anchor=(0.1, 0.01, 1, 1), bbox_transform=axs[2].transAxes)
-    # zoom_ax.set_xlim(0, 500)
-    # zoom_ax.set_ylim(0, 4)
 
     # Create line for theoretical max disk throughput but ignore it in the legend
     axs[0].axhline(
@@ -133,45 +104,34 @@ def increasing_clients_graph(relative: bool = False, save: bool = True):
             capsize=2,
             capthick=1,
         )
-        for x, y in zip(num_clients, latency):
-            axs[2].annotate(
-                f"{y:.2f}",  # Format the value as needed
-                (x, y),  # Position at the marker
-                textcoords="offset points",  # Offset the text
-                xytext=(0, y_offset),  # Offset by 5 points in the y-direction
-                ha="center",  # Center-align the text
-                fontsize=8,  # Adjust text size as needed
-                color=color,
-            )
-        # zoom_ax.plot(num_clients, latency, marker=marker, linestyle=linestyle, color=color)
-        if relative:
-            axs[1].plot(
-                num_clients,
-                rel_latency,
-                label=label,
-                marker=marker,
-                linestyle=linestyle,
-                color=color,
-            )
-        else:
-            axs[1].plot(
-                num_clients,
-                throughput,
-                label=label,
-                marker=marker,
-                linestyle=linestyle,
-                color=color,
-            )
-            for x, y in zip(num_clients, throughput):
-                axs[1].annotate(
-                    f"{y:.2f}",  # Format the value as needed
-                    (x, y),  # Position at the marker
-                    textcoords="offset points",  # Offset the text
-                    xytext=(0, y_offset),  # Offset by 5 points in the y-direction
-                    ha="center",  # Center-align the text
-                    fontsize=8,  # Adjust text size as needed
-                    color=color,
-                )
+        # for x, y in zip(num_clients, latency):
+        #     axs[2].annotate(
+        #         f"{y:.2f}",  # Format the value as needed
+        #         (x, y),  # Position at the marker
+        #         textcoords="offset points",  # Offset the text
+        #         xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+        #         ha="center",  # Center-align the text
+        #         fontsize=8,  # Adjust text size as needed
+        #         color=color,
+        #     )
+        axs[1].plot(
+            num_clients,
+            throughput,
+            label=label,
+            marker=marker,
+            linestyle=linestyle,
+            color=color,
+        )
+        # for x, y in zip(num_clients, throughput):
+        #     axs[1].annotate(
+        #         f"{y:.2f}",  # Format the value as needed
+        #         (x, y),  # Position at the marker
+        #         textcoords="offset points",  # Offset the text
+        #         xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+        #         ha="center",  # Center-align the text
+        #         fontsize=8,  # Adjust text size as needed
+        #         color=color,
+        #     )
         axs[0].plot(
             num_clients,
             disk_throughput,
@@ -180,16 +140,16 @@ def increasing_clients_graph(relative: bool = False, save: bool = True):
             linestyle=linestyle,
             color=color,
         )
-        for x, y in zip(num_clients, disk_throughput):
-            axs[0].annotate(
-                f"{y:.2f}",  # Format the value as needed
-                (x, y),  # Position at the marker
-                textcoords="offset points",  # Offset the text
-                xytext=(0, y_offset),  # Offset by 5 points in the y-direction
-                ha="center",  # Center-align the text
-                fontsize=8,  # Adjust text size as needed
-                color=color,
-            )
+        # for x, y in zip(num_clients, disk_throughput):
+        #     axs[0].annotate(
+        #         f"{y:.2f}",  # Format the value as needed
+        #         (x, y),  # Position at the marker
+        #         textcoords="offset points",  # Offset the text
+        #         xytext=(0, y_offset),  # Offset by 5 points in the y-direction
+        #         ha="center",  # Center-align the text
+        #         fontsize=8,  # Adjust text size as needed
+        #         color=color,
+        #     )
         axs[2].fill_between(
             num_clients, latency - std_dev, latency + std_dev, alpha=0.2, color=color
         )
@@ -204,8 +164,7 @@ def increasing_clients_graph(relative: bool = False, save: bool = True):
     def format_ticks(x, pos):
         return f"{x/1000:.0f}k"  # Divide by 1000 and append 'k'
 
-    if not relative:
-        axs[1].yaxis.set_major_formatter(ticker.FuncFormatter(format_ticks))
+    axs[1].yaxis.set_major_formatter(ticker.FuncFormatter(format_ticks))
     # axs[0].legend(title="Configurations", bbox_to_anchor=(1.01, 1), loc='upper left')  # Legend outside plot to right
     axs[2].set_ylabel("Latency (ms)", fontsize=14)
     axs[1].set_ylabel("Requests per sec", fontsize=14)
@@ -215,7 +174,7 @@ def increasing_clients_graph(relative: bool = False, save: bool = True):
     axs[0].grid(which="both", linestyle="--", linewidth=0.5, axis="x")
     # fig.tight_layout()  # Adjust layout to fit legend
     if save:
-        save_filename = "throughput-latency-exact-numbers.svg"
+        save_filename = "throughput-latency.svg"
         save_increasing_clients_plot(save_filename)
     plt.show()
     plt.close()
